@@ -1,0 +1,51 @@
+name: CI
+
+# The single workflow this fork keeps. Upstream's DKMS build matrix, integration
+# lifecycle and package-publishing workflows are not carried here - this fork
+# does not publish releases, and anything needing that coverage should be run
+# against qvr/nonraid.
+#
+# Scope is deliberately what runs in seconds and guards what this fork actually
+# changes: the bash in tools/nmdctl, and the Makefile packaging logic.
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  nmdctl:
+    runs-on: ubuntu-latest
+    name: nmdctl lint + unit tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck bats util-linux jq
+
+      - name: ShellCheck
+        run: |
+          shellcheck -x tools/nmdctl
+          shellcheck packaging/docker/build-deb.sh
+
+      - name: Bash syntax
+        run: bash -n tools/nmdctl
+
+      - name: Unit tests
+        run: |
+          cd tools
+          chmod +x nmdctl tests/*
+          bats tests/
+
+      - name: Assert packaging probes stay out of DKMS module builds
+        run: |
+          # The Makefile is installed into /usr/src and re-parsed on every DKMS
+          # build. Packaging variables must stay behind the MAKECMDGOALS guard so
+          # a module build never shells out to probe for docker.
+          if make -p -n modules 2>/dev/null | grep -qE "^(HAVE_DOCKER|IS_ROOTLESS|ENGINE_ADVICE|ENGINE_SWITCH|DEB_IMAGE|DEB_BUILDER_IMAGE|OUT_UID|OUT_GID|HAVE_BUILDDEPS) "; then
+            echo "packaging variables leaked into 'make modules'" >&2
+            exit 1
+          fi
