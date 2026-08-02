@@ -795,6 +795,16 @@ collect_resync_status() {
             elapsed_seconds=$(($(printf "%(%s)T")-sbsynced))
         fi
 
+        # Add time accumulated before a pause, if this run was resumed.
+        local saved_file saved_elapsed
+        saved_file=$(resync_elapsed_file)
+        if [ -f "$saved_file" ]; then
+            saved_elapsed=$(cat "$saved_file" 2>/dev/null)
+            if [[ "$saved_elapsed" =~ ^[0-9]+$ ]]; then
+                elapsed_seconds=$(( elapsed_seconds + saved_elapsed ))
+            fi
+        fi
+
         RESYNC_STATUS_DATA["progress_percent"]="$progress"
         RESYNC_STATUS_DATA["position_kb"]="$mdresyncpos"
         RESYNC_STATUS_DATA["position_gb"]=$(format_kbytes "$mdresyncpos" 0 1 "gb")
@@ -2230,6 +2240,8 @@ parse_device_spec() {
         return 1
     fi
 
+    validate_disk_id "$disk_id" || return 1
+
     echo "$device|$disk_id|$offset"
 }
 
@@ -2253,6 +2265,58 @@ is_valid_offset() {
 # for this purpose. Only TYPE=part is disqualifying.
 is_whole_device() {
     [ "$(lsblk -no TYPE "$1" 2>/dev/null | head -1)" != "part" ]
+}
+
+# Snapshot of elapsed resync time across a pause.
+#
+# The driver resets sbSynced when a paused check resumes, so elapsed time - and
+# therefore the ETA - restarts from zero for the remainder of the run. nmdctl
+# records the elapsed seconds at pause and adds them back afterwards.
+#
+# Named by a hash of the superblock path rather than a character substitution:
+# "/a b.dat" and "/a_b.dat" would otherwise share one snapshot.
+RESYNC_ELAPSED_DIR="${RESYNC_ELAPSED_DIR:-/run/nonraid}"
+
+resync_elapsed_file() {
+    local sbname="${NMDSTAT_VALUES[sbName]}"
+    local key
+    key=$(printf '%s' "$sbname" | sha1sum | cut -c1-16)
+    echo "${RESYNC_ELAPSED_DIR}/resync_elapsed_${key}"
+}
+
+# Longest disk ID the driver stores: MD_ID_SIZE is 80 including the terminator.
+readonly MAX_DISK_ID_LEN=79
+
+# Reject a disk ID the driver cannot store faithfully.
+#
+# The import command is one space-delimited string and the driver tokenises it
+# on " ,\t\n" (md_unraid.c, get_token). The ID is the last field, so an embedded
+# delimiter truncates it rather than shifting the others - which is worse than it
+# sounds, because find_matching_disk matches by-id names by *substring*: a
+# truncated ID is a prefix of the real name, still matches, and can match several
+# disks, letting a slot bind to the wrong device on re-import.
+#
+# Over-length IDs truncate the same way via strncpy into MD_ID_SIZE.
+#
+# udev's ID_SERIAL is normalised and will not trip this; a user-supplied
+# SLOT:DEV:ID will. Also protects DISK_OFFSETS_FILE, which is space separated.
+validate_disk_id() {
+    local disk_id="$1"
+
+    [ -z "$disk_id" ] && return 0
+
+    if [[ "$disk_id" =~ [[:space:],] ]]; then
+        echo -e "${RED}Error: disk ID '$disk_id' contains a space, comma or tab${NC}" >&2
+        echo -e "${YELLOW}The driver splits the import command on those characters, so the ID would be silently truncated.${NC}" >&2
+        return 1
+    fi
+
+    if [ "${#disk_id}" -gt "$MAX_DISK_ID_LEN" ]; then
+        echo -e "${RED}Error: disk ID is ${#disk_id} characters; the driver stores at most $MAX_DISK_ID_LEN${NC}" >&2
+        return 1
+    fi
+
+    return 0
 }
 
 # Record the import offset used for a disk ID so it can be recovered on a later
@@ -2883,6 +2947,24 @@ handle_check() {
             return 0
         fi
         echo "$([[ "${option^^}" != "PAUSE" ]] && echo "Stopping" || echo "Pausing") $friendly_action..."
+
+        # Record elapsed time before pausing so resume can continue the count.
+        # A stop (rather than pause) discards it: the next run starts fresh.
+        local elapsed_file
+        elapsed_file=$(resync_elapsed_file)
+        if [[ "${option^^}" == "PAUSE" ]]; then
+            local sbsynced_val="${NMDSTAT_VALUES[sbSynced]}"
+            local elapsed_to_save=0
+            if [ -n "$sbsynced_val" ] && [ "$sbsynced_val" != "0" ]; then
+                elapsed_to_save=$(($(printf "%(%s)T")-sbsynced_val))
+            fi
+            if mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
+                echo "$elapsed_to_save" > "$elapsed_file" 2>/dev/null || true
+            fi
+        else
+            rm -f "$elapsed_file" 2>/dev/null || true
+        fi
+
         if ! run_nmd_command "nocheck $option"; then
             echo -e "${RED}Error: Failed to $([[ "${option^^}" != "PAUSE" ]] && echo "stop" || echo "pause") $friendly_action${NC}"
             return 1
@@ -2951,6 +3033,13 @@ handle_check() {
         if [ "${option^^}" != "RESUME" ]; then
             friendly_action=$(format_resync_action "$mdresyncaction" "$( [[ ${option^^} == "CORRECT" ]] && echo "1" || echo "0" )")
         fi
+    fi
+
+    # A fresh check starts its own clock, so drop any snapshot left by an
+    # earlier paused run. A resume deliberately keeps it: collect_resync_status
+    # adds it to the time accrued since the driver reset sbSynced on resume.
+    if [ "${option^^}" != "RESUME" ]; then
+        rm -f "$(resync_elapsed_file)" 2>/dev/null || true
     fi
 
     echo "$([[ "${option^^}" != "RESUME" ]] && echo "Starting" || echo "Resuming") $friendly_action..."
@@ -3046,6 +3135,9 @@ list_available_devices() {
             # Get disk id
             local disk_id=""
             disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$dev" 2>/dev/null)
+            # A device whose ID_SERIAL the driver cannot store is skipped rather
+            # than offered with an ID that will be silently truncated.
+            validate_disk_id "$disk_id" >/dev/null 2>&1 || continue
 
             # Get disk size information
             local size_kb=$(get_disk_size_kb "$partition")
@@ -3220,6 +3312,7 @@ create_array_layout() {
                     parent_dev="$device_path"
                 fi
                 disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$parent_dev" 2>/dev/null)
+                validate_disk_id "$disk_id" || return 1
             fi
         fi
 
@@ -4027,6 +4120,7 @@ add_disk() {
             selected_disk_id="$param_disk_id"
         else
             selected_disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$parent_dev" 2>/dev/null)
+            validate_disk_id "$selected_disk_id" || return 1
         fi
 
         if [ -z "$selected_disk_id" ]; then

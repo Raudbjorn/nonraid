@@ -2,6 +2,12 @@ PWD := $(shell pwd)
 KVERSION := $(shell uname -r)
 HEADERS := /lib/modules/$(KVERSION)/build/
 
+# Kernel compatibility shims live outside the per-version source directories so
+# the vendored copies stay byte-identical to upstream and survive the periodic
+# 6.X -> 6.Y renames. Force-included, so it applies to whichever directory the
+# version gate below selects.
+ccflags-y += -include $(src)/compat-xor.h
+
 K_MAJOR := $(shell echo $(KVERSION) | cut -f1 -d.)
 K_MINOR := $(shell echo $(KVERSION) | cut -f2 -d.)
 K_GT_6_8 := $(shell [ $(K_MAJOR) -gt 6 -o \( $(K_MAJOR) -eq 6 -a $(K_MINOR) -gt 8 \) ] && echo true)
