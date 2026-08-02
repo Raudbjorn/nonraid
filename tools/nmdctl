@@ -796,11 +796,16 @@ collect_resync_status() {
         fi
 
         # Add time accumulated before a pause, if this run was resumed.
-        local saved_file saved_elapsed
+        #
+        # Only for the same operation the snapshot was taken from. The file
+        # outlives the pause by design, and an operation the driver starts on its
+        # own - a clear or reconstruction on array start - would otherwise
+        # inherit elapsed time from an unrelated check that was paused earlier.
+        local saved_file saved_action saved_elapsed
         saved_file=$(resync_elapsed_file)
         if [ -f "$saved_file" ]; then
-            saved_elapsed=$(cat "$saved_file" 2>/dev/null)
-            if [[ "$saved_elapsed" =~ ^[0-9]+$ ]]; then
+            { read -r saved_action; read -r saved_elapsed; } < "$saved_file" 2>/dev/null || true
+            if [ "$saved_action" = "$mdresyncaction" ] && [[ "$saved_elapsed" =~ ^[0-9]+$ ]]; then
                 elapsed_seconds=$(( elapsed_seconds + saved_elapsed ))
             fi
         fi
@@ -2977,9 +2982,9 @@ handle_check() {
             # pauses accrued, or pause -> resume -> pause keeps just the last
             # segment and silently drops everything before the first resume.
             if [ -f "$elapsed_file" ]; then
-                local carried
-                carried=$(cat "$elapsed_file" 2>/dev/null)
-                if [[ "$carried" =~ ^[0-9]+$ ]]; then
+                local carried_action carried
+                { read -r carried_action; read -r carried; } < "$elapsed_file" 2>/dev/null || true
+                if [ "$carried_action" = "$mdresyncaction" ] && [[ "$carried" =~ ^[0-9]+$ ]]; then
                     elapsed_to_save=$(( elapsed_to_save + carried ))
                 fi
             fi
@@ -2995,8 +3000,11 @@ handle_check() {
         # that is still going - double-counting elapsed time - and a failed CANCEL
         # erases a carried segment the resumed run still needs.
         if [[ "${option^^}" == "PAUSE" ]]; then
+            # Action first, seconds second: collect_resync_status only applies the
+            # snapshot to the same operation it was taken from.
             if mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
-                echo "$elapsed_to_save" > "$elapsed_file" 2>/dev/null || true
+                printf '%s\n%s\n' "$mdresyncaction" "$elapsed_to_save" \
+                    > "$elapsed_file" 2>/dev/null || true
             fi
         else
             rm -f "$elapsed_file" 2>/dev/null || true

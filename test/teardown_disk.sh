@@ -25,6 +25,23 @@ fi
 
 failed=0
 
+# `nmd -s` only selects the superblock for `create`; `umount`, `stop` and
+# `modprobe -r` act on whatever module is loaded. If that is a real array rather
+# than this harness's, every command below would operate on it. The driver
+# reports the superblock it was loaded with, so check that before issuing any of
+# them.
+if [ -r /proc/nmdstat ]; then
+    loaded_sb=$(sed -n 's/^sbName=//p' /proc/nmdstat | head -1)
+    if [ -n "$loaded_sb" ] && [ "$(readlink -m "$loaded_sb")" != "$(readlink -m "$SUPERBLOCK_FILE")" ]; then
+        echo "Refusing to tear down: the loaded array is not this harness's." >&2
+        echo "  /proc/nmdstat reports sbName=$loaded_sb" >&2
+        echo "  this harness owns $SUPERBLOCK_FILE" >&2
+        echo "  Unloading or stopping it would act on someone else's array." >&2
+        [ "$FORCE" -eq 0 ] && exit 1
+        echo "  WARNING: continuing because --force" >&2
+    fi
+fi
+
 echo "=== unmounting ==="
 nmd -u umount "$MOUNT_PREFIX" >/dev/null 2>&1 && echo "  unmounted" || echo "  nothing to unmount"
 
