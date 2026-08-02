@@ -60,7 +60,20 @@ jobs:
           # Workaround for slow dpkg-genbuildinfo on GitHub Actions runners
           # https://github.com/actions/runner-images/issues/13150
           sudo mv /usr/local{,_}
-          make clean package
+          # Pin the native toolchain explicitly. 'make package' would silently
+          # fall back to a container if a build-dep ever went missing here, and
+          # CI is where that should fail loudly instead.
+          make clean package-native
+
+      - name: Assert packaging probes stay out of DKMS module builds
+        run: |
+          # This Makefile is installed into /usr/src and re-parsed on every DKMS
+          # build. Packaging variables must stay behind the MAKECMDGOALS guard so
+          # a module build never shells out to probe for docker.
+          if make -p -n modules 2>/dev/null | grep -qE "^(HAVE_DOCKER|IS_ROOTLESS|DEB_IMAGE|DEB_BUILDER_IMAGE|OUT_UID|OUT_GID|HAVE_BUILDDEPS) "; then
+            echo "packaging variables leaked into 'make modules'" >&2
+            exit 1
+          fi
 
       - name: Workaround actions/upload-artifact#176
         run: |

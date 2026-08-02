@@ -11,7 +11,7 @@ modules:
 clean:
 	make -C $(HEADERS) M=$(PWD) clean
 
-# 'package' builds natively on Debian/Ubuntu with debhelper installed, and
+# 'package' builds natively on Debian/Ubuntu with a complete toolchain, and
 # otherwise falls back to a container. debian/control needs dh-sequence-dkms,
 # which only Debian's dh-dkms provides, so a native build cannot work elsewhere.
 # This file is installed into /usr/src and re-parsed on every DKMS build, so the
@@ -19,24 +19,56 @@ clean:
 ifneq ($(filter package package-native package-docker,$(MAKECMDGOALS)),)
 
 DOCKER ?= docker
+# Floating tag, so the toolchain drifts across point releases. Override with a
+# digest (DEB_IMAGE=debian@sha256:...) when a reproducible build matters.
 DEB_IMAGE ?= debian:13
-DEB_BUILD_DEPS ?= build-essential debhelper dkms dh-dkms
+# fakeroot is needed by 'dpkg-buildpackage -rfakeroot'. dpkg-dev only Recommends
+# it, so --no-install-recommends leaves it out and the container build fails.
+DEB_BUILD_DEPS ?= build-essential debhelper dkms dh-dkms fakeroot
+DEB_BUILDER_IMAGE ?= nonraid-deb-builder
 
 IS_DEBIAN := $(shell test -f /etc/debian_version && echo yes)
 HAVE_DH := $(shell command -v dh >/dev/null 2>&1 && echo yes)
-HAVE_DOCKER := $(shell command -v $(DOCKER) >/dev/null 2>&1 && echo yes)
+HAVE_FAKEROOT := $(shell command -v fakeroot >/dev/null 2>&1 && echo yes)
+# dpkg-checkbuilddeps reads debian/control, so this also covers dh-sequence-dkms
+# and anything added there later. Gating on Debian + dh alone would pick the
+# native path on a Debian host missing dh-dkms and fail, rather than fall back.
+HAVE_BUILDDEPS := $(shell command -v dpkg-checkbuilddeps >/dev/null 2>&1 && dpkg-checkbuilddeps >/dev/null 2>&1 && echo yes)
 
-ifeq ($(IS_DEBIAN)$(HAVE_DH),yesyes)
+ifeq ($(IS_DEBIAN)$(HAVE_DH)$(HAVE_FAKEROOT)$(HAVE_BUILDDEPS),yesyesyesyes)
 package: package-native
 else
 package: package-docker
+
+# Only probed on the fallback path; the native build never needs it.
+HAVE_DOCKER := $(shell command -v $(DOCKER) >/dev/null 2>&1 && echo yes)
+
+# Rootless podman (and rootless docker) map container uid 0 to the invoking user
+# and container uid N to a subordinate host id. Chowning artifacts to the real
+# uid there lands them on a subuid the user cannot easily read or delete - the
+# opposite of what the chown is for. Writing as container root is already
+# correct in that case; under rootful docker it is not, hence the real uid.
+IS_ROOTLESS := $(shell { $(DOCKER) info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qx true \
+	|| $(DOCKER) info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; } && echo yes)
+ifeq ($(IS_ROOTLESS),yes)
+OUT_UID := 0
+OUT_GID := 0
+else
+OUT_UID := $(shell id -u)
+OUT_GID := $(shell id -g)
+endif
+
 endif
 
 package-native:
 	dpkg-buildpackage -b -rfakeroot -us -uc
 
-# The source tree is copied into the container before building: dh_install uses
-# 'cp -a', which fails with ENODATA when it tries to write ACLs onto a bind mount.
+# Artifacts land in a temporary directory bind-mounted as /out and are moved
+# into place afterwards, so the container never gets write access to the whole
+# parent directory (which is '/' for a checkout directly under the root).
+#
+# NOTE: the conditional below is a Make ifneq evaluated at parse time, not a
+# shell branch - only one of the two blocks ever becomes part of the recipe.
 package-docker:
 ifneq ($(HAVE_DOCKER),yes)
 	@echo "make package: no native Debian toolchain and no '$(DOCKER)' in PATH." >&2
@@ -54,21 +86,24 @@ else
 	    echo "  and are you in the 'docker' group (log out and back in after adding)?" >&2; \
 	    exit 1; }
 	@echo "Not a Debian build host; building in $(DEB_IMAGE) via $(DOCKER)."
+	$(DOCKER) build -q \
+	    --build-arg DEB_IMAGE="$(DEB_IMAGE)" \
+	    --build-arg DEB_BUILD_DEPS="$(DEB_BUILD_DEPS)" \
+	    -t $(DEB_BUILDER_IMAGE) packaging/docker
+	@set -e; \
+	outdir=$$(mktemp -d); \
+	trap 'rm -rf "$$outdir"' EXIT; \
 	$(DOCKER) run --rm \
+	    --security-opt label=disable \
 	    -v "$(PWD)":/src:ro \
-	    -v "$(dir $(patsubst %/,%,$(PWD)))":/out \
-	    -e DEB_BUILD_DEPS="$(DEB_BUILD_DEPS)" \
-	    -e OUT_UID="$(shell id -u)" -e OUT_GID="$(shell id -g)" \
-	    $(DEB_IMAGE) sh -c 'set -e; \
-	        apt-get update -qq; \
-	        apt-get install -y --no-install-recommends $$DEB_BUILD_DEPS; \
-	        mkdir -p /work; \
-	        tar -C /src --exclude=.git -cf - . | tar -C /work -xf -; \
-	        cd /work && dpkg-buildpackage -b -rfakeroot -us -uc; \
-	        for f in /*.deb /*.changes /*.buildinfo; do \
-	            [ -e "$$f" ] || continue; \
-	            install -m 0644 -o "$$OUT_UID" -g "$$OUT_GID" "$$f" /out/; \
-	        done'
+	    -v "$$outdir":/out \
+	    -e OUT_UID="$(OUT_UID)" -e OUT_GID="$(OUT_GID)" \
+	    $(DEB_BUILDER_IMAGE); \
+	for f in "$$outdir"/*; do \
+	    [ -e "$$f" ] || continue; \
+	    mv "$$f" "$(dir $(patsubst %/,%,$(PWD)))"; \
+	    echo "  -> $(dir $(patsubst %/,%,$(PWD)))$$(basename "$$f")"; \
+	done
 endif
 
 endif
