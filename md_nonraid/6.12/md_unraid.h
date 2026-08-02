@@ -50,6 +50,22 @@
 #include <linux/raid/xor.h>
 
 /*
+ * Kernel 7.1 moved the xor code to lib/raid/xor/ and replaced xor_blocks() with
+ * xor_gen(), which takes an arbitrary source count instead of being capped at
+ * MAX_XOR_BLOCKS. Semantics are otherwise identical: the sources are xor'ed
+ * into @dest, which is also an operand. Keep the driver on the old interface so
+ * the call sites stay in sync with upstream.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,1,0)
+#define MAX_XOR_BLOCKS 4
+static inline void xor_blocks(unsigned int count, unsigned int bytes,
+			      void *dest, void **srcs)
+{
+	xor_gen(dest, srcs, count, bytes);
+}
+#endif
+
+/*
  * Here are the raid6 p/q functions. Note: we patched lib/raid6/algos.c to ensure xor_syndrome() function
  * is always available.
  */
