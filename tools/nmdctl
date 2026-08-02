@@ -2301,10 +2301,10 @@ import_disks() {
                         fi
                     fi
 
-                    echo -e "Found disk for slot $slot: ${BLUE}$(basename "$partition")${NC} (ID: ${short_id})"
+                    echo -e "Found disk for slot $slot: ${BLUE}$(device_kernel_name "$partition")${NC} (ID: ${short_id})"
 
-                    # Store partition name without /dev/
-                    partition=$(basename "$partition")
+                    # Store the kernel device name; the driver opens /dev/<name>
+                    partition=$(device_kernel_name "$partition")
 
                     # Add to import list: slot, partition, offset, size, erased, id
                     disks_to_import+=("$slot|$partition|0|$size_to_use|0|$disk_id")
@@ -2691,6 +2691,21 @@ handle_check() {
     return 0
 }
 
+# Resolve a device path to the kernel device name the driver will open.
+#
+# The driver is given a bare name and opens /dev/<name>, so it must receive the
+# kernel name ("sdb1"), not the basename of whatever path the caller supplied.
+# A /dev/disk/by-id/... path is a symlink whose own basename exists nowhere in
+# /dev; passing that through unresolved makes the import silently do nothing.
+# readlink -f leaves a plain /dev/sdb1 untouched.
+device_kernel_name() {
+    local device_path="$1"
+    local resolved
+    resolved=$(readlink -f "$device_path" 2>/dev/null) || resolved="$device_path"
+    [ -z "$resolved" ] && resolved="$device_path"
+    basename "$resolved"
+}
+
 # Validate if a device/partition path is available for array use
 validate_device_path() {
     local device_path="$1"
@@ -2706,6 +2721,16 @@ validate_device_path() {
     # Check if it's a block device
     if [ ! -b "$device_path" ]; then
         echo -e "${RED}Error: $device_path is not a block device${NC}"
+        return 1
+    fi
+
+    # The driver opens /dev/<name>, so a path that does not resolve to a device
+    # node directly under /dev cannot be imported. Without this check the import
+    # is issued anyway and reports success while the array stays empty.
+    local kernel_name
+    kernel_name=$(device_kernel_name "$device_path")
+    if [ ! -b "/dev/$kernel_name" ]; then
+        echo -e "${RED}Error: $device_path resolves to '$kernel_name', which is not a block device under /dev${NC}"
         return 1
     fi
 
@@ -2975,9 +3000,9 @@ create_array_layout() {
     for entry in "${sorted_entries[@]}"; do
         IFS='|' read -r slot device_path size_kb disk_id <<< "$entry"
 
-        echo -e "Importing disk to slot $slot: ${BLUE}$(basename "$device_path")${NC}"
+        echo -e "Importing disk to slot $slot: ${BLUE}$(device_kernel_name "$device_path")${NC}"
 
-        if ! run_nmd_command "import $slot $(basename "$device_path") 0 $size_kb 0 $disk_id"; then
+        if ! run_nmd_command "import $slot $(device_kernel_name "$device_path") 0 $size_kb 0 $disk_id"; then
             echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
             import_failed=1
         else
@@ -3244,9 +3269,9 @@ create_array_interactive() {
         for entry in "${sorted_entries[@]}"; do
             IFS='|' read -r slot partition size_kb disk_id <<< "$entry"
 
-            echo -e "Importing disk to slot $slot: ${BLUE}$(basename "$partition")${NC}"
+            echo -e "Importing disk to slot $slot: ${BLUE}$(device_kernel_name "$partition")${NC}"
 
-            if ! run_nmd_command "import $slot $(basename "$partition") 0 $size_kb 0 $disk_id"; then
+            if ! run_nmd_command "import $slot $(device_kernel_name "$partition") 0 $size_kb 0 $disk_id"; then
                 echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
                 import_failed=1
             else
@@ -3877,7 +3902,7 @@ add_disk() {
     echo -e "Adding disk to array..."
 
     # Import disk: slot, partition, offset, size, erased, id
-    if ! run_nmd_command "import $selected_slot $(basename "$selected_partition") 0 $selected_size_kb $preclear_done $selected_disk_id"; then
+    if ! run_nmd_command "import $selected_slot $(device_kernel_name "$selected_partition") 0 $selected_size_kb $preclear_done $selected_disk_id"; then
         echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
         return 1
     fi
