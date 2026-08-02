@@ -78,7 +78,7 @@ Array Management Commands:
 Disk Management Commands:
     add [SLOT:DEV[:ID]]             Add a new disk to the array
     replace SLOT[:DEV[:ID]]         Replace a disk in the specified slot
-    unassign SLOT                   Unassign a disk from the specified slot
+    unassign [-f] SLOT              Unassign a disk from the specified slot
 
 Maintenance Commands:
     reload                          Reload nonraid module with specified superblock
@@ -3964,12 +3964,21 @@ add_disk() {
 
 # Unassign a disk from a specified slot
 unassign_disk() {
-    local slot="$1"
+    local slot=""
+    local force=0
+
+    # Accept -f/--force in any position, matching add/replace/create.
+    for arg in "$@"; do
+        case "$arg" in
+            -f|--force) force=1 ;;
+            *) [ -z "$slot" ] && slot="$arg" ;;
+        esac
+    done
 
     # Check if we have a slot parameter
     if [ -z "$slot" ]; then
         echo -e "${RED}Error: Missing slot parameter${NC}"
-        echo -e "Usage: ${YELLOW}nmdctl unassign SLOT${NC}"
+        echo -e "Usage: ${YELLOW}nmdctl unassign [-f] SLOT${NC}"
         echo -e "Example: ${YELLOW}nmdctl unassign 1${NC} (to unassign disk from slot 1)"
         echo -e "Special slots: ${YELLOW}P${NC} or ${YELLOW}0${NC} (parity disk), ${YELLOW}Q${NC} or ${YELLOW}29${NC} (second parity)"
         return 1
@@ -4078,11 +4087,23 @@ unassign_disk() {
         fi
         echo ""
 
-        # Ask for confirmation
-        read -r -p "Are you sure you want to unassign this disk? (y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            echo "Operation cancelled."
+        # Unattended callers cannot answer a prompt: without -f the read
+        # consumes nothing and the operation is cancelled, which is why the
+        # integration test has to pipe "y" into it. Refuse explicitly instead,
+        # and let -f assert the intent, as add/replace/create already do.
+        if [ "$UNATTENDED" -eq 1 ] && [ "$force" -eq 0 ]; then
+            echo -e "${RED}Error: Refusing to unassign a disk in unattended mode without --force${NC}"
+            echo -e "${YELLOW}Re-run with ${GREEN}nmdctl -u unassign -f $slot${YELLOW} to confirm.${NC}"
             return 1
+        fi
+
+        # Ask for confirmation
+        if [ "$force" -eq 0 ]; then
+            read -r -p "Are you sure you want to unassign this disk? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Operation cancelled."
+                return 1
+            fi
         fi
         echo ""
     fi
@@ -4850,7 +4871,7 @@ main() {
             add_disk "$@"
             ;;
         "unassign")
-            unassign_disk "$1"
+            unassign_disk "$@"
             ;;
         "reload")
             reload_module
