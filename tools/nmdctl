@@ -802,8 +802,8 @@ collect_resync_status() {
         # own - a clear or reconstruction on array start - would otherwise
         # inherit elapsed time from an unrelated check that was paused earlier.
         local saved_file saved_action saved_elapsed
-        saved_file=$(resync_elapsed_file)
-        if [ -f "$saved_file" ]; then
+        saved_file=$(resync_elapsed_file) || saved_file=""
+        if [ -n "$saved_file" ] && [ -f "$saved_file" ]; then
             { read -r saved_action; read -r saved_elapsed; } < "$saved_file" 2>/dev/null || true
             if [ "$saved_action" = "$mdresyncaction" ] && [[ "$saved_elapsed" =~ ^[0-9]+$ ]]; then
                 elapsed_seconds=$(( elapsed_seconds + saved_elapsed ))
@@ -2280,17 +2280,35 @@ is_whole_device() {
 #
 # Named by a hash of the superblock path rather than a character substitution:
 # "/a b.dat" and "/a_b.dat" would otherwise share one snapshot.
-RESYNC_ELAPSED_DIR="${RESYNC_ELAPSED_DIR:-/run/nonraid}"
+#
+# Persistent, not /run: a paused check survives a reboot, because its position
+# is held in the superblock rather than in memory. A snapshot on tmpfs would be
+# lost while the thing it corrects is not, and the resumed check would silently
+# under-report. This is the directory nonraid.service already declares with
+# StateDirectory=nonraid, which is where array.running lives for the same
+# reason.
+RESYNC_ELAPSED_DIR="${RESYNC_ELAPSED_DIR:-${STATE_DIRECTORY:-/var/lib/nonraid}}"
 
 resync_elapsed_file() {
-    local sbname="${NMDSTAT_VALUES[sbName]}"
+    local sbname="${NMDSTAT_VALUES[sbName]:-}"
     local key
-    key=$(printf '%s' "$sbname" | sha1sum | cut -c1-16)
+    # An empty sbName would give every array one shared snapshot, and a missing
+    # sha1sum would do the same by way of an empty key. Both are refused rather
+    # than silently collapsed together.
+    if [ -z "$sbname" ]; then
+        return 1
+    fi
+    key=$(printf '%s' "$sbname" | sha1sum 2>/dev/null | cut -c1-16)
+    if [ -z "$key" ]; then
+        return 1
+    fi
     echo "${RESYNC_ELAPSED_DIR}/resync_elapsed_${key}"
 }
 
 # Longest disk ID the driver stores: MD_ID_SIZE is 80 including the terminator.
-readonly MAX_DISK_ID_LEN=79
+# Not readonly: sourcing this script twice in one shell - which the test suite
+# does - would then fail on the second assignment.
+MAX_DISK_ID_LEN=79
 
 # Reject a disk ID the driver cannot store faithfully.
 #
@@ -2315,6 +2333,8 @@ validate_disk_id() {
 
     [ -z "$disk_id" ] && return 0
 
+    # [[:space:]] also covers \v, \f and \r, which get_token does not split on.
+    # Stricter than the driver by three characters that no by-id name contains.
     if [[ "$disk_id" =~ [[:space:],] ]]; then
         echo -e "${RED}Error: disk ID '$disk_id' contains a space, comma, tab or newline${NC}" >&2
         echo -e "${YELLOW}The driver splits the import command on those characters, so the ID would be silently truncated.${NC}" >&2
@@ -2980,7 +3000,7 @@ handle_check() {
         # Record elapsed time before pausing so resume can continue the count.
         # A stop (rather than pause) discards it: the next run starts fresh.
         local elapsed_file elapsed_to_save=0
-        elapsed_file=$(resync_elapsed_file)
+        elapsed_file=$(resync_elapsed_file) || elapsed_file=""
         if [[ "${option^^}" == "PAUSE" ]]; then
             local sbsynced_val="${NMDSTAT_VALUES[sbSynced]}"
             if [ -n "$sbsynced_val" ] && [ "$sbsynced_val" != "0" ]; then
@@ -2990,7 +3010,7 @@ handle_check() {
             # covers only the segment since the last one. Carry what earlier
             # pauses accrued, or pause -> resume -> pause keeps just the last
             # segment and silently drops everything before the first resume.
-            if [ -f "$elapsed_file" ]; then
+            if [ -n "$elapsed_file" ] && [ -f "$elapsed_file" ]; then
                 local carried_action carried
                 { read -r carried_action; read -r carried; } < "$elapsed_file" 2>/dev/null || true
                 if [ "$carried_action" = "$mdresyncaction" ] && [[ "$carried" =~ ^[0-9]+$ ]]; then
@@ -3011,11 +3031,17 @@ handle_check() {
         if [[ "${option^^}" == "PAUSE" ]]; then
             # Action first, seconds second: collect_resync_status only applies the
             # snapshot to the same operation it was taken from.
-            if mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
+            #
+            # These writes are deliberately allowed to fail quietly - the sole
+            # place in this script that is. The pause has already been accepted
+            # by the driver, and this state only affects a displayed elapsed
+            # time and ETA; failing the command here would report a pause that
+            # did happen as an error, which is the worse outcome.
+            if [ -n "$elapsed_file" ] && mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
                 printf '%s\n%s\n' "$mdresyncaction" "$elapsed_to_save" \
                     > "$elapsed_file" 2>/dev/null || true
             fi
-        else
+        elif [ -n "$elapsed_file" ]; then
             rm -f "$elapsed_file" 2>/dev/null || true
         fi
 
@@ -3088,7 +3114,10 @@ handle_check() {
     # earlier paused run. A resume deliberately keeps it: collect_resync_status
     # adds it to the time accrued since the driver reset sbSynced on resume.
     if [ "${option^^}" != "RESUME" ]; then
-        rm -f "$(resync_elapsed_file)" 2>/dev/null || true
+        local done_file
+        if done_file=$(resync_elapsed_file); then
+            rm -f "$done_file" 2>/dev/null || true
+        fi
     fi
 
     echo "$([[ "${option^^}" != "RESUME" ]] && echo "Starting" || echo "Resuming") $friendly_action..."
@@ -3185,8 +3214,14 @@ list_available_devices() {
             local disk_id=""
             disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$dev" 2>/dev/null)
             # A device whose ID_SERIAL the driver cannot store is skipped rather
-            # than offered with an ID that will be silently truncated.
-            validate_disk_id "$disk_id" >/dev/null 2>&1 || continue
+            # than offered with an ID that will be silently truncated. Say so:
+            # "my disk is missing from the list" is otherwise undebuggable, and
+            # the next thing the user meets is validate_device_path refusing a
+            # disk that is plainly present and healthy.
+            if ! validate_disk_id "$disk_id" >/dev/null; then
+                echo -e "${YELLOW}Skipping $dev: the disk ID above cannot be stored by the driver${NC}" >&2
+                continue
+            fi
 
             # Get disk size information
             local size_kb=$(get_disk_size_kb "$partition")
