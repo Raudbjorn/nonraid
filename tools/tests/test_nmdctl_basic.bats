@@ -15,6 +15,12 @@ setup() {
 
     # Default superblock path for layout tests
     export SUPERBLOCK_PATH="/tmp/test.dat"
+
+    # Never let a test reach the real /etc/nonraid/disk-offsets. Individual
+    # tests override this again, but the default must not be the live file:
+    # the suite runs as root in CI, so a stray save_disk_offset would write to
+    # real array state.
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/default-disk-offsets"
 }
 
 teardown() {
@@ -181,9 +187,11 @@ EOF
     result=$(format_kbytes 1572864 0 1 "gb")
     [ "$result" = "1.6" ]
 
-    # Test KB and B units (should not have decimals)
+    # Test KB and B units (should not have decimals). Decimal like the rest:
+    # 1536 KiB = 1572864 B = 1572 kB. Previously asserted "1536 kB", which was
+    # the input echoed back under a decimal label.
     result=$(format_kbytes 1536 1 1 "kb")
-    [ "$result" = "1536 kB" ]
+    [ "$result" = "1572 kB" ]
 
     result=$(format_kbytes 1 1 1 "b")
     [ "$result" = "1024 B" ]
@@ -852,6 +860,9 @@ mock_import_with_status() {
 }
 
 @test "parse_device_spec - device, id and offset" {
+    # A nonzero offset is only accepted for a whole disk; stub the check so the
+    # test does not depend on the runner having a spare physical disk.
+    eval 'is_whole_device() { return 0; }'
     run parse_device_spec "/dev/sdb:virtdisk-001:64"
 
     [ "$status" -eq 0 ]
@@ -871,7 +882,7 @@ mock_import_with_status() {
     run parse_device_spec "/dev/sdb:myid:notanumber"
 
     [ "$status" -ne 0 ]
-    [[ "$output" =~ "not a number" ]]
+    [[ "$output" =~ "canonical decimal" ]]
 }
 
 @test "parse_device_spec - rejects too many fields" {
@@ -922,4 +933,94 @@ mock_import_with_status() {
     # the existing entry must survive a rejected write
     run get_saved_disk_offset "diskA"
     [ "$output" = "64" ]
+}
+
+@test "is_valid_offset - rejects leading zeros that bash would read as octal" {
+    # "08" passes a bare ^[0-9]+$ and then dies in arithmetic with
+    # "value too great for base", so it must be rejected up front.
+    run is_valid_offset "08"
+    [ "$status" -ne 0 ]
+
+    run is_valid_offset "0"
+    [ "$status" -eq 0 ]
+
+    run is_valid_offset "64"
+    [ "$status" -eq 0 ]
+}
+
+@test "is_valid_offset - rejects values that would overflow shell arithmetic" {
+    run is_valid_offset "999999999999999999"
+    [ "$status" -eq 0 ]
+
+    run is_valid_offset "99999999999999999999999999"
+    [ "$status" -ne 0 ]
+}
+
+@test "parse_device_spec - refuses a nonzero offset on a partition" {
+    # Reload applies a saved offset to the whole physical disk, so an offset
+    # against a partition would address a different region afterwards.
+    eval 'is_whole_device() { return 1; }'
+    run parse_device_spec "/dev/sdb1:myid:64"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "whole device" ]]
+}
+
+@test "parse_device_spec - allows offset 0 on a partition" {
+    eval 'is_whole_device() { return 1; }'
+    run parse_device_spec "/dev/sdb1:myid:0"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/sdb1|myid|0" ]
+}
+
+@test "get_saved_disk_offset - malformed record fails closed rather than reading as 0" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-malformed"
+    printf 'diskA notanumber\n' > "$DISK_OFFSETS_FILE"
+
+    run get_saved_disk_offset "diskA"
+    # Exit 2 distinguishes "malformed record" from "no record"; the caller must
+    # refuse the disk rather than import it at sector 0.
+    [ "$status" -eq 2 ]
+
+    printf 'diskB\n' > "$DISK_OFFSETS_FILE"
+    run get_saved_disk_offset "diskB"
+    [ "$status" -eq 2 ]
+}
+
+@test "get_saved_disk_offset - absent record is 0 with success" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-absent"
+    printf 'diskA 64\n' > "$DISK_OFFSETS_FILE"
+
+    run get_saved_disk_offset "diskZ"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+@test "save_disk_offset - an unwritable path fails loudly instead of silently" {
+    # Runs as root in CI, so permission bits are not a reliable barrier
+    # (CAP_DAC_OVERRIDE). Put a regular file where the parent directory would
+    # have to be: mkdir -p then fails for any user.
+    printf 'not a directory\n' > "$BATS_TMPDIR/blocker"
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/blocker/disk-offsets"
+
+    run save_disk_offset "diskA" 64
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "could not" ]]
+}
+
+@test "save_disk_offset - a rejected write leaves earlier entries intact" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-intact"
+    rm -f "$DISK_OFFSETS_FILE"
+    save_disk_offset "diskA" 64
+
+    # A non-canonical offset is refused before the file is touched.
+    run save_disk_offset "diskB" "08"
+    [ "$status" -ne 0 ]
+
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "64" ]
+    run get_saved_disk_offset "diskB"
+    [ "$output" = "0" ]
 }

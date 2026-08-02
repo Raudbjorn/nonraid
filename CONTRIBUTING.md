@@ -40,7 +40,7 @@ Not rules, just the stuff that has actually bitten:
 - **Keep driver diffs small.** The `nonraid-6.X` branches are rebased onto new upstream
   vendor drops, and every extra line is friction at rebase time. This is the one place
   where restraint pays for itself.
-- **CI gates `shellcheck -x tools/nmdctl` and `bash -n`.** Both are instant locally; run
+- **CI gates `shellcheck -x tools/nmdctl` and `bash -n tools/nmdctl`.** Both are instant locally; run
   them and skip a round trip. `cd tools && bats tests/` covers the pure functions.
 - **Rebasing on upstream `main` before sending anything onward** saves an awkward PR that
   appears to revert work already merged there.
