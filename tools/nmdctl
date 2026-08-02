@@ -128,7 +128,9 @@ device_kernel_name() {
     local device_path="$1"
     local resolved
     resolved=$(readlink -e "$device_path" 2>/dev/null)
-    [ -z "$resolved" ] && resolved="$device_path"
+    if [ -z "$resolved" ]; then
+        resolved="$device_path"
+    fi
     basename "$resolved"
 }
 
@@ -2733,8 +2735,12 @@ validate_device_path() {
     # import sites, not here - this catches e.g. a node created outside /dev.
     local kernel_name
     kernel_name=$(device_kernel_name "$device_path")
-    if [ ! -b "/dev/$kernel_name" ]; then
-        echo -e "${RED}Error: $device_path resolves to '$kernel_name', which is not a block device under /dev${NC}"
+    # Compare device numbers, not just the name: -b /dev/$kernel_name would only
+    # prove that *something* by that name is a block device, not that it is the
+    # device the caller named. This also covers a node that resolves somewhere
+    # other than directly under /dev, which the driver could not open.
+    if [ "$(stat -Lc '%t:%T' "$device_path" 2>/dev/null)" != "$(stat -c '%t:%T' "/dev/$kernel_name" 2>/dev/null)" ]; then
+        echo -e "${RED}Error: $device_path resolves to '$kernel_name', which is not the same device under /dev${NC}"
         return 1
     fi
 
@@ -3898,7 +3904,7 @@ add_disk() {
 
     if [ "$use_param_mode" -eq 0 ]; then
         # Confirm selection in interactive mode
-        echo -e "You are about to ${YELLOW}$verb${NC}: ${YELLOW}$(basename "$selected_dev")${NC} to slot ${YELLOW}$slot_display${NC}"
+        echo -e "You are about to ${YELLOW}$verb${NC}: ${YELLOW}$(device_kernel_name "$selected_dev")${NC} to slot ${YELLOW}$slot_display${NC}"
         read -r -p "Proceed with the operation? (y/N): " confirm
 
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
