@@ -733,3 +733,47 @@ mock_import_with_status() {
     [[ "$output" =~ "Error" ]]
 }
 
+
+@test "device_kernel_name - plain /dev path passes through" {
+    run device_kernel_name "/dev/null"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "null" ]
+}
+
+@test "device_kernel_name - by-id style symlink resolves to the kernel name" {
+    # The driver opens /dev/<name>, so a symlink must resolve to its target's
+    # name. Returning the symlink's own basename makes the import a silent no-op.
+    ln -sf /dev/null "$BATS_TMPDIR/virtio-testdisk-part1"
+    run device_kernel_name "$BATS_TMPDIR/virtio-testdisk-part1"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "null" ]
+    [ "$output" != "virtio-testdisk-part1" ]
+}
+
+@test "device_kernel_name - chained symlink resolves to the final target" {
+    ln -sf /dev/null "$BATS_TMPDIR/link-a"
+    ln -sf "$BATS_TMPDIR/link-a" "$BATS_TMPDIR/link-b"
+    run device_kernel_name "$BATS_TMPDIR/link-b"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "null" ]
+}
+
+@test "device_kernel_name - unresolvable path falls back to its own basename" {
+    # readlink -e fails here; the fallback must yield something that then fails
+    # the caller's block-device check rather than a plausible-looking name.
+    run device_kernel_name "/dev/disk/by-id/definitely-not-present"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "definitely-not-present" ]
+}
+
+@test "device_kernel_name - dangling symlink falls back rather than inventing a name" {
+    ln -sf "$BATS_TMPDIR/no-such-target" "$BATS_TMPDIR/dangling-link"
+    run device_kernel_name "$BATS_TMPDIR/dangling-link"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "dangling-link" ]
+}

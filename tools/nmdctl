@@ -113,6 +113,25 @@ check_root() {
     fi
 }
 
+# Resolve a device path to the kernel device name the driver will open.
+#
+# The driver is given a bare name and opens /dev/<name>, so it must receive the
+# kernel name ("sdb1"), not the basename of whatever path the caller supplied.
+# A /dev/disk/by-id/... path is a symlink whose own basename exists nowhere in
+# /dev; passing that through unresolved makes the import silently do nothing.
+# A plain /dev/sdb1 is returned unchanged.
+#
+# readlink -e (not -f) so a path that does not fully resolve falls back to the
+# caller's own basename, which then fails the block-device checks rather than
+# yielding a plausible-looking name for a device that is not there.
+device_kernel_name() {
+    local device_path="$1"
+    local resolved
+    resolved=$(readlink -e "$device_path" 2>/dev/null)
+    [ -z "$resolved" ] && resolved="$device_path"
+    basename "$resolved"
+}
+
 # Run a command via nmdcmd
 run_nmd_command() {
     check_root
@@ -2691,21 +2710,6 @@ handle_check() {
     return 0
 }
 
-# Resolve a device path to the kernel device name the driver will open.
-#
-# The driver is given a bare name and opens /dev/<name>, so it must receive the
-# kernel name ("sdb1"), not the basename of whatever path the caller supplied.
-# A /dev/disk/by-id/... path is a symlink whose own basename exists nowhere in
-# /dev; passing that through unresolved makes the import silently do nothing.
-# readlink -f leaves a plain /dev/sdb1 untouched.
-device_kernel_name() {
-    local device_path="$1"
-    local resolved
-    resolved=$(readlink -f "$device_path" 2>/dev/null) || resolved="$device_path"
-    [ -z "$resolved" ] && resolved="$device_path"
-    basename "$resolved"
-}
-
 # Validate if a device/partition path is available for array use
 validate_device_path() {
     local device_path="$1"
@@ -2724,9 +2728,9 @@ validate_device_path() {
         return 1
     fi
 
-    # The driver opens /dev/<name>, so a path that does not resolve to a device
-    # node directly under /dev cannot be imported. Without this check the import
-    # is issued anyway and reports success while the array stays empty.
+    # Defence in depth: the -b test above accepts a block node anywhere, but the
+    # driver can only open one under /dev. The by-id case is handled at the
+    # import sites, not here - this catches e.g. a node created outside /dev.
     local kernel_name
     kernel_name=$(device_kernel_name "$device_path")
     if [ ! -b "/dev/$kernel_name" ]; then
@@ -2739,7 +2743,11 @@ validate_device_path() {
         local device_found=0
         for device_info in $available_devices_str; do
             IFS='|' read -r dev partition size_kb size_gb disk_id <<< "$device_info"
-            if [ "$partition" = "$device_path" ]; then
+            # The scanned list holds kernel paths (/dev/sdb1), so a by-id path
+            # never matches by string. Compare resolved names as well, or a
+            # stable path is rejected as "not in the list of available devices".
+            if [ "$partition" = "$device_path" ] || \
+               [ "$(device_kernel_name "$partition")" = "$kernel_name" ]; then
                 device_found=1
                 break
             fi
@@ -2977,7 +2985,7 @@ create_array_layout() {
             return 1
         fi
 
-        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(basename "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"
+        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(device_kernel_name "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"
 
         import_entries+=("$slot|$device_path|$size_kb|$disk_id")
         assigned_slots+=("$slot")
@@ -3000,9 +3008,11 @@ create_array_layout() {
     for entry in "${sorted_entries[@]}"; do
         IFS='|' read -r slot device_path size_kb disk_id <<< "$entry"
 
-        echo -e "Importing disk to slot $slot: ${BLUE}$(device_kernel_name "$device_path")${NC}"
+        local kernel_name
+        kernel_name=$(device_kernel_name "$device_path")
+        echo -e "Importing disk to slot $slot: ${BLUE}${kernel_name}${NC}"
 
-        if ! run_nmd_command "import $slot $(device_kernel_name "$device_path") 0 $size_kb 0 $disk_id"; then
+        if ! run_nmd_command "import $slot $kernel_name 0 $size_kb 0 $disk_id"; then
             echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
             import_failed=1
         else
@@ -3269,9 +3279,11 @@ create_array_interactive() {
         for entry in "${sorted_entries[@]}"; do
             IFS='|' read -r slot partition size_kb disk_id <<< "$entry"
 
-            echo -e "Importing disk to slot $slot: ${BLUE}$(device_kernel_name "$partition")${NC}"
+            local kernel_name
+            kernel_name=$(device_kernel_name "$partition")
+            echo -e "Importing disk to slot $slot: ${BLUE}${kernel_name}${NC}"
 
-            if ! run_nmd_command "import $slot $(device_kernel_name "$partition") 0 $size_kb 0 $disk_id"; then
+            if ! run_nmd_command "import $slot $kernel_name 0 $size_kb 0 $disk_id"; then
                 echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
                 import_failed=1
             else
@@ -3754,8 +3766,8 @@ add_disk() {
         fi
 
         # Display selected disk details
-        echo -e "Device: ${BLUE}$(basename "$selected_dev")${NC}"
-        echo -e "Partition: $(basename "$selected_partition")"
+        echo -e "Device: ${BLUE}$(device_kernel_name "$selected_dev")${NC}"
+        echo -e "Partition: $(device_kernel_name "$selected_partition")"
         echo -e "Size: $selected_size_gb GB"
         echo -e "ID: $selected_disk_id"
         echo ""
@@ -3782,8 +3794,8 @@ add_disk() {
 
             # Display selected disk details in the same format as create_array
             echo ""
-            echo -e "=== Selected disk: ${BLUE}$(basename "$selected_dev")${NC} ==="
-            echo -e "Partition: $(basename "$selected_partition")"
+            echo -e "=== Selected disk: ${BLUE}$(device_kernel_name "$selected_dev")${NC} ==="
+            echo -e "Partition: $(device_kernel_name "$selected_partition")"
             echo -e "Size: $selected_size_gb GB"
             if [ -n "$selected_disk_id" ]; then
                 echo -e "ID: $selected_disk_id"
@@ -3895,7 +3907,7 @@ add_disk() {
         fi
     else
         # In parameter mode, show what we're doing
-        echo -e "${YELLOW}Adding${NC}: ${YELLOW}$(basename "$selected_dev")${NC} ($(basename "$selected_partition")) to slot ${YELLOW}$slot_display${NC}"
+        echo -e "${YELLOW}Adding${NC}: ${YELLOW}$(device_kernel_name "$selected_dev")${NC} ($(device_kernel_name "$selected_partition")) to slot ${YELLOW}$slot_display${NC}"
     fi
 
     echo ""
