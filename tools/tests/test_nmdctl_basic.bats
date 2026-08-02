@@ -1076,3 +1076,63 @@ mock_import_with_status() {
     run get_saved_disk_offset "diskB"
     [ "$output" = "0" ]
 }
+
+@test "validate_disk_id - accepts a normal udev ID_SERIAL" {
+    run validate_disk_id "Samsung_SSD_860_EVO_1TB_S5B3NR0N810424T"
+
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_disk_id - empty is allowed (caller derives one later)" {
+    run validate_disk_id ""
+
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_disk_id - rejects the driver's delimiters" {
+    # The driver tokenises the import command on " ,\t\n", and the ID is the
+    # last field, so any of these truncates it silently.
+    run validate_disk_id "ata-SOME DISK_123"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "space, comma or tab" ]]
+
+    run validate_disk_id "ata-SOME,DISK_123"
+    [ "$status" -ne 0 ]
+
+    run validate_disk_id "$(printf 'ata-SOME\tDISK')"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_disk_id - rejects an ID longer than the driver can store" {
+    # MD_ID_SIZE is 80 including the terminator.
+    local ok_id
+    ok_id=$(printf 'a%.0s' $(seq 1 79))
+    run validate_disk_id "$ok_id"
+    [ "$status" -eq 0 ]
+
+    local long_id
+    long_id=$(printf 'a%.0s' $(seq 1 80))
+    run validate_disk_id "$long_id"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "at most 79" ]]
+}
+
+@test "parse_device_spec - rejects a spec whose ID contains a space" {
+    run parse_device_spec "/dev/sdb1:bad id"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "space, comma or tab" ]]
+}
+
+@test "resync_elapsed_file - distinct superblocks do not collide" {
+    NMDSTAT_VALUES[sbName]="/a b.dat"
+    local one
+    one=$(resync_elapsed_file)
+
+    NMDSTAT_VALUES[sbName]="/a_b.dat"
+    local two
+    two=$(resync_elapsed_file)
+
+    # A plain "tr '/ ' '__'" substitution would map both to the same name.
+    [ "$one" != "$two" ]
+}
