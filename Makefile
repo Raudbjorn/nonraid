@@ -33,6 +33,8 @@ HAVE_FAKEROOT := $(shell command -v fakeroot >/dev/null 2>&1 && echo yes)
 # dpkg-checkbuilddeps reads debian/control, so this also covers dh-sequence-dkms
 # and anything added there later. Gating on Debian + dh alone would pick the
 # native path on a Debian host missing dh-dkms and fail, rather than fall back.
+# dpkg-checkbuilddeps and dpkg-buildpackage both ship in dpkg-dev, so probing
+# for the former also establishes that the latter is present.
 HAVE_BUILDDEPS := $(shell command -v dpkg-checkbuilddeps >/dev/null 2>&1 && dpkg-checkbuilddeps >/dev/null 2>&1 && echo yes)
 
 ifeq ($(IS_DEBIAN)$(HAVE_DH)$(HAVE_FAKEROOT)$(HAVE_BUILDDEPS),yesyesyesyes)
@@ -58,6 +60,16 @@ OUT_UID := $(shell id -u)
 OUT_GID := $(shell id -g)
 endif
 
+# Failure advice differs by engine: podman has no daemon to start and no group
+# to join, so the docker wording would send a podman user down a dead end.
+ifeq ($(findstring podman,$(DOCKER)),podman)
+ENGINE_ADVICE := podman is daemonless - run 'podman info' to see the underlying error (often storage or subuid configuration).
+ENGINE_SWITCH :=
+else
+ENGINE_ADVICE := Is it running ('systemctl start docker'), and are you in the 'docker' group (log out and back in after adding)?
+ENGINE_SWITCH := Set DOCKER=podman to use podman instead.
+endif
+
 endif
 
 package-native:
@@ -77,13 +89,12 @@ ifneq ($(HAVE_DOCKER),yes)
 	@echo "  Either build on Debian/Ubuntu with:" >&2
 	@echo "      apt install $(DEB_BUILD_DEPS)" >&2
 	@echo "  or install $(DOCKER) and re-run 'make package' to build in $(DEB_IMAGE)." >&2
-	@echo "  Set DOCKER=podman to use podman instead." >&2
+	$(if $(ENGINE_SWITCH),@echo "  $(ENGINE_SWITCH)" >&2)
 	@exit 1
 else
 	@$(DOCKER) info >/dev/null 2>&1 || { \
-	    echo "make package: cannot reach the $(DOCKER) daemon." >&2; \
-	    echo "  Is it running ('systemctl start docker')," >&2; \
-	    echo "  and are you in the 'docker' group (log out and back in after adding)?" >&2; \
+	    echo "make package: cannot run $(DOCKER)." >&2; \
+	    echo "  $(ENGINE_ADVICE)" >&2; \
 	    exit 1; }
 	@echo "Not a Debian build host; building in $(DEB_IMAGE) via $(DOCKER)."
 	$(DOCKER) build -q \
