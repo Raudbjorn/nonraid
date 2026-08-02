@@ -1094,13 +1094,25 @@ mock_import_with_status() {
     # last field, so any of these truncates it silently.
     run validate_disk_id "ata-SOME DISK_123"
     [ "$status" -ne 0 ]
-    [[ "$output" =~ "space, comma or tab" ]]
+    [[ "$output" =~ "space, comma, tab or newline" ]]
 
     run validate_disk_id "ata-SOME,DISK_123"
     [ "$status" -ne 0 ]
 
     run validate_disk_id "$(printf 'ata-SOME\tDISK')"
     [ "$status" -ne 0 ]
+
+    run validate_disk_id "$(printf 'ata-SOME\nDISK')"
+    [ "$status" -ne 0 ]
+}
+
+@test "validate_disk_id - rejects nmdctl's own field separator" {
+    # Driver-valid, but nmdctl joins specs and import entries with '|' and reads
+    # them back with IFS='|', so this would shift every field after it.
+    run validate_disk_id "ata-SOME|DISK_123"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "contains a '|'" ]]
 }
 
 @test "validate_disk_id - rejects an ID longer than the driver can store" {
@@ -1117,22 +1129,115 @@ mock_import_with_status() {
     [[ "$output" =~ "at most 79" ]]
 }
 
+@test "validate_disk_id - measures the driver's limit in bytes, not characters" {
+    # strncpy into MD_ID_SIZE bounds bytes. 40 two-byte characters is 80 bytes,
+    # which the driver truncates, but only 40 characters - so a length check run
+    # in a multibyte locale would wave it through.
+    local multibyte_id
+    multibyte_id=$(printf 'ä%.0s' $(seq 1 40))
+
+    LC_ALL=en_US.UTF-8 run validate_disk_id "$multibyte_id"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "80 bytes" ]]
+}
+
 @test "parse_device_spec - rejects a spec whose ID contains a space" {
     run parse_device_spec "/dev/sdb1:bad id"
 
     [ "$status" -ne 0 ]
-    [[ "$output" =~ "space, comma or tab" ]]
+    [[ "$output" =~ "space, comma, tab or newline" ]]
 }
 
 @test "resync_elapsed_file - distinct superblocks do not collide" {
     NMDSTAT_VALUES[sbName]="/a b.dat"
-    local one
+    local one one_again
     one=$(resync_elapsed_file)
+    one_again=$(resync_elapsed_file)
 
     NMDSTAT_VALUES[sbName]="/a_b.dat"
     local two
     two=$(resync_elapsed_file)
 
-    # A plain "tr '/ ' '__'" substitution would map both to the same name.
+    # Resume has to find the file pause wrote, so the name must be stable for a
+    # given superblock...
+    [ "$one" = "$one_again" ]
+    # ...while still separating these two. A plain "tr '/ ' '__'" substitution
+    # would map both to the same name.
     [ "$one" != "$two" ]
+}
+
+# Seed the state handle_check reads for a running check, so it skips
+# get_all_nmdstat_values and takes the pause/cancel branch.
+seed_running_check() {
+    NMDSTAT_VALUES=(
+        [mdState]=STARTED
+        [mdResync]=1
+        [mdResyncAction]="check P"
+        [mdResyncCorr]=0
+        [mdResyncPos]=100
+        [mdResyncSize]=1000
+        [sbName]=/test.dat
+        [sbSynced]="${1:-0}"
+    )
+}
+
+@test "handle_check PAUSE - carries elapsed time across pause, resume, pause" {
+    export RESYNC_ELAPSED_DIR="$BATS_TMPDIR/resync-carry-$$"
+    eval 'run_nmd_command() { return 0; }'
+
+    # First pause, 60s after the check started.
+    seed_running_check "$(( $(date +%s) - 60 ))"
+    run handle_check PAUSE
+    [ "$status" -eq 0 ]
+
+    # Resuming makes the driver reset sbSynced, so a second pause 30s later
+    # measures only that segment. Overwriting rather than accumulating would
+    # discard the first 60s entirely.
+    seed_running_check "$(( $(date +%s) - 30 ))"
+    run handle_check PAUSE
+    [ "$status" -eq 0 ]
+
+    local saved
+    saved=$(cat "$RESYNC_ELAPSED_DIR"/resync_elapsed_*)
+    [ "$saved" -ge 90 ]
+    [ "$saved" -le 92 ]
+
+    rm -rf "$RESYNC_ELAPSED_DIR"
+}
+
+@test "handle_check PAUSE - a rejected pause writes no snapshot" {
+    export RESYNC_ELAPSED_DIR="$BATS_TMPDIR/resync-nopause-$$"
+    eval 'run_nmd_command() { return 1; }'
+
+    seed_running_check "$(( $(date +%s) - 60 ))"
+    run handle_check PAUSE
+    [ "$status" -ne 0 ]
+
+    # The check is still running against the same sbSynced. A snapshot here
+    # would be added to it by collect_resync_status and counted twice.
+    run bash -c "ls '$RESYNC_ELAPSED_DIR'/resync_elapsed_* 2>/dev/null"
+    [ "$status" -ne 0 ]
+
+    rm -rf "$RESYNC_ELAPSED_DIR"
+}
+
+@test "handle_check CANCEL - a rejected cancel keeps the carried segment" {
+    export RESYNC_ELAPSED_DIR="$BATS_TMPDIR/resync-nocancel-$$"
+    eval 'run_nmd_command() { return 1; }'
+
+    seed_running_check "$(( $(date +%s) - 30 ))"
+    mkdir -p "$RESYNC_ELAPSED_DIR"
+    local elapsed_file
+    elapsed_file=$(resync_elapsed_file)
+    echo 60 > "$elapsed_file"
+
+    run handle_check CANCEL
+    [ "$status" -ne 0 ]
+
+    # The run the driver refused to stop still needs its carried time.
+    [ -f "$elapsed_file" ]
+    [ "$(cat "$elapsed_file")" -eq 60 ]
+
+    rm -rf "$RESYNC_ELAPSED_DIR"
 }

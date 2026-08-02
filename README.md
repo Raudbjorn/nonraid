@@ -48,8 +48,10 @@ Argument parsing is strict — a second positional or an unknown option is rejec
 ### Builds on kernel 7.1
 
 7.1 moved the xor code to `lib/raid/xor/` and replaced `xor_blocks()` with `xor_gen()`,
-dropping `MAX_XOR_BLOCKS`. A version-gated shim in `md_nonraid/6.12/md_unraid.h` keeps the
-six call sites in `unraid.c` byte-identical to upstream.
+dropping `MAX_XOR_BLOCKS`. A version-gated shim in `md_nonraid/compat-xor.h`, force-included
+from `md_nonraid/Makefile`, keeps the six call sites in `unraid.c` byte-identical to upstream.
+It lives outside the vendored per-kernel directories so a vendor drop or a directory rename
+cannot strand it.
 
 On ≥ 7.1 the module gains a runtime dependency on `xor` (builtin before, modular now), so
 `insmod` alone fails with unknown symbol `xor_gen`. `depmod` records that dependency in
