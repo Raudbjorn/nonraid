@@ -1,21 +1,30 @@
 [Unit]
-Description=NonRAID array teardown ordering for Proxmox VE storage
+Description=NonRAID array activation/teardown ordering for Proxmox VE storage
 Documentation=https://github.com/Raudbjorn/nonraid
-# Started by the NonRAID storage plugin on first activation; ExecStart is a
-# no-op. The unit exists so node shutdown tears the stack down in order
-# (guests -> mergerfs pools -> member mounts -> array) - hence only ExecStop
-# does real work. Do not enable it; the plugin starts it on demand.
+# Started by the NonRAID storage plugin on first activation. The unit exists
+# so node shutdown tears the stack down in order (guests -> mergerfs pools ->
+# member mounts -> array). Left disabled by default; ENABLE it when guests on
+# a nonraid storage use onboot: qemu-server's cloud-init regeneration stats
+# the cloudinit volume before anything has activated the storage, and on a
+# cold boot that makes "qm start" fail once with "disk image already exists".
+# When enabled, ExecStart activates the enabled storages (starting the array
+# and mounting the pool) before pve-guests runs.
 Requires=local-fs.target
-After=local-fs.target
+After=local-fs.target pve-cluster.service pve-storage.target
 Before=pve-guests.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/true
+# '-': activation failure (degraded array with autostart off, missing module)
+# must not mark the unit failed, or its ExecStop teardown would never run.
+ExecStart=-/usr/sbin/pvesm status
 # Unmount every mergerfs pool the plugin created (fsname=nonraid-<storeid>).
 # Storage ids cannot contain whitespace, so cutting field 2 is safe here.
 ExecStop=-/bin/sh -c 'grep "^nonraid-.* fuse.mergerfs " /proc/mounts | cut -d" " -f2 | xargs -r -n1 umount'
 ExecStop=-/usr/bin/nmdctl -u unmount
 ExecStop=-/usr/bin/nmdctl -u stop
 ExecStop=-/bin/rm -f /var/lib/nonraid/array.running
+
+[Install]
+WantedBy=multi-user.target
