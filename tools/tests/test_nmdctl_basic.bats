@@ -1027,6 +1027,28 @@ mock_import_with_status() {
     [ "$output" = "0" ]
 }
 
+@test "save_disk_offset - rejects a disk ID longer than the driver stores" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-toolong"
+    rm -f "$DISK_OFFSETS_FILE"
+
+    # MD_ID_SIZE is 80 including the terminator and the driver strncpy()s
+    # MD_ID_SIZE-1, so /proc/nmdstat reports at most 79 bytes. A longer key
+    # could never be matched on reload, and the disk would return at offset 0.
+    local long79 long80
+    long79=$(printf 'a%.0s' $(seq 1 79))
+    long80=$(printf 'a%.0s' $(seq 1 80))
+
+    run save_disk_offset "$long80" 64
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "79 bytes" ]]
+    [ ! -f "$DISK_OFFSETS_FILE" ]
+
+    run save_disk_offset "$long79" 64
+    [ "$status" -eq 0 ]
+    run get_saved_disk_offset "$long79"
+    [ "$output" = "64" ]
+}
+
 @test "save_disk_offset - an unwritable path fails loudly instead of silently" {
     # Runs as root in CI, so permission bits are not a reliable barrier
     # (CAP_DAC_OVERRIDE). Put a regular file where the parent directory would

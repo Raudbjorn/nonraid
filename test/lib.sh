@@ -109,6 +109,38 @@ require_inside_workdir() {
     esac
 }
 
+# Refuse a /dev/disk/by-id link this harness did not create.
+#
+# mk_array.sh hands its members to `create --force`, which skips nmdctl's own
+# device-availability check, so running it against a prefix that happens to
+# match real host links would import real disks. Ownership is proven three
+# ways rather than assumed from the prefix: setup_disk.sh's marker exists, the
+# link is in the manifest that setup wrote, and the link resolves to a loop
+# device whose backing file is inside WORKDIR.
+require_owned_link() {
+    local link="$1" target backing backing_real wd_real
+
+    [ -e "$OWNED_MARKER" ] ||
+        die "$OWNED_MARKER not found: run setup_disk.sh first (this is not a workdir the harness created)"
+    [ -f "$OWNED_LINKS" ] ||
+        die "$OWNED_LINKS not found: run setup_disk.sh first"
+    grep -qxF "$link" "$OWNED_LINKS" ||
+        die "$link is not one of the links setup_disk.sh created - refusing to hand it to the driver"
+
+    target=$(readlink -f "$link") || die "$link does not resolve"
+    [ -b "$target" ] || die "$link does not resolve to a block device (got '$target')"
+
+    backing=$(losetup --raw -n -O BACK-FILE "$target" 2>/dev/null | head -1)
+    [ -n "$backing" ] || die "$link ($target) is not a loop device"
+
+    wd_real=$(readlink -m "$WORKDIR")
+    backing_real=$(readlink -m "$backing")
+    case "$backing_real/" in
+        "$wd_real"/*) ;;
+        *) die "$link is backed by $backing_real, outside $wd_real" ;;
+    esac
+}
+
 # nmdctl always runs against the harness superblock, never the system one.
 nmd() {
     "$NMDCTL" -s "$SUPERBLOCK_FILE" "$@"
