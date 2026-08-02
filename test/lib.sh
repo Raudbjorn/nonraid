@@ -20,8 +20,15 @@ TEST_OFFSET="${NONRAID_TEST_OFFSET:-64}"
 # Keep the harness's offset records out of the host's real array state.
 # nmdctl defaults this to /etc/nonraid/disk-offsets; mk_array.sh imports at a
 # nonzero offset, so without this the harness writes entries into the real file
-# and teardown would have to clean up something it does not own.
-export DISK_OFFSETS_FILE="${DISK_OFFSETS_FILE:-$WORKDIR/disk-offsets}"
+# and teardown - which deletes this path - would destroy the offsets of a live
+# array.
+#
+# Deliberately not `${DISK_OFFSETS_FILE:-...}`: DISK_OFFSETS_FILE is nmdctl's
+# own override, so anyone pointing it at the system file for normal use would
+# have that value inherited here and deleted on teardown. The harness sets it
+# outright, and its own override is validated below like every other one.
+OFFSETS_FILE="${NONRAID_TEST_OFFSETS_FILE:-$WORKDIR/disk-offsets}"
+export DISK_OFFSETS_FILE="$OFFSETS_FILE"
 
 # Written by setup_disk.sh. teardown refuses to delete anything without it, and
 # it also lists exactly which by-id links and images this run created, so
@@ -64,15 +71,23 @@ validate_config() {
     [ "$DISK_COUNT" -ge 3 ] || die "need at least 3 disks (P, Q and one data disk)"
     [ "$DISK_COUNT" -le 30 ] || die "at most 30 disks (P + Q + 28 data slots)"
 
-    # The superblock must live inside the directory this harness owns, or
-    # teardown would delete a file it did not create - including a real
-    # /nonraid.dat on a machine with a live array.
-    local wd_real sb_real
+    # The superblock and the offsets file must live inside the directory this
+    # harness owns, or teardown would delete files it did not create - a real
+    # /nonraid.dat, or the offsets of a live array.
+    local wd_real
     wd_real=$(readlink -m "$WORKDIR")
-    sb_real=$(readlink -m "$SUPERBLOCK_FILE")
-    case "$sb_real/" in
+    require_inside_workdir "$wd_real" "$SUPERBLOCK_FILE" NONRAID_TEST_SUPERBLOCK
+    require_inside_workdir "$wd_real" "$OFFSETS_FILE" NONRAID_TEST_OFFSETS_FILE
+}
+
+# Usage: require_inside_workdir <resolved workdir> <path> <variable name>
+require_inside_workdir() {
+    local wd_real="$1" path="$2" varname="$3" resolved
+    [ -n "$path" ] || die "$varname must not be empty"
+    resolved=$(readlink -m "$path")
+    case "$resolved/" in
         "$wd_real"/*) ;;
-        *) die "NONRAID_TEST_SUPERBLOCK ($sb_real) must be inside NONRAID_TEST_WORKDIR ($wd_real)" ;;
+        *) die "$varname ($resolved) must be inside NONRAID_TEST_WORKDIR ($wd_real)" ;;
     esac
 }
 

@@ -132,6 +132,19 @@ jobs:
       - name: Create, sync, write, fail a disk, rebuild, verify
         run: |
           set -e
+          # A bare `for ... && break` loop falls out of its last iteration with
+          # status 0, so a resync that never finishes would be indistinguishable
+          # from one that did and the run would go on to format a rebuilding
+          # array. The wait has to fail loudly when it expires.
+          wait_idle() {
+            for _ in $(seq 1 120); do
+              grep -q "mdResync=0" /proc/nmdstat && return 0
+              sleep 2
+            done
+            echo "timed out after 240s waiting for resync to finish" >&2
+            grep -E "^(mdState|mdResync)" /proc/nmdstat >&2 || true
+            return 1
+          }
           for i in 1 2 3 4; do
             truncate -s 1G "/tmp/d$i"
             L=$(sudo losetup -fP --show "/tmp/d$i")
@@ -144,7 +157,7 @@ jobs:
           $N create --force "P:${L1}p1:citest-1" "1:${L2}p1:citest-2" "2:${L3}p1:citest-3"
           $N -u start new_array
           $N -u check recon
-          for _ in $(seq 1 120); do grep -q "mdResync=0" /proc/nmdstat && break; sleep 2; done
+          wait_idle
           sudo mkfs.xfs -f /dev/nmd1p1 >/dev/null
           $N -u mount
           sudo dd if=/dev/urandom of=/mnt/disk1/t bs=1M count=64 status=none
@@ -161,7 +174,7 @@ jobs:
           $N -u replace -f "1:${L2}p1:citest-2"
           $N -u start recon_disk
           $N -u check recon
-          for _ in $(seq 1 120); do grep -q "mdResync=0" /proc/nmdstat && break; sleep 2; done
+          wait_idle
           $N -u mount
           AFTER=$(sudo md5sum /mnt/disk1/t | cut -d' ' -f1)
           echo "before=$BEFORE degraded=$DEGRADED after=$AFTER"

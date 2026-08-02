@@ -2264,6 +2264,15 @@ save_disk_offset() {
     local offset="${2:-0}"
 
     [ -z "$disk_id" ] && return 0
+    # The record format is "<id> <offset>" and lookups match on the first field,
+    # so an ID containing whitespace would write a record that can never be
+    # found again - and the awk filter below would never remove it either. The
+    # disk would then be re-imported at offset 0, reading from the wrong base
+    # address, which is exactly the failure this file exists to prevent.
+    if [[ "$disk_id" =~ [[:space:]] ]]; then
+        echo -e "${RED}Error: disk ID '$disk_id' contains whitespace and cannot be recorded${NC}" >&2
+        return 1
+    fi
     if ! is_valid_offset "$offset"; then
         echo -e "${RED}Error: refusing to record offset '$offset' for $disk_id (not a canonical decimal sector count)${NC}" >&2
         return 1
@@ -2325,9 +2334,15 @@ get_saved_disk_offset() {
         return 0
     fi
 
-    offset=$(awk -v id="$disk_id" \
+    # A failed read must not look like "no record": empty output would otherwise
+    # fall through to offset 0 and import an offset-backed member at sector 0,
+    # which is the fail-open this function is written to avoid.
+    if ! offset=$(awk -v id="$disk_id" \
         '$1 == id { val = $2; found = 1 } END { if (found) print (val == "" ? "?" : val) }' \
-        "$DISK_OFFSETS_FILE" 2>/dev/null)
+        "$DISK_OFFSETS_FILE" 2>/dev/null); then
+        echo "0"
+        return 2
+    fi
 
     if [ -z "$offset" ]; then
         echo "0"
@@ -4407,16 +4422,22 @@ unassign_disk() {
 
     echo -e "Unassigning disk from slot $slot_display..."
 
-    # Unassign the disk by importing an empty device
-    # Drop any recorded offset for the disk leaving the slot, so a later import
-    # of the same physical disk does not inherit a base address from an array it
-    # is no longer part of.
     local unassigned_id="${NMDSTAT_VALUES[diskId.$slot]}"
-    [ -n "$unassigned_id" ] && save_disk_offset "$unassigned_id" 0
 
+    # Unassign the disk by importing an empty device
     if ! run_nmd_command "import $slot '' 0 0 0 ''"; then
         echo -e "${RED}Error: Failed to unassign disk from slot $slot${NC}"
         return 1
+    fi
+
+    # Only now drop the recorded offset, so a later import of the same physical
+    # disk does not inherit a base address from an array it is no longer part
+    # of. Clearing it first would delete the offset of a disk that is still
+    # assigned whenever the command above fails, and the next reload would then
+    # import that disk from sector 0.
+    if [ -n "$unassigned_id" ] && ! save_disk_offset "$unassigned_id" 0; then
+        echo -e "${YELLOW}Warning: the disk was unassigned but its recorded import offset could not be cleared.${NC}" >&2
+        echo -e "${YELLOW}Remove the '$unassigned_id' entry from $DISK_OFFSETS_FILE before re-adding this disk.${NC}" >&2
     fi
 
     echo -e "${GREEN}Successfully unassigned disk from slot $slot_display${NC}"

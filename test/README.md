@@ -35,6 +35,7 @@ All overridable; defaults in brackets.
 | `NONRAID_TEST_MOUNT_PREFIX` | mount point prefix [`/mnt/disk`] |
 | `NONRAID_TEST_SUPERBLOCK` | superblock path [`$WORKDIR/nonraid.dat`] |
 | `NONRAID_TEST_OFFSET` | import offset in 512-byte sectors [`64`] |
+| `NONRAID_TEST_OFFSETS_FILE` | offset records path, must be inside `$WORKDIR` [`$WORKDIR/disk-offsets`] |
 | `NMDCTL` | nmdctl to test [`../tools/nmdctl`] |
 
 ## Limits
@@ -64,7 +65,9 @@ in `.nonraid-test-links`, and teardown removes exactly those rather than
 globbing the prefix. It refuses to overwrite a link it does not already own.
 
 Offsets are written to `$WORKDIR/disk-offsets` rather than the system
-`/etc/nonraid/disk-offsets`, so a harness run leaves no entries in real array
+`/etc/nonraid/disk-offsets`. The harness sets `DISK_OFFSETS_FILE` outright rather than
+honouring an inherited value, because that variable is nmdctl's own override and teardown
+deletes whatever it points at. So a harness run leaves no entries in real array
 state.
 
 ## Note
