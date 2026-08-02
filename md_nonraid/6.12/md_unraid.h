@@ -57,7 +57,9 @@
  * the call sites stay in sync with upstream.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7,1,0)
+#ifndef MAX_XOR_BLOCKS
 #define MAX_XOR_BLOCKS 4
+#endif
 static inline void xor_blocks(unsigned int count, unsigned int bytes,
 			      void *dest, void **srcs)
 {
