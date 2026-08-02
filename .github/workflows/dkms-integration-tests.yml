@@ -227,7 +227,7 @@ jobs:
           sudo bash tools/nmdctl -u stop
 
           echo "Unassign a disk from array..."
-          sudo bash tools/nmdctl unassign 1 <<< "y" || true
+          sudo bash tools/nmdctl -u unassign -f 1 || true
           sudo bash tools/nmdctl status || true
 
           echo "Wiping disk 2..."
