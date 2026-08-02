@@ -3224,6 +3224,17 @@ create_array_layout() {
             return 1
         fi
 
+        # A whole device imported at offset 0 is not reproduced on reload:
+        # nothing is recorded (offset 0 means "no record"), so import_disks
+        # falls back to the largest partition, which changes both the base
+        # address and the size. Only warn - the import itself is valid, and a
+        # whole device with no partition at all is reloaded correctly.
+        if [ "$provided_offset" -eq 0 ] && is_whole_device "$device_path" &&
+           [ -n "$(lsblk -lpno KNAME "$device_path" 2>/dev/null | grep -vFx "$device_path" | head -1)" ]; then
+            echo -e "${YELLOW}Warning: $device_path is a whole device with partitions, imported at offset 0.${NC}" >&2
+            echo -e "${YELLOW}A reload will import its largest partition instead. Give the partition explicitly, or an offset.${NC}" >&2
+        fi
+
         echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(device_kernel_name "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id$([ "$provided_offset" -gt 0 ] && echo " Offset: $provided_offset")"
 
         import_entries+=("$slot|$device_path|$size_kb|$provided_offset|$disk_id")

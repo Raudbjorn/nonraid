@@ -56,9 +56,27 @@ require_cmd() {
 # script before it touches anything.
 validate_config() {
     [ -n "$WORKDIR" ]      || die "NONRAID_TEST_WORKDIR must not be empty"
-    [ -n "$BYID_PREFIX" ]  || die "NONRAID_TEST_PREFIX must not be empty: cleanup would match every by-id link on the host"
-    [ -n "$MOUNT_PREFIX" ] || die "NONRAID_TEST_MOUNT_PREFIX must not be empty: cleanup would rmdir every empty directory in \$PWD"
     [ -n "$SUPERBLOCK_FILE" ] || die "NONRAID_TEST_SUPERBLOCK must not be empty"
+
+    # The prefix becomes a filename directly under /dev/disk/by-id and a line in
+    # the ownership manifest, so non-emptiness is not enough: a value containing
+    # a slash escapes that directory entirely, and whitespace or a newline
+    # corrupts the line-based manifest that teardown reads back.
+    [ -n "$BYID_PREFIX" ] || die "NONRAID_TEST_PREFIX must not be empty: cleanup would match every by-id link on the host"
+    [[ "$BYID_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "NONRAID_TEST_PREFIX ('$BYID_PREFIX') must be a plain name prefix: [A-Za-z0-9][A-Za-z0-9._-]*"
+
+    # Mount points are formed as ${MOUNT_PREFIX}<slot>, so the prefix must be an
+    # absolute path with a non-empty final component - '/' or '/mnt/' would put
+    # the harness's rmdir loop on directories it never created.
+    [ -n "$MOUNT_PREFIX" ] || die "NONRAID_TEST_MOUNT_PREFIX must not be empty: cleanup would rmdir every empty directory in \$PWD"
+    case "$MOUNT_PREFIX" in
+        /*/?*) ;;
+        *) die "NONRAID_TEST_MOUNT_PREFIX ('$MOUNT_PREFIX') must be an absolute path with a non-empty final component" ;;
+    esac
+    if [[ "$MOUNT_PREFIX" =~ [[:space:]] ]]; then
+        die "NONRAID_TEST_MOUNT_PREFIX ('$MOUNT_PREFIX') must not contain whitespace"
+    fi
 
     case "$WORKDIR" in
         /|/dev|/etc|/usr|/var|/home|/boot|/root) die "refusing to use $WORKDIR as the test workdir" ;;
