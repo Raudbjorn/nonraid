@@ -21,6 +21,9 @@ setup() {
     # the suite runs as root in CI, so a stray save_disk_offset would write to
     # real array state.
     export DISK_OFFSETS_FILE="$BATS_TMPDIR/default-disk-offsets"
+    # Same reasoning for the elapsed-time snapshots, whose default is now a
+    # persistent directory rather than tmpfs.
+    export RESYNC_ELAPSED_DIR="$BATS_TMPDIR/default-resync-elapsed"
 }
 
 teardown() {
@@ -1165,6 +1168,29 @@ mock_import_with_status() {
     # ...while still separating these two. A plain "tr '/ ' '__'" substitution
     # would map both to the same name.
     [ "$one" != "$two" ]
+}
+
+@test "resync_elapsed_file - refuses to name a file without a superblock name" {
+    # An empty sbName would hash to one key shared by every array, so a snapshot
+    # taken against one superblock would be applied to another.
+    NMDSTAT_VALUES[sbName]=""
+    run resync_elapsed_file
+    [ "$status" -ne 0 ]
+    [ -z "$output" ]
+
+    unset "NMDSTAT_VALUES[sbName]"
+    run resync_elapsed_file
+    [ "$status" -ne 0 ]
+}
+
+@test "resync_elapsed_file - state is persistent, not tmpfs" {
+    # A paused check survives a reboot because its position lives in the
+    # superblock, so the elapsed snapshot has to survive one too.
+    NMDSTAT_VALUES[sbName]="/nonraid.dat"
+    local dir
+    dir=$(RESYNC_ELAPSED_DIR="${STATE_DIRECTORY:-/var/lib/nonraid}" bash -c 'echo "$RESYNC_ELAPSED_DIR"')
+    [[ "$dir" != /run/* ]]
+    [[ "$(dirname "$(resync_elapsed_file)")" != /run/* ]]
 }
 
 # Seed the state handle_check reads for a running check, so it skips
