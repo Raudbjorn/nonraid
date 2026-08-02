@@ -77,6 +77,10 @@ validate_config() {
     if [[ "$MOUNT_PREFIX" =~ [[:space:]] ]]; then
         die "NONRAID_TEST_MOUNT_PREFIX ('$MOUNT_PREFIX') must not contain whitespace"
     fi
+    # The shape test alone is not enough: "/root/../.." has a non-empty final
+    # component and still resolves to the root directory.
+    [ "$(readlink -m "$MOUNT_PREFIX")" != "/" ] ||
+        die "refusing to use '$MOUNT_PREFIX' as the mount prefix: it resolves to /"
 
     case "$WORKDIR" in
         /|/dev|/etc|/usr|/var|/home|/boot|/root) die "refusing to use $WORKDIR as the test workdir" ;;

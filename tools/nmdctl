@@ -2375,6 +2375,15 @@ save_disk_offset() {
         return 1
     fi
 
+    # A directory here would swallow the rename: "mv tmp somedir" succeeds by
+    # moving the file inside it, so this would report the offset persisted while
+    # the configured path was never replaced, and the next reload would find no
+    # record and import at sector 0.
+    if [ -e "$DISK_OFFSETS_FILE" ] && [ ! -f "$DISK_OFFSETS_FILE" ]; then
+        echo -e "${RED}Error: $DISK_OFFSETS_FILE is not a regular file; refusing to record the import offset${NC}" >&2
+        return 1
+    fi
+
     local dir tmp
     dir=$(dirname "$DISK_OFFSETS_FILE")
     if ! mkdir -p "$dir" 2>/dev/null; then
@@ -3698,6 +3707,8 @@ create_array_interactive() {
             # physical disk, so rebuilding an array from the same disks would
             # otherwise leave a stale entry that reload applies as a base
             # address the array was never created with.
+            local prev_offset
+            prev_offset=$(get_saved_disk_offset "$disk_id")
             if ! save_disk_offset "$disk_id" 0; then
                 echo -e "${RED}Error: Could not clear a stale import offset for slot $slot; refusing to import${NC}"
                 import_failed=1
@@ -3706,6 +3717,11 @@ create_array_interactive() {
 
             if ! run_nmd_command "import $slot $kernel_name 0 $size_kb 0 $disk_id"; then
                 echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
+                # Put the old record back, as the non-interactive paths do. New
+                # Config keeps the previous superblock in .bak; aborting and
+                # restoring it after a failed import would otherwise reload an
+                # offset-backed disk at sector 0.
+                save_disk_offset "$disk_id" "$prev_offset" || true
                 import_failed=1
             else
                 echo -e "${GREEN}Successfully imported disk to slot $slot${NC}"
