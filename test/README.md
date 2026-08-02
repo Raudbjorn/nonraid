@@ -64,6 +64,12 @@ resolves array members through that directory. Each link it creates is recorded
 in `.nonraid-test-links`, and teardown removes exactly those rather than
 globbing the prefix. It refuses to overwrite a link it does not already own.
 
+`mk_array.sh` refuses any member that setup did not create: the ownership marker
+and link manifest must exist, the link must be listed in the manifest, and it must
+resolve to a loop device whose backing file is inside `$WORKDIR`. `create --force`
+skips nmdctl's availability check, so a prefix colliding with real host links would
+otherwise import real disks.
+
 Offsets are written to `$WORKDIR/disk-offsets` rather than the system
 `/etc/nonraid/disk-offsets`. The harness sets `DISK_OFFSETS_FILE` outright rather than
 honouring an inherited value, because that variable is nmdctl's own override and teardown

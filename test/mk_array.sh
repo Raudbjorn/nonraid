@@ -23,6 +23,13 @@ for i in $(seq 3 "$DISK_COUNT"); do
     layout+=("$((i - 2)):$(byid "$i"):${BYID_PREFIX}$(printf '%03d' "$i"):$OFFSET")
 done
 
+# Every member is checked before any of them reaches the driver: `create
+# --force` below skips nmdctl's availability validation, so a prefix colliding
+# with real host links would otherwise import real disks at an offset.
+for i in $(seq 1 "$DISK_COUNT"); do
+    require_owned_link "$(byid "$i")"
+done
+
 echo ">>> [mk_array] creating array: ${layout[*]}"
 nmd create --force "${layout[@]}"
 

@@ -2260,6 +2260,10 @@ is_whole_device() {
 # re-added without an offset does not keep a stale one.
 # Usage: save_disk_offset <disk_id> <offset_sectors>
 save_disk_offset() {
+    # MD_ID_SIZE bounds bytes, not characters, and ${#var} counts characters in
+    # a multibyte locale. The C locale makes the two the same for the length
+    # test below.
+    local LC_ALL=C
     local disk_id="$1"
     local offset="${2:-0}"
 
@@ -2271,6 +2275,15 @@ save_disk_offset() {
     # address, which is exactly the failure this file exists to prevent.
     if [[ "$disk_id" =~ [[:space:]] ]]; then
         echo -e "${RED}Error: disk ID '$disk_id' contains whitespace and cannot be recorded${NC}" >&2
+        return 1
+    fi
+    # The lookup key on reload is diskId.<slot> from /proc/nmdstat, which the
+    # driver has already truncated: MD_ID_SIZE is 80 including the terminator
+    # and md_unraid.c strncpy()s MD_ID_SIZE-1 bytes. Recording the full-length
+    # ID would write a key the reload can never match, and the disk would come
+    # back at offset 0.
+    if [ "${#disk_id}" -gt 79 ]; then
+        echo -e "${RED}Error: disk ID is longer than the 79 bytes the driver stores; refusing to record an offset it could never match${NC}" >&2
         return 1
     fi
     if ! is_valid_offset "$offset"; then
