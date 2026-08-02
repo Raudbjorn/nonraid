@@ -51,9 +51,10 @@ Argument parsing is strict — a second positional or an unknown option is rejec
 dropping `MAX_XOR_BLOCKS`. A version-gated shim in `md_nonraid/6.12/md_unraid.h` keeps the
 six call sites in `unraid.c` byte-identical to upstream.
 
-On ≥ 7.1 the module gains a runtime dependency on `xor` (builtin before, modular now):
-`insmod` alone fails with unknown symbol `xor_gen`, while `modprobe`/`depmod` resolve it, so
-DKMS is unaffected.
+On ≥ 7.1 the module gains a runtime dependency on `xor` (builtin before, modular now), so
+`insmod` alone fails with unknown symbol `xor_gen`. `depmod` records that dependency in
+`modules.dep` and `modprobe` reads it to load `xor` before the module, so the normal load
+path — and DKMS, which runs `depmod` on install — is unaffected.
 
 ### `make package` works off Debian
 

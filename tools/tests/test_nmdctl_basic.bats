@@ -988,6 +988,36 @@ mock_import_with_status() {
     [ "$status" -eq 2 ]
 }
 
+@test "get_saved_disk_offset - a read failure fails closed rather than reading as 0" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-unreadable"
+    printf 'diskA 64\n' > "$DISK_OFFSETS_FILE"
+
+    # Permission bits are not a barrier under root (CAP_DAC_OVERRIDE), so the
+    # read is broken by shadowing awk instead. Empty output from a failed read
+    # must not be read as "no record".
+    awk() { return 1; }
+
+    run get_saved_disk_offset "diskA"
+    unset -f awk
+
+    [ "$status" -eq 2 ]
+}
+
+@test "save_disk_offset - rejects a disk ID containing whitespace" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-whitespace"
+    rm -f "$DISK_OFFSETS_FILE"
+
+    # "<id> <offset>" is whitespace separated and lookups match on the first
+    # field, so such a record could never be found or removed again.
+    run save_disk_offset "disk with spaces" 64
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "whitespace" ]]
+    [ ! -f "$DISK_OFFSETS_FILE" ]
+
+    run save_disk_offset "$(printf 'disk\tid')" 64
+    [ "$status" -ne 0 ]
+}
+
 @test "get_saved_disk_offset - absent record is 0 with success" {
     export DISK_OFFSETS_FILE="$BATS_TMPDIR/offsets-absent"
     printf 'diskA 64\n' > "$DISK_OFFSETS_FILE"
