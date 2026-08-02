@@ -30,6 +30,7 @@ jobs:
         run: |
           shellcheck -x tools/nmdctl
           shellcheck packaging/docker/build-deb.sh
+          shellcheck -x test/*.sh
 
       - name: Bash syntax
         run: bash -n tools/nmdctl

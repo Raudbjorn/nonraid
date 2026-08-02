@@ -31,6 +31,15 @@ SUPERBLOCK_PATH=""
 # LUKS keyfile path
 LUKS_KEYFILE="/etc/nonraid/luks-keyfile"
 
+# Persisted per-disk import offsets (512-byte sectors), keyed by disk ID.
+#
+# The driver does not keep a disk's import offset in its superblock, so nmdctl
+# records any non-zero offset here and reuses it when re-importing after a
+# module reload. Losing this file means an offset-imported disk comes back at
+# offset 0 and therefore the wrong size, so it is array state - back it up
+# alongside the superblock.
+DISK_OFFSETS_FILE="/etc/nonraid/disk-offsets"
+
 # verbose, unattended
 VERBOSE=0
 UNATTENDED=0
@@ -68,15 +77,19 @@ Status and monitoring command:
 
 Array Management Commands:
     create                          Create a new array with interactive disk assignment
-    create [-f] [SLOT:DEV[:ID] ..]  Create a new array with layout directly as arguments
+    create [-f] [SLOT:DEV[:ID[:OFFSET]] ..]
+                                    Create a new array with layout directly as arguments
                                     Example: nmdctl create P:/dev/sdb1 1:/dev/sdc1 2:/dev/sdd1 ...
+                                    OFFSET is in 512-byte sectors and allows importing a
+                                    raw device without partitioning it; it requires the
+                                    four-field form so a numeric ID stays unambiguous
                                     Options: -f, --force: Skip device availability checks, allow any block device
     start                           Start the array
     stop                            Stop the array
     import                          Import all disks to the array without starting it
 
 Disk Management Commands:
-    add [SLOT:DEV[:ID]]             Add a new disk to the array
+    add [SLOT:DEV[:ID[:OFFSET]]]    Add a new disk to the array
     replace SLOT[:DEV[:ID]]         Replace a disk in the specified slot
     unassign [-f] SLOT              Unassign a disk from the specified slot
                                     -f, --force: skip the confirmation prompt
@@ -913,7 +926,7 @@ format_human_output() {
         echo -e "${YELLOW}WARNING: Driver internal state is inconsistent!${NC}"
         echo -e "${YELLOW}The array mdNum* counters show non-zero values, but all individual disks are DISK_OK status.${NC}"
         echo -e "${YELLOW}This can happen after initial array creation, but it may cause unexpected behavior.${NC}"
-        echo -e "${YELLOW}Recommend reloading the driver and starting the array again: ${GREEN}nmdctl reload && nmdctl start${NC}"
+        echo -e "${YELLOW}Recommend reloading the driver and starting the array again: ${GREEN}nmdctl unmount && nmdctl reload && nmdctl start${NC}"
         echo ""
     fi
 
@@ -1717,21 +1730,21 @@ format_kbytes() {
     elif [ "$force_unit" = "kb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1024 ]; }; then
         [ "$add_unit" -eq 1 ] && unit=" kB"
         printf "%d%s" "$kb" "$unit"
-    elif [ "$force_unit" = "mb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1048576 ]; }; then  # 1024^2
-        local mb=$((kb / 1024))
-        local remainder=$((kb % 1024))
+    elif [ "$force_unit" = "mb" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1000000000 ]; }; then  # < 1 GB
+        local mb=$((bytes / 1000000))
+        local remainder=$((bytes % 1000000))
         [ "$add_unit" -eq 1 ] && unit=" MB"
-        format_with_decimals "$mb" "$remainder" "1024" "$unit" "$decimal_places"
-    elif [ "$force_unit" = "gb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1073741824 ]; }; then  # 1024^3
-        local gb=$((kb / 1048576))
-        local remainder=$((kb % 1048576))
+        format_with_decimals "$mb" "$remainder" "1000000" "$unit" "$decimal_places"
+    elif [ "$force_unit" = "gb" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1000000000000 ]; }; then  # < 1 TB
+        local gb=$((bytes / 1000000000))
+        local remainder=$((bytes % 1000000000))
         [ "$add_unit" -eq 1 ] && unit=" GB"
-        format_with_decimals "$gb" "$remainder" "1048576" "$unit" "$decimal_places"
+        format_with_decimals "$gb" "$remainder" "1000000000" "$unit" "$decimal_places"
     elif [ "$force_unit" = "tb" ] || [ -z "$force_unit" ]; then
-        local tb=$((kb / 1073741824))
-        local remainder=$((kb % 1073741824))
+        local tb=$((bytes / 1000000000000))
+        local remainder=$((bytes % 1000000000000))
         [ "$add_unit" -eq 1 ] && unit=" TB"
-        format_with_decimals "$tb" "$remainder" "1073741824" "$unit" "$decimal_places"
+        format_with_decimals "$tb" "$remainder" "1000000000000" "$unit" "$decimal_places"
     fi
 }
 
@@ -2142,16 +2155,26 @@ get_fs_usage() {
     return 0
 }
 
-# Get disk size in 1K blocks
+# Get disk size in 1K blocks, optionally subtracting an import offset.
+# Usage: get_disk_size_kb <device> [offset_sectors]
 get_disk_size_kb() {
     local device="$1"
+    local offset_sectors="${2:-0}"
     if [ ! -b "$device" ]; then
         return 1
     fi
+    is_valid_offset "$offset_sectors" || return 1
 
     # Use blockdev to get exact size in 512-byte logical sectors
     local sectors=$(blockdev --getsz "$device" 2>/dev/null)
     if [ -n "$sectors" ]; then
+        # The offset is not part of the usable data region
+        if [ "$offset_sectors" -gt 0 ]; then
+            sectors=$(( sectors - offset_sectors ))
+            if [ "$sectors" -le 0 ]; then
+                return 1
+            fi
+        fi
         # Round down to nearest multiple of 8 sectors (driver reads/writes 8 sectors at a time)
         local adjusted_sectors=$(( (sectors / 8) * 8 ))
         # Convert to 1K blocks (2 sectors = 1KB)
@@ -2160,6 +2183,97 @@ get_disk_size_kb() {
         return 0
     fi
     return 1
+}
+
+# Split the part of a create/add spec that follows the slot, i.e.
+# DEV[:ID[:OFFSET]], and echo "device|id|offset".
+#
+# Upstream's version treated a numeric second field as an offset, so
+# "1:/dev/sdb1:64" meant offset 64. That makes a disk ID consisting only of
+# digits parse as an offset instead, importing the disk at a wrong offset and
+# sizing it wrongly - silently, since both readings are well-formed. An
+# explicit offset therefore requires the unambiguous four-field form
+# SLOT:DEV:ID:OFFSET, and the third field is always an ID.
+# Usage: parse_device_spec <rest>
+parse_device_spec() {
+    local rest="$1"
+    local -a fields
+    IFS=':' read -ra fields <<< "$rest"
+
+    local device="${fields[0]}"
+    local disk_id=""
+    local offset=0
+
+    if [ ${#fields[@]} -ge 2 ]; then
+        disk_id="${fields[1]}"
+    fi
+    if [ ${#fields[@]} -ge 3 ]; then
+        offset="${fields[2]}"
+    fi
+    if [ ${#fields[@]} -ge 4 ]; then
+        echo -e "${RED}Error: too many fields in '$rest' (expected DEV[:ID[:OFFSET]])${NC}" >&2
+        return 1
+    fi
+
+    if ! is_valid_offset "$offset"; then
+        echo -e "${RED}Error: offset '$offset' is not a number of 512-byte sectors${NC}" >&2
+        return 1
+    fi
+
+    echo "$device|$disk_id|$offset"
+}
+
+# An offset is a count of 512-byte sectors. Anything else is rejected rather
+# than allowed to fail open in a later arithmetic test.
+is_valid_offset() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# Record the import offset used for a disk ID so it can be recovered on a later
+# reload. Any previous entry for the ID is cleared first, so a disk later
+# re-added without an offset does not keep a stale one.
+# Usage: save_disk_offset <disk_id> <offset_sectors>
+save_disk_offset() {
+    local disk_id="$1"
+    local offset="${2:-0}"
+
+    [ -z "$disk_id" ] && return 0
+    if ! is_valid_offset "$offset"; then
+        echo -e "${RED}Error: refusing to record non-numeric offset '$offset' for $disk_id${NC}" >&2
+        return 1
+    fi
+
+    # Rewrite via a temporary file, but only replace the original once awk has
+    # succeeded - a failure here would otherwise truncate the offsets of every
+    # other disk in the array.
+    if [ -f "$DISK_OFFSETS_FILE" ]; then
+        local tmp="${DISK_OFFSETS_FILE}.tmp.$$"
+        if awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$DISK_OFFSETS_FILE"
+        else
+            rm -f "$tmp"
+            echo -e "${RED}Error: could not rewrite $DISK_OFFSETS_FILE${NC}" >&2
+            return 1
+        fi
+    fi
+
+    [ "$offset" -eq 0 ] && return 0
+
+    mkdir -p "$(dirname "$DISK_OFFSETS_FILE")" 2>/dev/null
+    echo "$disk_id $offset" >> "$DISK_OFFSETS_FILE"
+}
+
+# Echo the recorded import offset for a disk ID, or 0 if none.
+# Usage: get_saved_disk_offset <disk_id>
+get_saved_disk_offset() {
+    local disk_id="$1"
+    local offset=""
+
+    if [ -n "$disk_id" ] && [ -f "$DISK_OFFSETS_FILE" ]; then
+        offset=$(awk -v id="$disk_id" '$1 == id { val = $2 } END { print val }' "$DISK_OFFSETS_FILE" 2>/dev/null)
+    fi
+    is_valid_offset "$offset" || offset=0
+    echo "$offset"
 }
 
 # Find an unused largest partition for a given disk device
@@ -2286,63 +2400,94 @@ import_disks() {
             found_device=$(find_matching_disk "$disk_id")
         fi
 
-        # Check if device exists and has an available partition
-        local partition=""
-        if [ -n "$found_device" ]; then
+        if [ -z "$found_device" ]; then
+            echo -e "${YELLOW}Warning: Could not find physical disk for ID: ${short_id}${NC}"
+            continue
+        fi
+
+        # The driver does not persist a disk's import offset, so if this disk
+        # was originally imported at an explicit offset, reuse the one recorded
+        # at create/add time. Without it the size is recomputed over the whole
+        # device and every offset disk reports a size mismatch on reload.
+        local saved_offset
+        saved_offset=$(get_saved_disk_offset "$disk_id")
+
+        local import_device=""
+        local offset=0
+
+        if [ "$saved_offset" -gt 0 ]; then
+            # Raw whole-disk import at the recorded offset
+            import_device="$found_device"
+            offset="$saved_offset"
+        else
+            # No recorded offset: the usual partition-based import, or a raw
+            # whole-disk import when the device has no partition at all.
+            local partition
             partition="$(find_partition "$found_device")"
             local find_rc=$?
             if [ "$find_rc" -eq 2 ]; then
                 echo -e "${YELLOW}Warning: Partition $partition on $found_device is locked by another process, skipping${NC}"
                 partition=""
             fi
+
             if [ -n "$partition" ]; then
-                # Get the partition size
-                local disk_size=$(get_disk_size_kb "$partition")
-
-                if [ -n "$disk_size" ]; then
-                    # Get the configured size from nmdstat
-                    local configured_size=$(get_nmdstat_value "diskSize.$slot")
-                    local size_to_use="$disk_size"
-
-                    # If we have a configured size and it differs from actual size
-                    if [ -n "$configured_size" ] && [ "$configured_size" -gt 0 ] && [ "$configured_size" -ne "$disk_size" ]; then
-                        echo -e "${YELLOW}Warning: Size mismatch for disk in slot $slot${NC}"
-                        echo -e "  Partition size: $disk_size KB"
-                        echo -e "  Expected size : $configured_size KB"
-
-                        if [ "$UNATTENDED" -eq 1 ]; then
-                            # If unattended, do not continue import
-                            echo -e "${RED}Error: Size mismatch for disk in slot $slot (unattended mode)${NC}"
-                            continue
-                        fi
-
-                        # Ask for confirmation
-                        read -r -p "Use the configured size instead of detected size? (y/N): " confirm
-                        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                            size_to_use="$configured_size"
-                            echo -e "Using configured size: ${BLUE}$configured_size KB${NC}"
-                        else
-                            echo -e "Using detected partition size: ${BLUE}$disk_size KB${NC}"
-                        fi
-                    fi
-
-                    echo -e "Found disk for slot $slot: ${BLUE}$(device_kernel_name "$partition")${NC} (ID: ${short_id})"
-
-                    # Store the kernel device name; the driver opens /dev/<name>
-                    partition=$(device_kernel_name "$partition")
-
-                    # Add to import list: slot, partition, offset, size, erased, id
-                    disks_to_import+=("$slot|$partition|0|$size_to_use|0|$disk_id")
-                    num_disks=$((num_disks + 1))
-                else
-                    echo -e "${YELLOW}Warning: Could not determine size for $partition${NC}"
+                import_device="$partition"
+            elif [ "$find_rc" -ne 2 ]; then
+                local has_partition
+                has_partition=$(lsblk -lpno KNAME "$found_device" 2>/dev/null | grep -v -w "^$found_device$" | head -1)
+                if [ -z "$has_partition" ]; then
+                    import_device="$found_device"
                 fi
-            else
-                echo -e "${YELLOW}Warning: No partition found for disk $found_device${NC}"
             fi
-        else
-            echo -e "${YELLOW}Warning: Could not find physical disk for ID: ${short_id}${NC}"
         fi
+
+        if [ -z "$import_device" ]; then
+            echo -e "${YELLOW}Warning: No usable partition found for disk $found_device${NC}"
+            continue
+        fi
+
+        local disk_size
+        disk_size=$(get_disk_size_kb "$import_device" "$offset")
+        if [ -z "$disk_size" ]; then
+            echo -e "${YELLOW}Warning: Could not determine size for $import_device${NC}"
+            continue
+        fi
+
+        # Get the configured size from nmdstat
+        local configured_size=$(get_nmdstat_value "diskSize.$slot")
+        local size_to_use="$disk_size"
+
+        # If we have a configured size and it differs from actual size
+        if [ -n "$configured_size" ] && [ "$configured_size" -gt 0 ] && [ "$configured_size" -ne "$disk_size" ]; then
+            echo -e "${YELLOW}Warning: Size mismatch for disk in slot $slot${NC}"
+            echo -e "  Disk size     : $disk_size KB"
+            echo -e "  Expected size : $configured_size KB"
+
+            if [ "$UNATTENDED" -eq 1 ]; then
+                # If unattended, do not continue import
+                echo -e "${RED}Error: Size mismatch for disk in slot $slot (unattended mode)${NC}"
+                continue
+            fi
+
+            # Ask for confirmation
+            read -r -p "Use the configured size instead of detected size? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                size_to_use="$configured_size"
+                echo -e "Using configured size: ${BLUE}$configured_size KB${NC}"
+            else
+                echo -e "Using detected disk size: ${BLUE}$disk_size KB${NC}"
+            fi
+        fi
+
+        # The driver opens /dev/<name>, so hand it the kernel device name
+        local kernel_name
+        kernel_name=$(device_kernel_name "$import_device")
+
+        echo -e "Found disk for slot $slot: ${BLUE}${kernel_name}${NC} (ID: ${short_id})$([ "$offset" -gt 0 ] && echo " Offset: $offset")"
+
+        # Add to import list: slot, device, offset, size, erased, id
+        disks_to_import+=("$slot|$kernel_name|$offset|$size_to_use|0|$disk_id")
+        num_disks=$((num_disks + 1))
     done
 
     # Check if we found any disks to import
@@ -2919,15 +3064,10 @@ create_array_layout() {
         slot_spec="${param%%:*}"
         local rest="${param#*:}"
 
-        # Now parse the device path and optional ID from rest
-        if [[ "$rest" =~ ^([^:]+):(.+)$ ]]; then
-            # device:ID
-            device_path="${BASH_REMATCH[1]}"
-            provided_disk_id="${BASH_REMATCH[2]}"
-        else
-            # just device
-            device_path="$rest"
-        fi
+        # Now parse the device path, optional ID and optional offset from rest
+        local spec provided_offset
+        spec=$(parse_device_spec "$rest") || return 1
+        IFS='|' read -r device_path provided_disk_id provided_offset <<< "$spec"
 
         # Validate device path is not empty
         if [ -z "$device_path" ]; then
@@ -2989,15 +3129,15 @@ create_array_layout() {
         fi
 
         # Get disk size
-        local size_kb=$(get_disk_size_kb "$device_path")
+        local size_kb=$(get_disk_size_kb "$device_path" "$provided_offset")
         if [ -z "$size_kb" ] || [ "$size_kb" -le 0 ]; then
             echo -e "${RED}Error: Could not determine size for $device_path${NC}"
             return 1
         fi
 
-        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(device_kernel_name "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"
+        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(device_kernel_name "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id$([ "$provided_offset" -gt 0 ] && echo " Offset: $provided_offset")"
 
-        import_entries+=("$slot|$device_path|$size_kb|$disk_id")
+        import_entries+=("$slot|$device_path|$size_kb|$provided_offset|$disk_id")
         assigned_slots+=("$slot")
     done
 
@@ -3016,17 +3156,18 @@ create_array_layout() {
 
     local import_failed=0
     for entry in "${sorted_entries[@]}"; do
-        IFS='|' read -r slot device_path size_kb disk_id <<< "$entry"
+        IFS='|' read -r slot device_path size_kb offset disk_id <<< "$entry"
 
         local kernel_name
         kernel_name=$(device_kernel_name "$device_path")
         echo -e "Importing disk to slot $slot: ${BLUE}${kernel_name}${NC}"
 
-        if ! run_nmd_command "import $slot $kernel_name 0 $size_kb 0 $disk_id"; then
+        if ! run_nmd_command "import $slot $kernel_name $offset $size_kb 0 $disk_id"; then
             echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
             import_failed=1
         else
             echo -e "${GREEN}Successfully imported disk to slot $slot${NC}"
+            save_disk_offset "$disk_id" "$offset"
         fi
     done
 
@@ -3400,6 +3541,7 @@ add_disk() {
     local param_slot=""
     local param_device=""
     local param_disk_id=""
+    local param_offset=0
     local use_param_mode=0
 
     if [ -n "$disk_param" ] && [[ "$disk_param" =~ : ]]; then
@@ -3411,15 +3553,10 @@ add_disk() {
             param_slot="${disk_param%%:*}"
             local rest="${disk_param#*:}"
 
-            # Parse device path and optional ID from rest
-            if [[ "$rest" =~ ^([^:]+):(.+)$ ]]; then
-                # device:ID format
-                param_device="${BASH_REMATCH[1]}"
-                param_disk_id="${BASH_REMATCH[2]}"
-            else
-                # just device
-                param_device="$rest"
-            fi
+            # Parse device path, optional ID and optional offset from rest
+            local spec
+            spec=$(parse_device_spec "$rest") || return 1
+            IFS='|' read -r param_device param_disk_id param_offset <<< "$spec"
 
             # Convert P/Q notation to slot numbers
             case "$param_slot" in
@@ -3710,6 +3847,7 @@ add_disk() {
     local selected_size_kb=0
     local selected_size_gb=0
     local selected_disk_id=""
+    local selected_offset=0
 
     if [ "$use_param_mode" -eq 1 ]; then
         # Parameter mode: validate and use the provided device
@@ -3737,7 +3875,7 @@ add_disk() {
         # Set selected device info
         selected_partition="$param_device"
         selected_dev="$parent_dev"
-        selected_size_kb=$(get_disk_size_kb "$param_device")
+        selected_size_kb=$(get_disk_size_kb "$param_device" "$param_offset")
 
         if [ -z "$selected_size_kb" ] || [ "$selected_size_kb" -le 0 ]; then
             echo -e "${RED}Error: Could not determine size for $param_device${NC}"
@@ -3745,6 +3883,7 @@ add_disk() {
         fi
 
         selected_size_gb=$(format_kbytes "$selected_size_kb" 0 0 "gb")
+        selected_offset="$param_offset"
 
         # Get or use provided disk ID
         if [ -n "$param_disk_id" ]; then
@@ -3780,6 +3919,7 @@ add_disk() {
         echo -e "Partition: $(device_kernel_name "$selected_partition")"
         echo -e "Size: $selected_size_gb GB"
         echo -e "ID: $selected_disk_id"
+        [ "$selected_offset" -gt 0 ] && echo -e "Offset: ${BLUE}$selected_offset${NC} sectors"
         echo ""
     else
         # Interactive mode: display menu and let user select
@@ -3924,10 +4064,12 @@ add_disk() {
     echo -e "Adding disk to array..."
 
     # Import disk: slot, partition, offset, size, erased, id
-    if ! run_nmd_command "import $selected_slot $(device_kernel_name "$selected_partition") 0 $selected_size_kb $preclear_done $selected_disk_id"; then
+    if ! run_nmd_command "import $selected_slot $(device_kernel_name "$selected_partition") $selected_offset $selected_size_kb $preclear_done $selected_disk_id"; then
         echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
         return 1
     fi
+
+    save_disk_offset "$selected_disk_id" "$selected_offset"
 
     echo -e "${GREEN}Successfully added disk to slot $selected_slot${NC}"
     echo ""

@@ -1,7 +1,13 @@
 [Unit]
 Description=Start/Stop NonRAID array and manage mounts
-Requires=local-fs.target
-After=local-fs.target
+# Deliberately no Requires=/After=local-fs.target. Array members only appear as
+# /dev/nmdXp1 once this unit has run, so array mounts declared in /etc/fstab or
+# as .mount units - which belong to local-fs.target - would have to be ordered
+# after this service. Ordering this service after local-fs.target as well closes
+# that into a cycle, which systemd resolves by dropping an edge at random.
+#
+# Nothing is lost: DefaultDependencies=yes already orders this after
+# basic.target, which is itself after local-fs.target.
 
 [Service]
 Type=oneshot
