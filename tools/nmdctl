@@ -2386,8 +2386,8 @@ save_disk_offset() {
     # and md_unraid.c strncpy()s MD_ID_SIZE-1 bytes. Recording the full-length
     # ID would write a key the reload can never match, and the disk would come
     # back at offset 0.
-    if [ "${#disk_id}" -gt 79 ]; then
-        echo -e "${RED}Error: disk ID is longer than the 79 bytes the driver stores; refusing to record an offset it could never match${NC}" >&2
+    if [ "${#disk_id}" -gt "$MAX_DISK_ID_LEN" ]; then
+        echo -e "${RED}Error: disk ID is longer than the $MAX_DISK_ID_LEN bytes the driver stores; refusing to record an offset it could never match${NC}" >&2
         return 1
     fi
     if ! is_valid_offset "$offset"; then
