@@ -1198,10 +1198,38 @@ seed_running_check() {
     run handle_check PAUSE
     [ "$status" -eq 0 ]
 
-    local saved
-    saved=$(cat "$RESYNC_ELAPSED_DIR"/resync_elapsed_*)
+    local saved_action saved
+    { read -r saved_action; read -r saved; } < "$(echo "$RESYNC_ELAPSED_DIR"/resync_elapsed_*)"
+    [ "$saved_action" = "check P" ]
     [ "$saved" -ge 90 ]
     [ "$saved" -le 92 ]
+
+    rm -rf "$RESYNC_ELAPSED_DIR"
+}
+
+@test "collect_resync_status - a snapshot from another action is not inherited" {
+    export RESYNC_ELAPSED_DIR="$BATS_TMPDIR/resync-action-$$"
+    mkdir -p "$RESYNC_ELAPSED_DIR"
+
+    # A check was paused earlier and its snapshot is still on disk, by design.
+    NMDSTAT_VALUES=([sbName]=/test.dat)
+    printf 'check P\n3600\n' > "$(resync_elapsed_file)"
+
+    # The array then starts a reconstruction of its own accord. Its elapsed time
+    # is its own; inheriting the paused check's hour would be nonsense.
+    NMDSTAT_VALUES+=(
+        [mdResync]=1
+        [mdResyncAction]=recon
+        [mdResyncCorr]=0
+        [mdResyncPos]=100
+        [mdResyncSize]=1000
+        [mdResyncDt]=10
+        [mdResyncDb]=5000
+        [sbSynced]="$(( $(date +%s) - 5 ))"
+    )
+    collect_resync_status
+
+    [ "${RESYNC_STATUS_DATA[elapsed_seconds]}" -lt 60 ]
 
     rm -rf "$RESYNC_ELAPSED_DIR"
 }

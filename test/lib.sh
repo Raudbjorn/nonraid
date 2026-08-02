@@ -146,11 +146,32 @@ nmd() {
     "$NMDCTL" -s "$SUPERBLOCK_FILE" "$@"
 }
 
+# Wait for a resync to start, bounded.
+#
+# `nmdctl check` returns as soon as the driver accepts the command, and
+# /proc/nmdstat can still report mdResync=0 at that moment. Without this, a
+# following wait_resync_idle matches on its first poll and the caller proceeds -
+# mounting and checksumming an array that never synced.
+wait_resync_started() {
+    local timeout="${1:-60}" waited=0
+    while true; do
+        [ -r /proc/nmdstat ] || die "/proc/nmdstat is not readable - is the module loaded?"
+        grep -q "mdResync=0" /proc/nmdstat || return 0
+        sleep 1
+        waited=$((waited + 1))
+        [ "$waited" -ge "$timeout" ] && die "resync never started within ${timeout}s"
+    done
+}
+
 # Wait for the driver to report no resync in progress, bounded.
 # A bare `while ! grep -q ...` turns an unreadable /proc/nmdstat into a
 # successful loop condition and spins forever.
+#
+# Waits for the operation to start first, so this cannot return success against
+# a resync that has not begun.
 wait_resync_idle() {
     local timeout="${1:-600}" waited=0
+    wait_resync_started
     while true; do
         [ -r /proc/nmdstat ] || die "/proc/nmdstat is not readable - is the module loaded?"
         grep -q "mdResync=0" /proc/nmdstat && return 0

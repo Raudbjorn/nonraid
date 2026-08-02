@@ -23,7 +23,12 @@ if [ -e "$WORKDIR" ] && [ ! -e "$OWNED_MARKER" ]; then
 fi
 mkdir -p "$WORKDIR"
 touch "$OWNED_MARKER"
-: > "$OWNED_LINKS"
+# Appended to, never truncated. The rest of this script is written to be re-run
+# over an existing owned workdir - it skips images, partitioning and mkfs that
+# are already there - and the by-id links from the previous run still exist. A
+# truncated manifest would make the ownership check below reject them, and would
+# also strand links from a run with a higher disk count.
+touch "$OWNED_LINKS"
 cd "$WORKDIR"
 
 echo ">>> [setup] $DISK_COUNT disks of ${SIZE_MB}MB in $WORKDIR"
@@ -66,7 +71,9 @@ for i in $(seq 1 "$DISK_COUNT"); do
         die "/dev/disk/by-id/$linkname already exists and is not ours; choose another NONRAID_TEST_PREFIX"
     fi
     ln -s "$loop_dev" "/dev/disk/by-id/$linkname" 2>/dev/null || ln -sf "$loop_dev" "/dev/disk/by-id/$linkname"
-    echo "/dev/disk/by-id/$linkname" >> "$OWNED_LINKS"
+    # Once each: a re-run repoints the same link and must not duplicate the entry.
+    grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null || \
+        echo "/dev/disk/by-id/$linkname" >> "$OWNED_LINKS"
 done
 
 udevadm settle
