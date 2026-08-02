@@ -63,15 +63,23 @@ only when the whole toolchain is present (checked with `dpkg-checkbuilddeps`), a
 builds in a container:
 
 ```bash
-make package                 # native on Debian, container elsewhere
+make package                 # native where the full toolchain is present, container otherwise
 make package-native          # force the native path
 make package-docker          # force the container path
 make package DOCKER=podman   # podman instead of docker
 ```
 
+The native path is chosen whenever `dpkg-checkbuilddeps` is satisfied and `dh`/`fakeroot`
+are present — that includes Ubuntu and any Debian derivative with the build dependencies
+installed, not only Debian.
+
 The container image is defined in `packaging/docker/`, so the toolchain is a cached layer —
-a repeat build is about a second rather than reinstalling every dependency. Override
-`DEB_IMAGE` with a digest for a reproducible toolchain.
+a repeat build is about a second rather than reinstalling every dependency.
+
+`DEB_IMAGE` accepts a digest (`DEB_IMAGE=debian@sha256:…`) to pin the base image. Note that
+this pins the base only: the image still runs `apt-get update` and installs unpinned
+packages, so the toolchain versions inside it continue to drift. Pinning those too would
+need a snapshot repository or an explicit version list in `DEB_BUILD_DEPS`.
 
 ## Testing
 

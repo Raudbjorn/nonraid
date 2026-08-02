@@ -45,7 +45,18 @@ jobs:
           # The Makefile is installed into /usr/src and re-parsed on every DKMS
           # build. Packaging variables must stay behind the MAKECMDGOALS guard so
           # a module build never shells out to probe for docker.
-          if make -p -n modules 2>/dev/null | grep -qE "^(HAVE_DOCKER|IS_ROOTLESS|ENGINE_ADVICE|ENGINE_SWITCH|DEB_IMAGE|DEB_BUILDER_IMAGE|OUT_UID|OUT_GID|HAVE_BUILDDEPS) "; then
+          #
+          # Run make separately and keep its stderr: piping straight into grep
+          # takes the pipeline's status from grep, so a Makefile that fails to
+          # parse emits no matching variables and the check "passes".
+          set -o pipefail
+          make -p -n modules > /tmp/make-db.txt || {
+            echo "make -p -n modules failed; see the error above" >&2
+            exit 1
+          }
+          # Every variable defined inside the MAKECMDGOALS guard, including the
+          # host probes - moving any of them outside it must be caught.
+          if grep -qE "^(DOCKER|DEB_IMAGE|DEB_BUILD_DEPS|DEB_BUILDER_IMAGE|IS_DEBIAN|HAVE_DH|HAVE_FAKEROOT|HAVE_BUILDDEPS|HAVE_DOCKER|IS_ROOTLESS|OUT_UID|OUT_GID|ENGINE_ADVICE|ENGINE_SWITCH) " /tmp/make-db.txt; then
             echo "packaging variables leaked into 'make modules'" >&2
             exit 1
           fi
