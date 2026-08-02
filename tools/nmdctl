@@ -38,7 +38,7 @@ LUKS_KEYFILE="/etc/nonraid/luks-keyfile"
 # module reload. Losing this file means an offset-imported disk comes back at
 # offset 0 and therefore the wrong size, so it is array state - back it up
 # alongside the superblock.
-DISK_OFFSETS_FILE="/etc/nonraid/disk-offsets"
+DISK_OFFSETS_FILE="${DISK_OFFSETS_FILE:-/etc/nonraid/disk-offsets}"
 
 # verbose, unattended
 VERBOSE=0
@@ -1724,12 +1724,13 @@ format_kbytes() {
         fi
     }
 
-    if [ "$force_unit" = "b" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1024 ]; }; then
+    if [ "$force_unit" = "b" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1000 ]; }; then
         [ "$add_unit" -eq 1 ] && unit=" B"
         printf "%d%s" "$bytes" "$unit"
-    elif [ "$force_unit" = "kb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1024 ]; }; then
+    elif [ "$force_unit" = "kb" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1000000 ]; }; then
+        # Decimal like the rungs below: kB = 1000 B, not 1024.
         [ "$add_unit" -eq 1 ] && unit=" kB"
-        printf "%d%s" "$kb" "$unit"
+        printf "%d%s" "$((bytes / 1000))" "$unit"
     elif [ "$force_unit" = "mb" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1000000000 ]; }; then  # < 1 GB
         local mb=$((bytes / 1000000))
         local remainder=$((bytes % 1000000))
@@ -2216,7 +2217,16 @@ parse_device_spec() {
     fi
 
     if ! is_valid_offset "$offset"; then
-        echo -e "${RED}Error: offset '$offset' is not a number of 512-byte sectors${NC}" >&2
+        echo -e "${RED}Error: offset '$offset' is not a canonical decimal count of 512-byte sectors${NC}" >&2
+        return 1
+    fi
+
+    # Reload applies a saved offset to the physical device resolved from the
+    # disk ID, so an offset given against a partition would address a different
+    # region after a reload than it did here.
+    if [ "$offset" -ne 0 ] && ! is_whole_device "$device"; then
+        echo -e "${RED}Error: an offset may only be given for a whole device, not the partition '$device'${NC}" >&2
+        echo -e "${YELLOW}On reload the offset is applied to the whole physical device, so a partition would resolve elsewhere.${NC}" >&2
         return 1
     fi
 
@@ -2226,7 +2236,23 @@ parse_device_spec() {
 # An offset is a count of 512-byte sectors. Anything else is rejected rather
 # than allowed to fail open in a later arithmetic test.
 is_valid_offset() {
-    [[ "$1" =~ ^[0-9]+$ ]]
+    # Canonical decimal only. Bash reads a leading zero as octal, so "08" would
+    # pass a bare ^[0-9]+$ and then die with "value too great for base" inside
+    # the size arithmetic. The digit cap keeps values inside signed 64-bit so a
+    # pathological input cannot wrap during subtraction.
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,17})$ ]]
+}
+
+# A nonzero offset is only meaningful against a whole device: import_disks
+# recovers a saved offset and applies it to the device it resolves from the disk
+# ID, so an offset accepted against a partition would address a different region
+# after a reload than it did at create time.
+#
+# The test is "not a partition" rather than "is a disk": lsblk reports TYPE=loop
+# for a loop device and TYPE=disk for physical media, and both are whole devices
+# for this purpose. Only TYPE=part is disqualifying.
+is_whole_device() {
+    [ "$(lsblk -no TYPE "$1" 2>/dev/null | head -1)" != "part" ]
 }
 
 # Record the import offset used for a disk ID so it can be recovered on a later
@@ -2239,41 +2265,80 @@ save_disk_offset() {
 
     [ -z "$disk_id" ] && return 0
     if ! is_valid_offset "$offset"; then
-        echo -e "${RED}Error: refusing to record non-numeric offset '$offset' for $disk_id${NC}" >&2
+        echo -e "${RED}Error: refusing to record offset '$offset' for $disk_id (not a canonical decimal sector count)${NC}" >&2
         return 1
     fi
 
-    # Rewrite via a temporary file, but only replace the original once awk has
-    # succeeded - a failure here would otherwise truncate the offsets of every
-    # other disk in the array.
+    local dir tmp
+    dir=$(dirname "$DISK_OFFSETS_FILE")
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        echo -e "${RED}Error: could not create $dir to record the import offset${NC}" >&2
+        return 1
+    fi
+    tmp="${DISK_OFFSETS_FILE}.tmp.$$"
+
+    # Build the complete target contents - every other entry, plus this one -
+    # and put it in place with a single checked rename. Filtering into place and
+    # then appending leaves a window in which the previous offset is already
+    # gone and the replacement is not yet written; dying there loses the only
+    # persisted copy and the next reload imports at sector 0.
+    if ! : > "$tmp" 2>/dev/null; then
+        echo -e "${RED}Error: could not write $tmp${NC}" >&2
+        return 1
+    fi
     if [ -f "$DISK_OFFSETS_FILE" ]; then
-        local tmp="${DISK_OFFSETS_FILE}.tmp.$$"
-        if awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$DISK_OFFSETS_FILE"
-        else
+        if ! awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" >> "$tmp" 2>/dev/null; then
             rm -f "$tmp"
-            echo -e "${RED}Error: could not rewrite $DISK_OFFSETS_FILE${NC}" >&2
+            echo -e "${RED}Error: could not read $DISK_OFFSETS_FILE${NC}" >&2
             return 1
         fi
     fi
+    if [ "$offset" -ne 0 ]; then
+        if ! echo "$disk_id $offset" >> "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            echo -e "${RED}Error: could not record the offset entry${NC}" >&2
+            return 1
+        fi
+    fi
+    if ! mv "$tmp" "$DISK_OFFSETS_FILE" 2>/dev/null; then
+        rm -f "$tmp"
+        echo -e "${RED}Error: could not replace $DISK_OFFSETS_FILE${NC}" >&2
+        return 1
+    fi
 
-    [ "$offset" -eq 0 ] && return 0
-
-    mkdir -p "$(dirname "$DISK_OFFSETS_FILE")" 2>/dev/null
-    echo "$disk_id $offset" >> "$DISK_OFFSETS_FILE"
+    return 0
 }
 
-# Echo the recorded import offset for a disk ID, or 0 if none.
+# Echo the recorded import offset for a disk ID.
+#
+# Exit 0 with "0" means there is no record. Exit 2 means a record exists but is
+# malformed - callers must refuse that member rather than read it as offset 0,
+# because a disk imported at a nonzero offset and re-imported at sector 0 reads
+# from the wrong base address, which is the failure this file exists to prevent.
 # Usage: get_saved_disk_offset <disk_id>
 get_saved_disk_offset() {
     local disk_id="$1"
     local offset=""
 
-    if [ -n "$disk_id" ] && [ -f "$DISK_OFFSETS_FILE" ]; then
-        offset=$(awk -v id="$disk_id" '$1 == id { val = $2 } END { print val }' "$DISK_OFFSETS_FILE" 2>/dev/null)
+    if [ -z "$disk_id" ] || [ ! -f "$DISK_OFFSETS_FILE" ]; then
+        echo "0"
+        return 0
     fi
-    is_valid_offset "$offset" || offset=0
+
+    offset=$(awk -v id="$disk_id" \
+        '$1 == id { val = $2; found = 1 } END { if (found) print (val == "" ? "?" : val) }' \
+        "$DISK_OFFSETS_FILE" 2>/dev/null)
+
+    if [ -z "$offset" ]; then
+        echo "0"
+        return 0
+    fi
+    if ! is_valid_offset "$offset"; then
+        echo "0"
+        return 2
+    fi
     echo "$offset"
+    return 0
 }
 
 # Find an unused largest partition for a given disk device
@@ -2409,8 +2474,16 @@ import_disks() {
         # was originally imported at an explicit offset, reuse the one recorded
         # at create/add time. Without it the size is recomputed over the whole
         # device and every offset disk reports a size mismatch on reload.
-        local saved_offset
+        local saved_offset saved_rc
         saved_offset=$(get_saved_disk_offset "$disk_id")
+        saved_rc=$?
+        if [ "$saved_rc" -eq 2 ]; then
+            # A record exists but is unreadable. Falling back to 0 would import
+            # an offset-backed member from the wrong sector, so refuse it.
+            echo -e "${RED}Error: $DISK_OFFSETS_FILE has a malformed entry for ${short_id}; refusing to import this disk${NC}"
+            echo -e "${YELLOW}Repair or remove that entry - importing it at offset 0 would read from the wrong base address.${NC}"
+            continue
+        fi
 
         local import_device=""
         local offset=0
@@ -2434,7 +2507,8 @@ import_disks() {
                 import_device="$partition"
             elif [ "$find_rc" -ne 2 ]; then
                 local has_partition
-                has_partition=$(lsblk -lpno KNAME "$found_device" 2>/dev/null | grep -v -w "^$found_device$" | head -1)
+                # -Fx: the device path is data, not a regex
+                has_partition=$(lsblk -lpno KNAME "$found_device" 2>/dev/null | grep -vFx "$found_device" | head -1)
                 if [ -z "$has_partition" ]; then
                     import_device="$found_device"
                 fi
@@ -3162,12 +3236,25 @@ create_array_layout() {
         kernel_name=$(device_kernel_name "$device_path")
         echo -e "Importing disk to slot $slot: ${BLUE}${kernel_name}${NC}"
 
+        # Persist the offset *before* importing, and roll back if the import
+        # fails. The other order leaves the driver holding an offset import that
+        # nothing records, so the next reload addresses sector 0 - the exact
+        # wrong-base-address failure this file exists to prevent. Ignoring the
+        # save result would do the same while reporting success.
+        local prev_offset
+        prev_offset=$(get_saved_disk_offset "$disk_id")
+        if ! save_disk_offset "$disk_id" "$offset"; then
+            echo -e "${RED}Error: Could not record the import offset for slot $slot; refusing to import${NC}"
+            import_failed=1
+            continue
+        fi
+
         if ! run_nmd_command "import $slot $kernel_name $offset $size_kb 0 $disk_id"; then
             echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
+            save_disk_offset "$disk_id" "$prev_offset" || true
             import_failed=1
         else
             echo -e "${GREEN}Successfully imported disk to slot $slot${NC}"
-            save_disk_offset "$disk_id" "$offset"
         fi
     done
 
@@ -3433,6 +3520,17 @@ create_array_interactive() {
             local kernel_name
             kernel_name=$(device_kernel_name "$partition")
             echo -e "Importing disk to slot $slot: ${BLUE}${kernel_name}${NC}"
+
+            # This path always imports at offset 0, so clear any offset recorded
+            # for these disks by a previous array. Disk IDs are stable per
+            # physical disk, so rebuilding an array from the same disks would
+            # otherwise leave a stale entry that reload applies as a base
+            # address the array was never created with.
+            if ! save_disk_offset "$disk_id" 0; then
+                echo -e "${RED}Error: Could not clear a stale import offset for slot $slot; refusing to import${NC}"
+                import_failed=1
+                continue
+            fi
 
             if ! run_nmd_command "import $slot $kernel_name 0 $size_kb 0 $disk_id"; then
                 echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
@@ -4064,12 +4162,19 @@ add_disk() {
     echo -e "Adding disk to array..."
 
     # Import disk: slot, partition, offset, size, erased, id
-    if ! run_nmd_command "import $selected_slot $(device_kernel_name "$selected_partition") $selected_offset $selected_size_kb $preclear_done $selected_disk_id"; then
-        echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
+    # Persist first, roll back on failure - see the note in create_array_layout.
+    local prev_offset
+    prev_offset=$(get_saved_disk_offset "$selected_disk_id")
+    if ! save_disk_offset "$selected_disk_id" "$selected_offset"; then
+        echo -e "${RED}Error: Could not record the import offset; refusing to add the disk${NC}"
         return 1
     fi
 
-    save_disk_offset "$selected_disk_id" "$selected_offset"
+    if ! run_nmd_command "import $selected_slot $(device_kernel_name "$selected_partition") $selected_offset $selected_size_kb $preclear_done $selected_disk_id"; then
+        echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
+        save_disk_offset "$selected_disk_id" "$prev_offset" || true
+        return 1
+    fi
 
     echo -e "${GREEN}Successfully added disk to slot $selected_slot${NC}"
     echo ""
@@ -4303,6 +4408,12 @@ unassign_disk() {
     echo -e "Unassigning disk from slot $slot_display..."
 
     # Unassign the disk by importing an empty device
+    # Drop any recorded offset for the disk leaving the slot, so a later import
+    # of the same physical disk does not inherit a base address from an array it
+    # is no longer part of.
+    local unassigned_id="${NMDSTAT_VALUES[diskId.$slot]}"
+    [ -n "$unassigned_id" ] && save_disk_offset "$unassigned_id" 0
+
     if ! run_nmd_command "import $slot '' 0 0 0 ''"; then
         echo -e "${RED}Error: Failed to unassign disk from slot $slot${NC}"
         return 1

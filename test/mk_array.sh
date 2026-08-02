@@ -10,14 +10,10 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 require_root
+validate_config
 require_cmd losetup
 
-OFFSET="${NONRAID_TEST_OFFSET:-64}"
-
-if [ "$DISK_COUNT" -lt 3 ]; then
-    echo "Need at least 3 disks (P, Q and one data disk); have $DISK_COUNT" >&2
-    exit 1
-fi
+OFFSET="$TEST_OFFSET"
 
 byid() { echo "/dev/disk/by-id/${BYID_PREFIX}$(printf '%03d' "$1")"; }
 
@@ -35,7 +31,7 @@ nmd -u start new_array
 
 echo ">>> [mk_array] parity sync"
 nmd -u check recon
-while ! grep -q "mdResync=0" /proc/nmdstat; do sleep 2; done
+wait_resync_idle 600
 
 echo ">>> [mk_array] mounting"
 nmd -u mount "$MOUNT_PREFIX"

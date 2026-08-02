@@ -1,12 +1,10 @@
 name: CI
 
-# The single workflow this fork keeps. Upstream's DKMS build matrix, integration
-# lifecycle and package-publishing workflows are not carried here - this fork
-# does not publish releases, and anything needing that coverage should be run
-# against qvr/nonraid.
-#
-# Scope is deliberately what runs in seconds and guards what this fork actually
-# changes: the bash in tools/nmdctl, and the Makefile packaging logic.
+# Trimmed from upstream's five workflows, but not to the point of proving
+# nothing. Upstream's release/publishing jobs are gone (this fork ships no
+# releases); the module build and an end-to-end array lifecycle are kept,
+# because this fork stages driver and nmdctl changes and nothing else here
+# would catch a kernel or parity regression.
 
 on:
   pull_request:
@@ -41,6 +39,52 @@ jobs:
           chmod +x nmdctl tests/*
           bats tests/
 
+  dkms:
+    name: DKMS build (${{ matrix.container.name }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - { name: "Debian 12",   image: "debian:12",   headers: "linux-headers-amd64" }
+          - { name: "Debian 13",   image: "debian:13",   headers: "linux-headers-amd64" }
+          - { name: "Ubuntu 24.04", image: "ubuntu:24.04", headers: "linux-headers-generic" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends build-essential dkms ${{ matrix.container.headers }}
+
+      - name: Build the module against the installed headers
+        run: |
+          # The runner kernel has no headers in a container, so build against
+          # whatever the headers package provides rather than $(uname -r).
+          KVER=$(ls -1 /lib/modules | head -1)
+          echo "Building for $KVER"
+          make modules KVERSION="$KVER"
+
+  package:
+    name: Debian package
+    runs-on: ubuntu-latest
+    container: debian:13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends build-essential debhelper dkms dh-dkms fakeroot
+
+      - name: Build natively
+        # Explicitly the native path: 'make package' would silently fall back to
+        # a container if a build-dep went missing, and CI should fail loudly.
+        run: make package-native
+
       - name: Assert packaging probes stay out of DKMS module builds
         run: |
           # The Makefile is installed into /usr/src and re-parsed on every DKMS
@@ -61,3 +105,64 @@ jobs:
             echo "packaging variables leaked into 'make modules'" >&2
             exit 1
           fi
+
+  lifecycle:
+    name: Array lifecycle (loop devices)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential dkms gdisk xfsprogs \
+            linux-headers-$(uname -r)
+
+      - name: Build and load the module
+        run: |
+          DKMS_VERSION=$(grep '^PACKAGE_VERSION=' dkms.conf | cut -d= -f2)
+          sudo mkdir -p "/usr/src/nonraid-dkms-$DKMS_VERSION"
+          sudo cp -r md_nonraid/ raid6/ dkms.conf Makefile "/usr/src/nonraid-dkms-$DKMS_VERSION/"
+          sudo dkms install "nonraid-dkms/$DKMS_VERSION" -k "$(uname -r)"
+          sudo modprobe nonraid6_pq
+          sudo modprobe md-nonraid super=/nonraid.dat
+          grep -q mdState /proc/nmdstat
+
+      - name: Create, sync, write, fail a disk, rebuild, verify
+        run: |
+          set -e
+          for i in 1 2 3 4; do
+            truncate -s 1G "/tmp/d$i"
+            L=$(sudo losetup -fP --show "/tmp/d$i")
+            sudo sgdisk -o -a 8 -n 1:32K:0 "$L" >/dev/null
+            sudo ln -sf "$L" "/dev/disk/by-id/citest-$i"
+            eval "L$i=$L"
+          done
+          sudo udevadm settle
+          N="sudo bash tools/nmdctl"
+          $N create --force "P:${L1}p1:citest-1" "1:${L2}p1:citest-2" "2:${L3}p1:citest-3"
+          $N -u start new_array
+          $N -u check recon
+          for _ in $(seq 1 120); do grep -q "mdResync=0" /proc/nmdstat && break; sleep 2; done
+          sudo mkfs.xfs -f /dev/nmd1p1 >/dev/null
+          $N -u mount
+          sudo dd if=/dev/urandom of=/mnt/disk1/t bs=1M count=64 status=none
+          sudo sync
+          BEFORE=$(sudo md5sum /mnt/disk1/t | cut -d' ' -f1)
+          $N -u umount && $N -u stop
+          $N unassign -f 1
+          sudo dd if=/dev/zero of="${L2}p1" bs=1M status=none 2>/dev/null || true
+          $N -u start disable_disk
+          $N -u mount
+          DEGRADED=$(sudo md5sum /mnt/disk1/t | cut -d' ' -f1)
+          $N -u umount && $N -u stop
+          $N -u import
+          $N -u replace -f "1:${L2}p1:citest-2"
+          $N -u start recon_disk
+          $N -u check recon
+          for _ in $(seq 1 120); do grep -q "mdResync=0" /proc/nmdstat && break; sleep 2; done
+          $N -u mount
+          AFTER=$(sudo md5sum /mnt/disk1/t | cut -d' ' -f1)
+          echo "before=$BEFORE degraded=$DEGRADED after=$AFTER"
+          [ "$BEFORE" = "$DEGRADED" ] && [ "$BEFORE" = "$AFTER" ]
