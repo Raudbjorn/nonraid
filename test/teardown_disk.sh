@@ -105,7 +105,12 @@ rm -f "$OWNED_MARKER" "$OWNED_LINKS"
 rmdir "$WORKDIR" 2>/dev/null && echo "  removed $WORKDIR" || echo "  $WORKDIR not empty, left in place"
 
 echo "=== removing empty mountpoints ==="
-for d in "${MOUNT_PREFIX}"*; do
+# Only the slots this configuration can have used. A "${MOUNT_PREFIX}"* glob is
+# wider than the harness: with the default it also matches an unrelated empty
+# /mnt/disk-backup. nmdctl mounts data slot N at ${MOUNT_PREFIX}N, and slots run
+# from 1 to DISK_COUNT-2 because two disks are parity.
+for slot in $(seq 1 $((DISK_COUNT - 2))); do
+    d="${MOUNT_PREFIX}${slot}"
     [ -d "$d" ] || continue
     rmdir "$d" 2>/dev/null && echo "  removed $d"
 done

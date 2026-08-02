@@ -31,8 +31,8 @@ All overridable; defaults in brackets.
 | `NONRAID_TEST_WORKDIR` | image + superblock directory [`/root/nonraid-test`] |
 | `NONRAID_TEST_DISKS` | number of disks [`4`] |
 | `NONRAID_TEST_SIZE_MB` | size of each [`256`] |
-| `NONRAID_TEST_PREFIX` | by-id symlink prefix [`virtdisk-`] |
-| `NONRAID_TEST_MOUNT_PREFIX` | mount point prefix [`/mnt/disk`] |
+| `NONRAID_TEST_PREFIX` | by-id symlink prefix, `[A-Za-z0-9][A-Za-z0-9._-]*` [`virtdisk-`] |
+| `NONRAID_TEST_MOUNT_PREFIX` | mount point prefix, absolute with a non-empty final component [`/mnt/disk`] |
 | `NONRAID_TEST_SUPERBLOCK` | superblock path [`$WORKDIR/nonraid.dat`] |
 | `NONRAID_TEST_OFFSET` | import offset in 512-byte sectors [`64`] |
 | `NONRAID_TEST_OFFSETS_FILE` | offset records path, must be inside `$WORKDIR` [`$WORKDIR/disk-offsets`] |
