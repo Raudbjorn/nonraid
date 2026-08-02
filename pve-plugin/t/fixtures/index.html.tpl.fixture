@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>[% nodename %] - Proxmox Virtual Environment</title>
+    <script type="text/javascript">
+      Proxmox = {
+        defaultLang: '[% lang %]',
+        CSRFPreventionToken: '[% token %]',
+      };
+    </script>
+    <script type="text/javascript" src="/pve2/ext6/ext-all.js?ver=[% wtversion %]"></script>
+    <script type="text/javascript" src="/pve2/js/pvemanagerlib.js?ver=[% version %]"></script>
+    <script type="text/javascript" src="/pve2/ext6/locale/locale-en.js?ver=[% wtversion %]"></script>
+  </head>
+  <body>
+    <div id="main"></div>
+  </body>
+</html>
