@@ -113,13 +113,17 @@ EOF
 }
 
 @test "format_kbytes function" {
-    # Test basic conversion (1048576 KB = 1 GB)
+    # These expectations are decimal (MB = 10^6 B, GB = 10^9 B), matching the
+    # unit labels the function prints. Several previously asserted binary
+    # results - e.g. 1572864 KB as "1.5 GB" - which is 1.5 GiB mislabelled as
+    # GB; decimally it is 1.61 GB.
+    # Test basic conversion (1048576 KB ~= 1 GB)
     result=$(format_kbytes 1048576 0 0 "gb")
     [ "$result" = "1" ]
 
-    # Test with 1 decimal (1.5 GB)
+    # 1572864 KB = 1610612736 B = 1.61 GB
     result=$(format_kbytes 1572864 0 1 "gb")
-    [ "$result" = "1.5" ]
+    [ "$result" = "1.6" ]
 
     # Test rounding up (should round up to 1)
     result=$(format_kbytes 1048575 0 0 "gb")
@@ -133,12 +137,12 @@ EOF
     result=$(format_kbytes 1024 1 2)
     [ "$result" = "1 MB" ]
 
-    # About 1.09 MB (small remainder) should show as "1"
+    # 1126 KB = 1153024 B = 1.15 MB - a large enough remainder to show decimals
     result=$(format_kbytes 1126 1 1)
-    [ "$result" = "1 MB" ]
+    [ "$result" = "1.1 MB" ]
 
     result=$(format_kbytes 1126 1 2)
-    [ "$result" = "1 MB" ]
+    [ "$result" = "1.15 MB" ]
 
     # 1.5 MB (significant remainder) should show decimals
     result=$(format_kbytes 1536 1 0)
@@ -148,11 +152,11 @@ EOF
     [ "$result" = "1.5 MB" ]
 
     result=$(format_kbytes 1536 1 2)
-    [ "$result" = "1.50 MB" ]
+    [ "$result" = "1.57 MB" ]
 
     # Test GB formatting with 2 decimals
-    result=$(format_kbytes 1572864 1 2)  # 1.5 GB
-    [ "$result" = "1.50 GB" ]
+    result=$(format_kbytes 1572864 1 2)  # 1.61 GB
+    [ "$result" = "1.61 GB" ]
 
     # Test exactly 1 GB shows as integer
     result=$(format_kbytes 1048576 1 1)  # Exactly 1 GB
@@ -173,9 +177,9 @@ EOF
     result=$(format_kbytes 1572864 0 0 "gb")
     [ "$result" = "2" ]
 
-    # Test forced units with decimals
+    # Test forced units with decimals (1572864 KB = 1.61 GB decimal)
     result=$(format_kbytes 1572864 0 1 "gb")
-    [ "$result" = "1.5" ]
+    [ "$result" = "1.6" ]
 
     # Test KB and B units (should not have decimals)
     result=$(format_kbytes 1536 1 1 "kb")
@@ -184,13 +188,14 @@ EOF
     result=$(format_kbytes 1 1 1 "b")
     [ "$result" = "1024 B" ]
 
-    # Test TB formatting
-    result=$(format_kbytes 1073741824000 1 1 "tb")  # About 1000 TB
-    [ "$result" = "1000 TB" ]
+    # Test TB formatting. 1073741824000 KB = 1.0995e15 B = 1099.5 TB decimal
+    # (it is 1000 TiB, which is what the old binary maths reported as "1000 TB").
+    result=$(format_kbytes 1073741824000 1 1 "tb")
+    [ "$result" = "1099.5 TB" ]
 
-    # Test very large number with 2 decimals
-    result=$(format_kbytes 1610612736 1 2)  # 1.5 TB
-    [ "$result" = "1.50 TB" ]
+    # Test very large number with 2 decimals (1.5 TiB = 1.64 TB decimal)
+    result=$(format_kbytes 1610612736 1 2)
+    [ "$result" = "1.64 TB" ]
 }
 
 @test "format_time_duration function" {
@@ -272,7 +277,9 @@ EOF
     echo "$status"
     echo "$output"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ Array\ Size.*1.9\ GB\ \(2\ data\ disk\(s\)\) ]]
+    # 2 data disks of 1000000 KB = 2048000000 B = 2.05 GB. Previously read as
+    # 1.9 because the size was divided in binary and labelled GB.
+    [[ "$output" =~ Array\ Size.*2\ GB\ \(2\ data\ disk\(s\)\) ]]
 }
 
 @test "status parsing - Array with invalid disks" {
@@ -820,4 +827,99 @@ mock_import_with_status() {
     echo "$output"
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Unknown option" ]]
+}
+
+@test "is_valid_offset - accepts digits, rejects anything else" {
+    run is_valid_offset 0;    [ "$status" -eq 0 ]
+    run is_valid_offset 64;   [ "$status" -eq 0 ]
+    run is_valid_offset "";   [ "$status" -ne 0 ]
+    run is_valid_offset "64a"; [ "$status" -ne 0 ]
+    run is_valid_offset "-1"; [ "$status" -ne 0 ]
+}
+
+@test "parse_device_spec - device only" {
+    run parse_device_spec "/dev/sdb1"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/sdb1||0" ]
+}
+
+@test "parse_device_spec - device and id" {
+    run parse_device_spec "/dev/sdb1:ata-SOMEDISK_123"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/sdb1|ata-SOMEDISK_123|0" ]
+}
+
+@test "parse_device_spec - device, id and offset" {
+    run parse_device_spec "/dev/sdb:virtdisk-001:64"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/sdb|virtdisk-001|64" ]
+}
+
+@test "parse_device_spec - an all-digit disk ID is an ID, not an offset" {
+    # Upstream's parser treated a numeric second field as an offset, so this
+    # spec silently imported the disk at offset 12345 and sized it wrongly.
+    run parse_device_spec "/dev/sdb1:12345"
+
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/sdb1|12345|0" ]
+}
+
+@test "parse_device_spec - rejects a non-numeric offset" {
+    run parse_device_spec "/dev/sdb:myid:notanumber"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "not a number" ]]
+}
+
+@test "parse_device_spec - rejects too many fields" {
+    run parse_device_spec "/dev/sdb:myid:64:extra"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "too many fields" ]]
+}
+
+@test "save/get_disk_offset - round trip, overwrite and clear" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/disk-offsets"
+    rm -f "$DISK_OFFSETS_FILE"
+
+    # nothing recorded yet
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "0" ]
+
+    save_disk_offset "diskA" 64
+    save_disk_offset "diskB" 2048
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "64" ]
+    run get_saved_disk_offset "diskB"
+    [ "$output" = "2048" ]
+
+    # overwriting one entry must not disturb the other
+    save_disk_offset "diskA" 128
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "128" ]
+    run get_saved_disk_offset "diskB"
+    [ "$output" = "2048" ]
+
+    # re-adding without an offset clears the stale record
+    save_disk_offset "diskA" 0
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "0" ]
+    run get_saved_disk_offset "diskB"
+    [ "$output" = "2048" ]
+}
+
+@test "save_disk_offset - refuses a non-numeric offset without touching the file" {
+    export DISK_OFFSETS_FILE="$BATS_TMPDIR/disk-offsets-guard"
+    rm -f "$DISK_OFFSETS_FILE"
+    save_disk_offset "diskA" 64
+
+    run save_disk_offset "diskB" "garbage"
+    [ "$status" -ne 0 ]
+
+    # the existing entry must survive a rejected write
+    run get_saved_disk_offset "diskA"
+    [ "$output" = "64" ]
 }
