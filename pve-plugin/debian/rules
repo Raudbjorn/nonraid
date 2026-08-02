@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+# Installed but never enabled or started: the storage plugin starts the unit
+# on first activation; only its ExecStop (ordered teardown) matters.
+override_dh_installsystemd:
+	dh_installsystemd --name=pve-nonraid --no-enable --no-start

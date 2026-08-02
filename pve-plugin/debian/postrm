@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+# Unlike postinst, postrm never receives "configure" - guard on remove/purge
+# (the upstream purestorage plugin gets this wrong and its restarts never run).
+case "$1" in
+    remove|purge)
+        for s in pve-cluster pvedaemon pvestatd pveproxy pvescheduler; do
+            systemctl try-restart "$s.service" >/dev/null 2>&1 || true
+        done
+        ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rm -f /usr/share/pve-manager/index.html.tpl.pve-nonraid.bak
+fi
+
+#DEBHELPER#

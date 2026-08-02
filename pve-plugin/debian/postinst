@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# configure: fresh install/upgrade of this package.
+# triggered: another package (pve-manager) replaced index.html.tpl.
+# The GUI injection is cosmetic - never fail the dpkg run over it.
+case "$1" in
+    configure)
+        /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+        for s in pve-cluster pvedaemon pvestatd pveproxy pvescheduler; do
+            systemctl try-restart "$s.service" >/dev/null 2>&1 || true
+        done
+        ;;
+    triggered)
+        /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+        ;;
+esac
+
+#DEBHELPER#

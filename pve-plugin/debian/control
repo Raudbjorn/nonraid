@@ -1,0 +1,20 @@
+Source: libpve-storage-nonraid-perl
+Section: perl
+Priority: optional
+Maintainer: Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/Raudbjorn/nonraid
+
+Package: libpve-storage-nonraid-perl
+Architecture: all
+Depends: ${perl:Depends}, ${misc:Depends},
+ libpve-storage-perl (>= 9.0~),
+ nonraid-tools (>= 1.23~),
+ mergerfs
+Recommends: nonraid-dkms
+Description: NonRAID storage plugin for Proxmox VE
+ Exposes a NonRAID array as Proxmox VE directory-backed storage: on
+ activation the plugin starts the array via nmdctl, mounts the member
+ disks and unions them into a mergerfs pool. Includes an optional web
+ UI integration that adds a NonRAID entry to the Add Storage menu.

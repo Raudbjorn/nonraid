@@ -11,3 +11,6 @@ clean:
 
 package:
 	dpkg-buildpackage -b -rfakeroot -us -uc
+
+package-plugin:
+	cd pve-plugin && dpkg-buildpackage -b -rfakeroot -us -uc
