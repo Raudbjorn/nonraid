@@ -48,7 +48,7 @@ my $health = \&{"${P}::nmdstat_health"};
     my $st = load_fixture('nmdstat-fresh-create-quirk.txt');
     my $h = $health->($st);
     is($h->{degraded}, 1, 'quirk: counters flag degraded (advisory only)');
-    my $d = $P->can('decide_start_action')->($st->{mdState}, 1);
+    my $d = $P->can('decide_start_action')->($st->{mdState}, 1, $h->{degraded});
     is($d->{action}, 'none', 'quirk: STARTED array is never restarted because of counters');
 }
 

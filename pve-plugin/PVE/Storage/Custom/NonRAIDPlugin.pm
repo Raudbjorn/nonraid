@@ -178,10 +178,14 @@ sub mergerfs_branches {
 # cache.files=off keeps O_DIRECT working so qemu cache=none is usable;
 # category.create=mfs keeps each image whole on one branch; moveonenospc
 # migrates a growing image instead of failing the guest with ENOSPC.
+# minfreespace must stay below the smallest branch or every create fails
+# with ENOSPC (mergerfs's own 4G default bricks arrays of small disks);
+# 1G is enough because images grow after creation and moveonenospc covers
+# growth, not minfreespace.
 sub default_mergerfs_opts {
     my ($storeid) = @_;
     return "cache.files=off,category.create=mfs,moveonenospc=true,"
-        . "minfreespace=4G,fsname=nonraid-$storeid";
+        . "minfreespace=1G,fsname=nonraid-$storeid";
 }
 
 # Health signals for logging only. mdNumInvalid/mdNumDisabled are known to be
@@ -218,13 +222,14 @@ sub nmdstat_health {
     };
 }
 
+# $degraded comes from nmdstat_health() AFTER the members are imported.
+# It matters because a degraded array that was stopped reports plain STOPPED,
+# not DISABLE_DISK - mdState alone cannot carry the fail-stop decision.
 sub decide_start_action {
-    my ($state, $autostart) = @_;
+    my ($state, $autostart, $degraded) = @_;
     $state //= '';
 
     return { action => 'none' } if $state eq 'STARTED';
-    # '' means the module is not loaded; nmdctl start handles the modprobe.
-    return { action => 'start' } if $state eq '' || $state eq 'STOPPED';
 
     if ($state eq 'DISABLE_DISK' || $state eq 'RECON_DISK') {
         return { action => 'start-degraded', assert => $state } if $autostart;
@@ -233,6 +238,16 @@ sub decide_start_action {
             msg => "array is in state $state and nonraid-degraded-autostart is disabled;"
                 . " inspect with 'nmdctl status' and start manually with"
                 . " 'nmdctl start " . lc($state) . "'\n",
+        };
+    }
+
+    if ($state eq '' || $state eq 'STOPPED') {
+        return { action => 'start' } if !$degraded;
+        return { action => 'start-degraded' } if $autostart;
+        return {
+            action => 'die',
+            msg => "array is degraded and nonraid-degraded-autostart is disabled;"
+                . " inspect with 'nmdctl status' and start manually with 'nmdctl start'\n",
         };
     }
 
@@ -261,18 +276,34 @@ my sub ensure_array_started {
     my ($storeid, $scfg, $st) = @_;
 
     my $state = $st ? ($st->{mdState} // '') : '';
+    return 0 if $state eq 'STARTED';
+
+    # Import before deciding: it loads the module if needed, and only with the
+    # members imported do the degraded counters mean anything. Idempotent -
+    # already-imported slots are skipped.
+    run_command(
+        [$NMDCTL, '-u', '-s', scfg_super($scfg), 'import'],
+        timeout => 120,
+        errmsg => "NonRAID disk import failed",
+    );
+    $st = read_nmdstat()
+        or die "cannot read /proc/nmdstat after import - module did not load?\n";
+    $state = $st->{mdState} // '';
+
     my $autostart = $scfg->{'nonraid-degraded-autostart'} // 1;
-    my $decision = decide_start_action($state, $autostart);
+    my $health = nmdstat_health($st);
+    my $decision = decide_start_action($state, $autostart, $health->{degraded});
 
     return 0 if $decision->{action} eq 'none';
     die $decision->{msg} if $decision->{action} eq 'die';
 
     my $cmd = [$NMDCTL, '-u', '-v', '-s', scfg_super($scfg), 'start'];
     if ($decision->{action} eq 'start-degraded') {
-        syslog('warning', "storage $storeid: NonRAID array is $state"
+        my $why = $decision->{assert} // "degraded ($health->{summary})";
+        syslog('warning', "storage $storeid: NonRAID array is $why"
             . " - starting DEGRADED, redundancy is compromised");
-        warn "WARNING: starting NonRAID array in degraded state ($state)\n";
-        push @$cmd, $decision->{assert};
+        warn "WARNING: starting NonRAID array in degraded state\n";
+        push @$cmd, $decision->{assert} if defined($decision->{assert});
     }
     run_command($cmd, timeout => 300, errmsg => "NonRAID array start failed");
 

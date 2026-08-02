@@ -69,6 +69,10 @@ sub load_fixture {
     like($opts, qr/fsname=nonraid-nrpool/, 'fsname carries the storage id');
     like($opts, qr/cache\.files=off/, 'O_DIRECT-compatible cache mode');
     like($opts, qr/moveonenospc=true/, 'moveonenospc enabled');
+    # E2E-found bug: minfreespace above the smallest branch makes every
+    # create fail with ENOSPC; pin the default at 1G so it cannot silently
+    # creep back up to mergerfs's 4G default.
+    like($opts, qr/minfreespace=1G/, 'minfreespace stays below small branches');
 }
 
 done_testing();
