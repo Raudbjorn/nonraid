@@ -2301,18 +2301,33 @@ readonly MAX_DISK_ID_LEN=79
 # udev's ID_SERIAL is normalised and will not trip this; a user-supplied
 # SLOT:DEV:ID will. Also protects DISK_OFFSETS_FILE, which is space separated.
 validate_disk_id() {
+    # MD_ID_SIZE bounds bytes, not characters: the driver strncpy()s the token.
+    # ${#var} counts characters in a multibyte locale, so a 79-character UTF-8
+    # ID can exceed 79 bytes and still be truncated. C locale makes the two the
+    # same, and also keeps the class below matching single bytes.
+    local LC_ALL=C
     local disk_id="$1"
 
     [ -z "$disk_id" ] && return 0
 
     if [[ "$disk_id" =~ [[:space:],] ]]; then
-        echo -e "${RED}Error: disk ID '$disk_id' contains a space, comma or tab${NC}" >&2
+        echo -e "${RED}Error: disk ID '$disk_id' contains a space, comma, tab or newline${NC}" >&2
         echo -e "${YELLOW}The driver splits the import command on those characters, so the ID would be silently truncated.${NC}" >&2
         return 1
     fi
 
+    # nmdctl serialises device specs and import entries as pipe-joined fields and
+    # reads them back with IFS='|', so a pipe shifts every field after it - the ID
+    # is driver-valid but cannot survive nmdctl's own plumbing. No by-id name
+    # contains one.
+    if [[ "$disk_id" == *"|"* ]]; then
+        echo -e "${RED}Error: disk ID '$disk_id' contains a '|'${NC}" >&2
+        echo -e "${YELLOW}nmdctl separates its internal fields with '|', so the ID would corrupt them.${NC}" >&2
+        return 1
+    fi
+
     if [ "${#disk_id}" -gt "$MAX_DISK_ID_LEN" ]; then
-        echo -e "${RED}Error: disk ID is ${#disk_id} characters; the driver stores at most $MAX_DISK_ID_LEN${NC}" >&2
+        echo -e "${RED}Error: disk ID is ${#disk_id} bytes; the driver stores at most $MAX_DISK_ID_LEN${NC}" >&2
         return 1
     fi
 
@@ -2950,24 +2965,41 @@ handle_check() {
 
         # Record elapsed time before pausing so resume can continue the count.
         # A stop (rather than pause) discards it: the next run starts fresh.
-        local elapsed_file
+        local elapsed_file elapsed_to_save=0
         elapsed_file=$(resync_elapsed_file)
         if [[ "${option^^}" == "PAUSE" ]]; then
             local sbsynced_val="${NMDSTAT_VALUES[sbSynced]}"
-            local elapsed_to_save=0
             if [ -n "$sbsynced_val" ] && [ "$sbsynced_val" != "0" ]; then
                 elapsed_to_save=$(($(printf "%(%s)T")-sbsynced_val))
             fi
-            if mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
-                echo "$elapsed_to_save" > "$elapsed_file" 2>/dev/null || true
+            # The driver resets sbSynced on every resume, so the figure above
+            # covers only the segment since the last one. Carry what earlier
+            # pauses accrued, or pause -> resume -> pause keeps just the last
+            # segment and silently drops everything before the first resume.
+            if [ -f "$elapsed_file" ]; then
+                local carried
+                carried=$(cat "$elapsed_file" 2>/dev/null)
+                if [[ "$carried" =~ ^[0-9]+$ ]]; then
+                    elapsed_to_save=$(( elapsed_to_save + carried ))
+                fi
             fi
-        else
-            rm -f "$elapsed_file" 2>/dev/null || true
         fi
 
         if ! run_nmd_command "nocheck $option"; then
             echo -e "${RED}Error: Failed to $([[ "${option^^}" != "PAUSE" ]] && echo "stop" || echo "pause") $friendly_action${NC}"
             return 1
+        fi
+
+        # Only now that the driver has acted. Committing the snapshot first means
+        # a failed PAUSE leaves a file that collect_resync_status adds to the run
+        # that is still going - double-counting elapsed time - and a failed CANCEL
+        # erases a carried segment the resumed run still needs.
+        if [[ "${option^^}" == "PAUSE" ]]; then
+            if mkdir -p "$RESYNC_ELAPSED_DIR" 2>/dev/null; then
+                echo "$elapsed_to_save" > "$elapsed_file" 2>/dev/null || true
+            fi
+        else
+            rm -f "$elapsed_file" 2>/dev/null || true
         fi
 
         echo -e "${GREEN}$friendly_action $([[ "${option^^}" != "PAUSE" ]] && echo "stopped" || echo "paused")${NC}"
