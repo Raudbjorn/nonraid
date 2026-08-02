@@ -407,8 +407,13 @@ sudo nmdctl replace SLOT
 
 Unassigns a disk from the specified slot, effectively removing it from the array. Disk contents will be emulated from parity and other data disks when the array is started.
 ```bash
-sudo nmdctl unassign SLOT
+sudo nmdctl unassign [-f] SLOT
 ```
+
+`-f`/`--force` skips the confirmation prompt, and is required together with `-u`
+(unattended), which will otherwise refuse rather than act on an unanswerable
+prompt. Note this differs from `--force` on `create`/`add`/`replace`, where it
+bypasses device availability validation.
 
 ### Mount all data disks
 

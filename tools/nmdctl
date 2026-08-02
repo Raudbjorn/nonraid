@@ -79,6 +79,10 @@ Disk Management Commands:
     add [SLOT:DEV[:ID]]             Add a new disk to the array
     replace SLOT[:DEV[:ID]]         Replace a disk in the specified slot
     unassign [-f] SLOT              Unassign a disk from the specified slot
+                                    -f, --force: skip the confirmation prompt
+                                    (required with -u; note this differs from
+                                    --force on create/add/replace, which
+                                    bypasses device validation)
 
 Maintenance Commands:
     reload                          Reload nonraid module with specified superblock
@@ -3966,14 +3970,36 @@ add_disk() {
 unassign_disk() {
     local slot=""
     local force=0
+    local arg
 
-    # Accept -f/--force in any position, matching add/replace/create.
+    # Accept -f/--force in any position, as add/replace/create do. Parsing is
+    # strict: this command destroys array membership, so a malformed invocation
+    # must fail rather than act on a best guess. "unassign 1 2 -f" silently
+    # unassigning slot 1 would be the worst possible reading of that command.
     for arg in "$@"; do
         case "$arg" in
-            -f|--force) force=1 ;;
-            *) [ -z "$slot" ] && slot="$arg" ;;
+            -f|--force)
+                force=1
+                ;;
+            -*)
+                echo -e "${RED}Error: Unknown option '$arg'${NC}"
+                echo -e "Usage: ${YELLOW}nmdctl unassign [-f] SLOT${NC}"
+                return 1
+                ;;
+            *)
+                if [ -n "$slot" ]; then
+                    echo -e "${RED}Error: Unexpected argument '$arg' (slot '$slot' already given)${NC}"
+                    echo -e "Usage: ${YELLOW}nmdctl unassign [-f] SLOT${NC}"
+                    return 1
+                fi
+                slot="$arg"
+                ;;
         esac
     done
+
+    # Keep the caller's own spelling for messages: "P" should be echoed back as
+    # "P", not as the normalized slot 0.
+    local original_slot="$slot"
 
     # Check if we have a slot parameter
     if [ -z "$slot" ]; then
@@ -4087,13 +4113,18 @@ unassign_disk() {
         fi
         echo ""
 
-        # Unattended callers cannot answer a prompt: without -f the read
+        # Unattended callers cannot answer a prompt: with empty stdin the read
         # consumes nothing and the operation is cancelled, which is why the
-        # integration test has to pipe "y" into it. Refuse explicitly instead,
-        # and let -f assert the intent, as add/replace/create already do.
+        # integration test used to pipe "y" into it. Refuse explicitly instead,
+        # and let -f assert the intent.
+        #
+        # Unlike stop/mount, which bail before printing their interactive block,
+        # this refusal comes after the slot and warning details. That is
+        # deliberate: the operator (or the CI log) then sees which disk was
+        # about to be unassigned, which is the useful part of the message.
         if [ "$UNATTENDED" -eq 1 ] && [ "$force" -eq 0 ]; then
             echo -e "${RED}Error: Refusing to unassign a disk in unattended mode without --force${NC}"
-            echo -e "${YELLOW}Re-run with ${GREEN}nmdctl -u unassign -f $slot${YELLOW} to confirm.${NC}"
+            echo -e "${YELLOW}Re-run with ${GREEN}nmdctl -u unassign -f $original_slot${YELLOW} to confirm.${NC}"
             return 1
         fi
 

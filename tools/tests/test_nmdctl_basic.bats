@@ -777,3 +777,47 @@ mock_import_with_status() {
     [ "$status" -eq 0 ]
     [ "$output" = "dangling-link" ]
 }
+
+@test "unassign_disk - refuses in unattended mode without --force" {
+    create_mock_nmdstat "STOPPED" 0 0 > "$BATS_TMPDIR/mock_nmdstat_unassign_u"
+    export PROC_NMDSTAT="$BATS_TMPDIR/mock_nmdstat_unassign_u"
+    export UNATTENDED=1
+
+    run unassign_disk 1
+
+    echo "$output"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "without --force" ]]
+}
+
+@test "unassign_disk - proceeds in unattended mode with --force and no stdin" {
+    create_mock_nmdstat "STOPPED" 0 0 > "$BATS_TMPDIR/mock_nmdstat_unassign_uf"
+    export PROC_NMDSTAT="$BATS_TMPDIR/mock_nmdstat_unassign_uf"
+    export UNATTENDED=1
+    eval 'run_nmd_command() { echo "cmd: $*"; return 0; }'
+
+    run unassign_disk 1 -f < /dev/null
+
+    echo "$output"
+    [[ ! "$output" =~ "without --force" ]]
+    [[ ! "$output" =~ "Operation cancelled" ]]
+}
+
+@test "unassign_disk - rejects a second positional argument" {
+    # Destructive command: "unassign 1 2 -f" must not silently act on slot 1.
+    export UNATTENDED=1
+    run unassign_disk 1 2 -f
+
+    echo "$output"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "Unexpected argument" ]]
+}
+
+@test "unassign_disk - rejects an unknown option" {
+    export UNATTENDED=1
+    run unassign_disk --forse 1
+
+    echo "$output"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "Unknown option" ]]
+}
