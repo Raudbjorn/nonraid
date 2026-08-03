@@ -563,11 +563,15 @@
                     },
                     {
                         xtype: 'widgetcolumn',
-                        text: gettext('Disconnect'),
+                        text: gettext('Unmount'),
                         flex: 1,
                         widget: {
                             xtype: 'button',
-                            text: gettext('Unmount'),
+                            // The column header already says Unmount; a
+                            // full text button per row is redundant. The
+                            // glyph plus the tooltip below (set in
+                            // onWidgetAttach) carries the meaning.
+                            iconCls: 'fa fa-unlink',
                             enableToggle: true,
                             handler: function (btn) {
                                 btn.getWidgetRecord().set('doUnmount', btn.pressed);

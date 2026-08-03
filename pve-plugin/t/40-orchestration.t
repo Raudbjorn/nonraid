@@ -645,6 +645,7 @@ sub member_mounts {
     reset_commands();
     eval { $P->can('_refuse_if_legacy_unit_active')->('nrpool') };
     is($@, '', 'pve-nonraid.service being active does not refuse activation');
+    is_deeply(cmds(), [], 'and nothing was issued either');
 }
 
 # Neither unit active: the ordinary case, no refusal.
@@ -652,8 +653,10 @@ sub member_mounts {
     my $bk = tempdir(CLEANUP => 1);
     local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
     mkdir "$bk/units";
+    reset_commands();
     eval { $P->can('_refuse_if_legacy_unit_active')->('nrpool') };
     is($@, '', 'no legacy unit active: nothing to refuse');
+    is_deeply(cmds(), [], 'and nothing was issued');
 }
 
 done_testing();

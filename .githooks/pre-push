@@ -93,8 +93,13 @@ while read -r _ local_sha _ remote_sha; do
     (
         cd "$wt" || exit 1
 
+        # The outer 'while read' loop above is still reading ref lines from
+        # this hook's own stdin. Anything a tier script (or something it
+        # execs) reads from its inherited stdin would silently steal a line
+        # meant for the next ref in a multi-ref push, so each tier gets its
+        # own /dev/null rather than sharing the loop's.
         echo "pre-push: fast tier"
-        sh checks/fast.sh || {
+        sh checks/fast.sh </dev/null || {
             echo "pre-push: the fast tier failed for $local_sha; nothing was pushed." >&2
             exit 1
         }
@@ -107,7 +112,7 @@ while read -r _ local_sha _ remote_sha; do
 
         if touches '^(pve-plugin/|tools/|debian/|dkms\.conf|Makefile)'; then
             echo "pre-push: package tier (docker)"
-            sh checks/debs.sh || {
+            sh checks/debs.sh </dev/null || {
                 echo "pre-push: the package tier failed for $local_sha; nothing was pushed." >&2
                 exit 1
             }
@@ -115,7 +120,7 @@ while read -r _ local_sha _ remote_sha; do
 
         if touches '^(pve-plugin/|tools/)'; then
             echo "pre-push: PVE tier (docker)"
-            sh checks/pve-load.sh || {
+            sh checks/pve-load.sh </dev/null || {
                 echo "pre-push: the PVE tier failed for $local_sha; nothing was pushed." >&2
                 exit 1
             }

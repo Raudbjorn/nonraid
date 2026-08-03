@@ -75,8 +75,10 @@ make package DOCKER=podman   # podman instead of docker
 tree by convention — which drops files outside the checkout where nothing tracks or
 ignores them, and for a tree checked out directly under `/`, into the filesystem root.
 `package-native` and `package-plugin` move their `.deb`, `.changes` and `.buildinfo` there
-afterwards; `package-docker` bind-mounts it into the container so the build writes there
-directly. `out/` is gitignored. Override with `OUTDIR=/somewhere`.
+afterwards; `package-docker` does the same via a temporary directory - it bind-mounts a
+`mktemp -d` directory into the container as `/out` (never `OUTDIR` itself, so the container
+never gets write access to the real output location) and moves the built artifacts into
+`OUTDIR` once the container exits. `out/` is gitignored. Override with `OUTDIR=/somewhere`.
 
 They cannot simply be redirected at build time: `dpkg-genbuildinfo` and `dpkg-genchanges`
 read the just-built `.deb` from `..` by the name `debian/files` records, so
