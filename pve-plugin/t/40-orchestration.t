@@ -34,7 +34,13 @@ sub reset_commands {
     $PVE::Tools::run_command_hook = undef;
 }
 
-sub cmds { return [map { join(' ', @$_) } @PVE::Tools::run_command_log]; }
+# The nmdctl capability probe is filtered out: it fires at most once per boot
+# and says nothing about the orchestration these assertions are about. It has
+# its own coverage below.
+sub cmds {
+    return [grep { $_ !~ /nmdctl --version$/ }
+        map { join(' ', @$_) } @PVE::Tools::run_command_log];
+}
 
 my $scfg = {
     path => $POOL,
@@ -361,6 +367,41 @@ sub member_mounts {
         eval { $P->can('_ensure_array_started')->('nrpool', $degraded, $P->can('read_nmdstat')->()) };
     });
     like(join(' ', @{ cmds() }), qr/import/, 'once cleared, it tries again');
+}
+
+# ---- nmdctl capability probe ----------------------------------------------
+
+{
+    my $ok = $P->can('nmdctl_version_ok');
+    is($ok->('nmdctl version 1.23.0'), 1, '1.23.0 is new enough');
+    is($ok->('nmdctl version 1.23'), 1, 'a two-component 1.23 is new enough');
+    is($ok->('nmdctl version 2.0.0'), 1, 'a newer major is new enough');
+    is($ok->('nmdctl version 1.22.9'), 0, '1.22.9 is refused');
+    # The bound that a dpkg version comparison gets wrong: dpkg orders 1.4.0
+    # ABOVE 1.23, which is why this is checked numerically instead.
+    is($ok->('nmdctl version 1.4.0'), 0, '1.4.0 is older than 1.23, not newer');
+    is($ok->('a fork with its own banner'), undef, 'unparseable is not a verdict');
+}
+
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+
+    reset_commands();
+    $PVE::Tools::run_command_hook = sub {
+        my ($cmd, %param) = @_;
+        $param{outfunc}->('nmdctl version 1.22.0') if $param{outfunc};
+        return 0;
+    };
+    my $err = '';
+    with_fixture('nmdstat-stopped.txt', sub {
+        eval { $P->can('_ensure_array_started')->('nrpool', $scfg, $P->can('read_nmdstat')->()) };
+        $err = $@;
+    });
+    like($err, qr/nonraid-tools is too old/, 'an old nmdctl is refused');
+    is_deeply(cmds(), [], 'and nothing else was issued');
+    ok(!-e "$bk/run/nmdctl-checked", 'a failed probe is not stamped as passed');
 }
 
 done_testing();

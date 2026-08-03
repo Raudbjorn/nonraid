@@ -76,6 +76,66 @@ sub live_array {
     is_deeply($b, ['2 partition(s)'], 'partitions are the only blocker, and counted');
 }
 
+# lsblk nests, and the layout that matters is two levels down: disk -> part ->
+# LVM/dm-crypt/MD. Looking only at direct children saw a bare 'part' and said
+# "1 partition(s)" - which wipe_disks drops as the very reason one wipes, so a
+# disk whose partition carried a mounted root LV arrived at wipefs with no
+# blockers at all.
+{
+    my $nested = sub {
+        my ($leaf) = @_;
+        return { name => 'vdx', type => 'disk',
+            children => [{ name => 'vdx1', type => 'part', children => [$leaf] }] };
+    };
+    my $fatal = sub {
+        # What wipe_disks sees: everything except the partition count.
+        return [grep { !/^\d+ partition/ } @{ $blockers->($_[0], undef) }];
+    };
+
+    my $mounted_lv = $nested->({ name => 'pve-root', type => 'lvm', mountpoint => '/' });
+    like($blockers->($mounted_lv, undef)->[0], qr{pve-root is mounted at /},
+        'a mounted LV two levels down is seen');
+    ok(scalar @{ $fatal->($mounted_lv) }, 'and it survives the wipe filter');
+
+    my $bare_pv = $nested->({ name => 'pve-data', type => 'lvm' });
+    like($blockers->($bare_pv, undef)->[0], qr/pve-data \(lvm\) holds it/,
+        'an unmounted LVM holder two levels down is seen');
+    ok(scalar @{ $fatal->($bare_pv) }, 'and it survives the wipe filter');
+
+    my $deep = $nested->({ name => 'cr', type => 'crypt',
+        children => [{ name => 'cr-lv', type => 'lvm', mountpoint => '/srv' }] });
+    my $b = $blockers->($deep, undef);
+    like(join('; ', @$b), qr/cr \(crypt\) holds it/, 'the crypt layer is named');
+    like(join('; ', @$b), qr{cr-lv is mounted at /srv}, 'and so is what sits on it');
+
+    # The one case that must still be wipeable: a plain partition table.
+    my $plain = { name => 'vdx', type => 'disk',
+        children => [{ name => 'vdx1', type => 'part' }, { name => 'vdx2', type => 'part' }] };
+    is_deeply($fatal->($plain), [], 'a plain partition table is still wipeable');
+    is_deeply($blockers->($plain, undef), ['2 partition(s)'],
+        'and the count stays top-level, describing the partition table');
+}
+
+# Member matching derives the disk from rdevName, and a blind s/p?\d+$// also
+# eats the trailing digits of whole-device names.
+{
+    my %fixture = (
+        'nvme0n1p1' => 'nvme0n1',
+        'mmcblk0p2' => 'mmcblk0',
+        'sdb1' => 'sdb',
+        'vde2' => 'vde',
+        'nvme0n1' => 'nvme0n1',
+        'mmcblk0' => 'mmcblk0',
+    );
+    for my $rdev (sort keys %fixture) {
+        my $disk = $fixture{$rdev};
+        my $st = { 'rdevName.1' => $rdev, 'diskName.1' => 'nmd1p1' };
+        my $b = $blockers->({ name => $disk, type => 'disk' }, $st);
+        like($b->[0] // '', qr/already in this array/,
+            "rdevName '$rdev' is recognised as belonging to disk '$disk'");
+    }
+}
+
 {
     my $b = $blockers->({ name => 'vdf', type => 'disk', fstype => 'ext4' }, undef);
     like($b->[0], qr/holds a ext4 filesystem/, 'a bare filesystem blocks');

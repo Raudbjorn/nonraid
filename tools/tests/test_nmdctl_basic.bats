@@ -1338,3 +1338,25 @@ seed_running_check() {
 
     rm -rf "$RESYNC_ELAPSED_DIR"
 }
+
+@test "save_disk_offset - concurrent writers do not lose entries" {
+    # The atomic rename makes each writer's own result self-consistent, but not
+    # correct: without a lock every writer reads the same original, writes a
+    # full file from it, and the last rename discards the rest - after they
+    # were all reported as recorded. A lost offset re-imports that disk at
+    # sector 0. Before the flock this left 1 of 25 entries.
+    local offsets="$BATS_TEST_TMPDIR/offsets"
+    DISK_OFFSETS_FILE="$offsets"
+
+    local i
+    for i in $(seq 1 25); do
+        ( save_disk_offset "concurrent-disk-$i" "$((1000 + i))" >/dev/null 2>&1 ) &
+    done
+    wait
+
+    [ "$(wc -l < "$offsets")" -eq 25 ]
+    # And every one of them is findable, not just the right number of lines.
+    for i in $(seq 1 25); do
+        grep -qx "concurrent-disk-$i $((1000 + i))" "$offsets"
+    done
+}

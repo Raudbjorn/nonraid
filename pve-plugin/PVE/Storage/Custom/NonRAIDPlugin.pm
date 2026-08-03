@@ -59,8 +59,19 @@ my $DEFAULT_DISK_PREFIX = '/mnt/disk';
 # value - any number below the oldest window PVE will ever offer would do.
 sub api {
     my $tested = 15;
+
+    # 13 is a hard floor, not a preference. PVE::API2::Storage::Config
+    # dispatches on_update_hook_full only for api() >= 13 and plain
+    # on_update_hook below it - and the write-only disk-action properties are
+    # deleted inside the _full hook, so on an older PVE they would be handed
+    # straight through to storage.cfg and persist. Reporting a version such a
+    # PVE cannot accept makes it decline to load us (with a warning, inside its
+    # own eval - it does not break PVE::Storage), which is the safe answer.
+    my $needs = 13;
+
     my ($apiver, $apiage) = eval { (PVE::Storage::APIVER(), PVE::Storage::APIAGE()) };
     return $tested if !defined($apiver); # standalone (unit tests)
+    return $tested if $apiver < $needs;
     return $apiver if $apiver <= $tested;
     return $tested if $apiver - $apiage <= $tested;
     return 12;
@@ -336,8 +347,17 @@ sub disk_blockers {
             my $rdev = $st->{$key} // '';
             next if $rdev eq '';
             # rdevName is e.g. 'vde1'; strip the partition to get the disk.
+            # Anchored on the two real partition-naming forms, because a blind
+            # s/p?\d+$// also eats the trailing digits of whole-device names -
+            # 'nvme0n1' would become 'nvme0n', and 'mmcblk0' 'mmcblk'.
             my $disk = $rdev;
-            $disk =~ s/p?\d+$//;
+            if ($disk =~ /^(?:nvme\d+n\d+|mmcblk\d+|loop\d+|md\d+)$/) {
+                # Already a whole device whose name simply ends in a digit.
+            } elsif ($disk =~ /^(.*\d)p\d+$/) {
+                $disk = $1; # nvme0n1p3, mmcblk0p1, loop0p1
+            } else {
+                $disk =~ s/(?<=[a-zA-Z])\d+$//; # sda1, vde2, hdb3
+            }
             if ($disk eq $name || $rdev eq $name) {
                 my $role = $slot == 0 ? 'parity P'
                     : $slot == 29 ? 'parity Q'
@@ -353,17 +373,27 @@ sub disk_blockers {
     push @blockers, "holds a $entry->{fstype} filesystem"
         if defined($entry->{fstype}) && $entry->{fstype} ne '';
 
+    # The WHOLE subtree, not just the direct children. lsblk nests, and the
+    # usual layout puts the thing that matters two levels down: disk -> part ->
+    # LVM/dm-crypt/MD. Looking only one level deep saw a bare 'part' and
+    # reported "1 partition(s)" - and since wipe_disks drops exactly that
+    # blocker as the reason one wipes, a disk whose partition carried a mounted
+    # root LV came out with no blockers at all and went to wipefs.
     my @children = @{ $entry->{children} // [] };
-    for my $child (@children) {
+    my @queue = @children;
+    while (my $child = shift @queue) {
         my $ctype = $child->{type} // '';
         if (defined($child->{mountpoint}) && $child->{mountpoint} ne '') {
             push @blockers, "$child->{name} is mounted at $child->{mountpoint}";
         } elsif ($ctype ne 'part') {
-            # A non-partition child is a holder: LVM, dm-crypt, MD, a Ceph OSD.
-            # Undoing those is the business of the tool that made them.
+            # A non-partition descendant is a holder: LVM, dm-crypt, MD, a Ceph
+            # OSD. Undoing those is the business of the tool that made them.
             push @blockers, "$child->{name} ($ctype) holds it";
         }
+        push @queue, @{ $child->{children} // [] };
     }
+    # Counted at the top level only: "3 partition(s)" describes the partition
+    # table, which is what is about to be erased.
     my @parts = grep { ($_->{type} // '') eq 'part' } @children;
     push @blockers, scalar(@parts) . " partition(s)" if @parts;
 
@@ -575,11 +605,70 @@ sub _clear_refusal {
     unlink(_refusal_stamp($storeid));
 }
 
+# nmdctl capability, checked at runtime rather than pinned as a package
+# version. The commands below need 1.23 semantics - the expected-state argument
+# to 'start', and '-u' - and the dpkg route to enforcing that does not work:
+# the in-tree tools/debian/changelog says 1.0.0-1, so a locally built
+# nonraid-tools could never satisfy a bound that release artifacts do, and dpkg
+# orders 1.4.0 BELOW 1.23 anyway. Asking the tool what it is avoids both traps.
+my $NMDCTL_MIN = [1, 23];
+
+# Pure, so the parsing is testable without a binary present.
+sub nmdctl_version_ok {
+    my ($output, $min) = @_;
+    $min //= $NMDCTL_MIN;
+    my ($major, $minor) = ($output // '') =~ /version\s+(\d+)\.(\d+)/;
+    return undef if !defined($major); # unparseable - caller decides
+    return 1 if $major > $min->[0];
+    return 0 if $major < $min->[0];
+    return $minor >= $min->[1] ? 1 : 0;
+}
+
+sub _check_nmdctl {
+    my ($storeid) = @_;
+
+    # Once per boot: nmdctl cannot change version under a running system
+    # without the package being replaced, and the slow path is already the
+    # expensive one without adding a fork to it every time.
+    my $stamp = _run_dir() . '/nmdctl-checked';
+    return if -e $stamp;
+
+    my $out = '';
+    eval {
+        run_command([$NMDCTL, '--version'], timeout => 15,
+            outfunc => sub { $out .= shift . "\n" },
+            errfunc => sub { });
+    };
+    die "cannot run $NMDCTL - is nonraid-tools installed? ($@)\n" if $@;
+
+    my $ok = nmdctl_version_ok($out);
+    if (!defined($ok)) {
+        # Unrecognised output is not fatal: a fork of the tool may well be
+        # capable and simply not say so in this format. Say what was assumed.
+        syslog('warning', '%s', "storage $storeid: could not read a version from"
+            . " '$NMDCTL --version'; assuming it supports 1.23 semantics");
+        return;
+    }
+    die "nonraid-tools is too old: $NMDCTL reports \""
+        . (split /\n/, $out)[0] . "\", and this plugin needs"
+        . " $NMDCTL_MIN->[0].$NMDCTL_MIN->[1] semantics (the expected-state"
+        . " argument to 'start', and '-u')\n" if !$ok;
+
+    if (eval { make_path(_run_dir()); 1 } && open(my $fh, '>', $stamp)) {
+        close($fh);
+    }
+    return;
+}
+
 sub _ensure_array_started {
     my ($storeid, $scfg, $st) = @_;
 
     my $super = _scfg_super($scfg);
     my $state = $st ? ($st->{mdState} // '') : '';
+
+    # Before anything is issued: an old nmdctl would take the commands below
+    # and do something subtly different with them.
+    _check_nmdctl($storeid);
 
     if ($st) {
         die "a different NonRAID array is loaded (superblock '$st->{sbName}',"

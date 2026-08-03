@@ -14,7 +14,12 @@ host_actions() {
 
 case "$1" in
     remove)
-        host_actions && { /usr/share/pve-nonraid/pve-nonraid-gui remove || true; }
+        # if-form, not 'host_actions && ...': an && list that ends false takes
+        # the script's exit status with it when nothing follows, and dpkg reads
+        # a non-zero prerm as a failed removal.
+        if host_actions; then
+            /usr/share/pve-nonraid/pve-nonraid-gui remove || true
+        fi
         ;;
 esac
 

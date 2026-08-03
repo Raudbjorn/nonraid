@@ -59,7 +59,12 @@ The pool path defaults to `/mnt/pve/<storage id>`. Options:
 | `nonraid-degraded-autostart` | `yes` | start DISABLE_DISK/RECON_DISK arrays |
 | `nonraid-mergerfs-opts` | computed | mergerfs `-o` override |
 
-Always set `--nodes`: `storage.cfg` is cluster-wide, the array is not.
+Always set `--nodes`: `storage.cfg` is cluster-wide, the array is not. PVE
+treats `nodes` as optional for every storage type and this plugin does not
+override that, so nothing stops you omitting it — on a cluster the result is
+that every other node also tries to activate this storage, runs `nmdctl
+import` against a superblock it has no disks for, and fails the activation on
+each pvestatd cycle. On a single-node install it is harmless.
 
 The storage stays online while the array is degraded (emulated reads);
 transitions are syslogged. `NEW_ARRAY`, `SWAP_DSBL` and `ERROR:*` states are
@@ -115,10 +120,11 @@ list:
 
 ![The Add menu with the NonRAID entry](images/add-menu.png)
 
-The panel asks for the same options as `pvesm`. Only the ID is mandatory:
-leave Path empty and it becomes `/mnt/pve/<id>`, and the remaining fields
-fall back to the defaults in the table above. Set **Nodes** to the one node
-that has the array.
+The panel asks for the same options as `pvesm`. Only the ID is mandatory to
+the *schema*: leave Path empty and it becomes `/mnt/pve/<id>`, and the
+remaining fields fall back to the defaults in the table above. **Nodes** is
+the exception you should treat as mandatory anyway — set it to the one node
+that has the array, for the reason above.
 
 ![The Add: NonRAID dialog](images/add-dialog.png)
 

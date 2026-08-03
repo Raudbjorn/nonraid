@@ -25,7 +25,10 @@ case "$1" in
         fi
         ;;
     triggered)
-        host_actions && { /usr/share/pve-nonraid/pve-nonraid-gui apply || true; }
+        # See prerm: an && list that ends false becomes the script's status.
+        if host_actions; then
+            /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+        fi
         ;;
 esac
 
