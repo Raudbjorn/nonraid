@@ -122,6 +122,82 @@
             });
         };
 
+        // ---- @svnbjrn/design tokens, scoped ------------------------------
+        //
+        // Values are copied verbatim from the design system's GENERATED
+        // dist/tokens/colors.css (do not hand-edit them here either - edit the
+        // DTCG source there and re-copy). Only the semantic slice is carried:
+        // inside Proxmox's ExtJS theme the parchment surface family would
+        // fight the host chrome, but the semantic colors (success / error /
+        // warning / accent, muted text) are exactly the vocabulary the disk
+        // funnel needs. Everything is scoped under .nonraid-sv so no token or
+        // rule can leak into PVE's own widgets, and the theme is chosen by
+        // measuring the page rather than trusting a class name: PVE reloads
+        // on theme switch, so a one-shot probe at load time is enough.
+        var injectDesignTokens = function () {
+            if (document.getElementById('nonraid-sv-tokens')) {
+                return;
+            }
+            var dark = true;
+            try {
+                var bg = getComputedStyle(document.body).backgroundColor;
+                var m = bg && bg.match(/\d+/g);
+                if (m && m.length >= 3) {
+                    // Relative luminance, roughly; PVE light is near-white.
+                    dark = (0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2]) < 128;
+                }
+            } catch (ignore) { /* default to dark-first, like the system */ }
+
+            var t = dark ? {
+                success: '#74a55e', error: '#ff5b48', warning: '#ffa500',
+                accent: '#4ec9b0', accent2: '#e06c75',
+                muted: '#9a9a9a', strong: '#f5f5f5',
+                chipBg: '#2d2d2d', chipBorder: '#3c3c3c',
+            } : {
+                success: '#086326', error: '#9d2b20', warning: '#7d4800',
+                accent: '#1f6659', accent2: '#8d3740',
+                muted: '#605b47', strong: '#2a2617',
+                chipBg: '#ece1b8', chipBorder: '#c7ba85',
+            };
+
+            var css = [
+                '.nonraid-sv {',
+                '  --sv-success:' + t.success + '; --sv-error:' + t.error + ';',
+                '  --sv-warning:' + t.warning + '; --sv-accent:' + t.accent + ';',
+                '  --sv-accent-2:' + t.accent2 + '; --sv-text-muted:' + t.muted + ';',
+                '  --sv-text-strong:' + t.strong + '; --sv-surface-3:' + t.chipBg + ';',
+                '  --sv-border:' + t.chipBorder + ';',
+                '}',
+                // Device names: chips in the system's mono voice. Iosevka is
+                // the design system font; fall back through the platform mono
+                // stack rather than embedding fonts into PVE.
+                '.nonraid-sv .nonraid-dev {',
+                '  font-family: Iosevka, ui-monospace, "Cascadia Mono", Menlo, monospace;',
+                '  font-size: 12px; padding: 0 5px; border-radius: 3px;',
+                '  background: var(--sv-surface-3); border: 1px solid var(--sv-border);',
+                '  color: var(--sv-text-strong);',
+                '}',
+                '.nonraid-sv .nonraid-status-free   { color: var(--sv-success); font-weight: 600; }',
+                '.nonraid-sv .nonraid-status-held   { color: var(--sv-warning); }',
+                '.nonraid-sv .nonraid-status-used   { color: var(--sv-text-muted); }',
+                // Staged-action row tints: the row answers "what will happen
+                // to this disk when I press Add" at a glance. Wipe outranks
+                // assign outranks unmount, matching the funnel order.
+                '.nonraid-sv .nonraid-row-wipe    .x-grid-cell { background: color-mix(in srgb, ' + t.error + ' 14%, transparent) !important; }',
+                '.nonraid-sv .nonraid-row-assign  .x-grid-cell { background: color-mix(in srgb, ' + t.accent + ' 14%, transparent) !important; }',
+                '.nonraid-sv .nonraid-row-unmount .x-grid-cell { background: color-mix(in srgb, ' + t.warning + ' 12%, transparent) !important; }',
+                // Confirmation dialog: the danger line carries the error
+                // token; device chips reuse the mono voice.
+                '.nonraid-sv .nonraid-confirm-danger { color: var(--sv-error); font-weight: 700; }',
+                '.nonraid-sv .nonraid-confirm-section { margin: 4px 0; }',
+            ].join('\n');
+
+            var el = document.createElement('style');
+            el.id = 'nonraid-sv-tokens';
+            el.appendChild(document.createTextNode(css));
+            document.head.appendChild(el);
+        };
+
         // Why a disk cannot be unmounted / wiped / assigned, from what
         // /nodes/{node}/disks/list reports. 'used' comes from PVE's own
         // vocabulary: 'mounted', 'LVM', 'ZFS', 'Device Mapper', 'partitions',
@@ -423,20 +499,45 @@
                     ],
                 });
 
+                injectDesignTokens();
+
                 me.columnB = [
                     {
                         xtype: 'grid',
                         name: 'nonraid-disk-manager',
+                        cls: 'nonraid-sv',
                         title: gettext('Disks on the selected node'),
                         store: me.diskStore,
                         height: 230,
                         emptyText: gettext('Select a single node to list its disks'),
-                        viewConfig: { markDirty: false, stripeRows: true },
+                        viewConfig: {
+                            markDirty: false,
+                            stripeRows: true,
+                            // The row tint answers "what happens to this disk
+                            // on Add" at a glance; record.set() refreshes the
+                            // row, so this re-evaluates as actions are staged.
+                            getRowClass: function (rec) {
+                                if (rec.get('doWipe')) {
+                                    return 'nonraid-row-wipe';
+                                }
+                                if (rec.get('role')) {
+                                    return 'nonraid-row-assign';
+                                }
+                                if (rec.get('doUnmount')) {
+                                    return 'nonraid-row-unmount';
+                                }
+                                return '';
+                            },
+                        },
                         columns: [
                             {
                                 text: gettext('Device'),
                                 dataIndex: 'devpath',
                                 flex: 2,
+                                renderer: function (v) {
+                                    return '<span class="nonraid-dev">'
+                                        + Ext.String.htmlEncode(v || '') + '</span>';
+                                },
                             },
                             {
                                 text: gettext('Size'),
@@ -451,6 +552,17 @@
                                 text: gettext('Status'),
                                 dataIndex: 'statusText',
                                 flex: 2,
+                                renderer: function (v, meta, rec) {
+                                    var cls = 'nonraid-status-used';
+                                    if (!rec.get('used') && !(rec.get('osdid') >= 0)) {
+                                        cls = 'nonraid-status-free';
+                                    } else if (rec.get('unmountWhy')
+                                        && /Held by/.test(rec.get('unmountWhy'))) {
+                                        cls = 'nonraid-status-held';
+                                    }
+                                    return '<span class="' + cls + '">'
+                                        + Ext.String.htmlEncode(v || '') + '</span>';
+                                },
                             },
                             {
                                 xtype: 'widgetcolumn',
@@ -629,28 +741,37 @@
             // reads before erasing a disk, and a name that renders as markup
             // is a name they cannot check.
             var devs = function (list) {
-                return Ext.String.htmlEncode(list.join(', '));
+                return list.map(function (d) {
+                    return '<span class="nonraid-dev">' + Ext.String.htmlEncode(d) + '</span>';
+                }).join(' ');
+            };
+            var section = function (html) {
+                return '<div class="nonraid-confirm-section">' + html + '</div>';
             };
             var lines = [];
             if (s.unmount.length) {
-                lines.push(gettext('Unmount') + ': ' + devs(s.unmount));
+                lines.push(section(gettext('Unmount') + ': ' + devs(s.unmount)));
             }
             if (s.wipe.length) {
-                lines.push('<b>' + gettext('ERASE ALL DATA') + '</b>: ' + devs(s.wipe));
+                lines.push(section('<span class="nonraid-confirm-danger">'
+                    + gettext('ERASE ALL DATA') + '</span>: ' + devs(s.wipe)));
             }
             if (s.parity.length || s.data.length) {
-                lines.push('<b>' + gettext('Build a new array, destroying their contents')
-                    + '</b>:<br>&nbsp;&nbsp;' + gettext('Parity') + ': '
+                lines.push(section('<span class="nonraid-confirm-danger">'
+                    + gettext('Build a new array, destroying their contents')
+                    + '</span><br>&nbsp;&nbsp;' + gettext('Parity') + ': '
                     + (s.parity.length ? devs(s.parity) : '—') + '<br>&nbsp;&nbsp;'
-                    + gettext('Data') + ': ' + (s.data.length ? devs(s.data) : '—'));
+                    + gettext('Data') + ': ' + (s.data.length ? devs(s.data) : '—')));
             }
             if (!lines.length) {
                 return submit();
             }
+            injectDesignTokens();
             Ext.Msg.show({
                 title: gettext('Confirm disk changes'),
-                message: gettext('These changes cannot be undone:') + '<br><br>'
-                    + lines.join('<br>') + '<br><br>' + gettext('Continue?'),
+                message: '<div class="nonraid-sv">'
+                    + gettext('These changes cannot be undone:') + '<br><br>'
+                    + lines.join('') + '<br>' + gettext('Continue?') + '</div>',
                 buttons: Ext.Msg.YESNO,
                 icon: Ext.Msg.WARNING,
                 defaultFocus: 'no',

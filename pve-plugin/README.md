@@ -155,6 +155,11 @@ Nothing runs while you click. Pressing **Add** shows one confirmation naming
 every disk in every staged action, and only then does the plugin's hook run
 them in order: unmount, wipe, create.
 
+The dialog's own surfaces (device chips, status colors, staged-row tints, the
+confirmation's danger line) use the semantic color tokens from
+`@svnbjrn/design`, scoped under a `.nonraid-sv` class so nothing bleeds into
+Proxmox's own widgets, with the light/dark set chosen to match the PVE theme.
+
 ![The Add dialog with the disk manager](images/add-dialog-diskmanager.png)
 
 ![The batch confirmation](images/add-dialog-confirm.png)
