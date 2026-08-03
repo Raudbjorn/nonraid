@@ -1,32 +1,52 @@
 #!/bin/sh
 set -e
 
+# An offline-root operation (debootstrap, image builds) sets DPKG_ROOT to the
+# target tree. Our own actions here touch THIS host - the live PVE template and
+# this host's services - so they are skipped in that case; nothing they do is
+# essential to the package, and doing them would be actively wrong. The
+# debhelper-generated snippets below still run: they are DPKG_ROOT-aware
+# themselves. (Do not write the debhelper token in a comment - it is
+# substituted wherever it appears, and the rest of the sentence becomes code.)
+host_actions() {
+    [ -z "${DPKG_ROOT:-}" ]
+}
+
 # Unlike postinst, postrm never receives "configure" - guard on remove/purge
 # (the upstream purestorage plugin gets this wrong and its restarts never run).
 TPL=/usr/share/pve-manager/index.html.tpl
 
 case "$1" in
     remove|purge)
-        # prerm removes the injected block, but it is allowed to fail (the GUI
-        # is cosmetic and must never break a dpkg run). If it did fail, the tag
-        # would outlive the package and 404 on every page load, so sweep it
-        # here too - our own script is gone by now, hence the inline sed.
-        if [ -f "$TPL" ] && grep -q '<!-- BEGIN pve-nonraid-gui' "$TPL"; then
-            if grep -q '<!-- END pve-nonraid-gui -->' "$TPL"; then
-                sed -i '/<!-- BEGIN pve-nonraid-gui/,/<!-- END pve-nonraid-gui -->/d' "$TPL"
-            else
-                echo "pve-nonraid: $TPL has an unterminated marker block;" >&2
-                echo "  leaving it alone - remove the block by hand." >&2
+        if host_actions; then
+            # prerm removes the injected block, but it is allowed to fail (the
+            # GUI is cosmetic and must never break a dpkg run). If it did fail,
+            # the tag would outlive the package and 404 on every page load, so
+            # sweep it here too - our own script is gone by now, hence the
+            # inline sed.
+            #
+            # Every failure is warned about and stepped over: an immutable or
+            # read-only template must not abort post-removal and leave the
+            # package Half-Installed, which is a far worse state to be in than
+            # one with a stale <script> tag.
+            if [ -f "$TPL" ] && grep -q '<!-- BEGIN pve-nonraid-gui' "$TPL"; then
+                if ! grep -q '<!-- END pve-nonraid-gui -->' "$TPL"; then
+                    echo "pve-nonraid: $TPL has an unterminated marker block;" >&2
+                    echo "  leaving it alone - remove the block by hand." >&2
+                elif ! sed -i '/<!-- BEGIN pve-nonraid-gui/,/<!-- END pve-nonraid-gui -->/d' "$TPL"; then
+                    echo "pve-nonraid: could not edit $TPL; the GUI <script> tag" >&2
+                    echo "  is still there and will 404. Remove it by hand." >&2
+                fi
             fi
+            for s in pvedaemon pvestatd pveproxy pvescheduler; do
+                systemctl try-restart "$s.service" >/dev/null 2>&1 || true
+            done
         fi
-        for s in pvedaemon pvestatd pveproxy pvescheduler; do
-            systemctl try-restart "$s.service" >/dev/null 2>&1 || true
-        done
         ;;
 esac
 
-if [ "$1" = "purge" ]; then
-    rm -f /usr/share/pve-manager/index.html.tpl.pve-nonraid.bak
+if [ "$1" = "purge" ] && host_actions; then
+    rm -f /usr/share/pve-manager/index.html.tpl.pve-nonraid.bak || true
 fi
 
 #DEBHELPER#

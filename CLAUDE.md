@@ -19,10 +19,12 @@ Driver source is **not** developed on `main`. Three branch families:
 | Branch | Contains | Role |
 |---|---|---|
 | `upstream` | `vendor/drivers/md/*.c`, `vendor/*.patch` | Pristine GPL drops extracted from UnRAID firmware releases. History = one commit per UnRAID release. |
-| `nonraid-6.1`, `nonraid-6.6`, `nonraid-6.12`, `nonraid-6.18` | `md_nonraid/{md_unraid.c,md_unraid.h,unraid.c}` | NonRAID's rebranding + crash-fix patches rebased on top of the matching `upstream` vendor drop. One branch per supported kernel range. |
+| `nonraid-6.1`, `nonraid-6.6`, `nonraid-6.18` | `md_nonraid/{md_unraid.c,md_unraid.h,unraid.c}` | NonRAID's rebranding + crash-fix patches rebased on top of the matching `upstream` vendor drop. One branch per supported kernel range. |
 | `main` | everything else | DKMS packaging, `nmdctl`, docs, CI. Vendors the driver branches into `md_nonraid/<ver>/`. |
 
 **`md_nonraid/6.1/`, `md_nonraid/6.6/`, `md_nonraid/6.18/` on `main` are copies** (each has a `README.md` saying so). A driver fix generally belongs on the `nonraid-6.X` branch and is then copied to `main` — check with the maintainer before landing driver changes directly on `main`.
+
+`nonraid-6.12` still exists as a branch but is **historical**: `main` carries no `md_nonraid/6.12/`, and the routing below sends everything above 6.8 to `6.18/`. Current fixes for new kernels go to `nonraid-6.18`.
 
 Which copy gets compiled is decided by `md_nonraid/Makefile` from `KVERSION`: `> 6.8` → `6.18/`, `>= 6.5` → `6.6/`, else `6.1/`. Kernels 6.9 and 6.10 are unsupported. Note the comparison is `major > 6 OR (major == 6 AND minor > 8)`, so kernel 7.x already routes to the newest branch. `md_nonraid/compat-xor.h` is force-included by that Makefile and holds the kernel-7.1 `xor_blocks` → `xor_gen` shim, deliberately outside the per-kernel directories so the vendored copies stay byte-identical to upstream.
 

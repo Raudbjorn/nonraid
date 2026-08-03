@@ -1143,14 +1143,25 @@ mock_import_with_status() {
     # counts bytes anyway, and this passes without having tested the multibyte
     # case at all. C.UTF-8 is present on minimal Debian/Ubuntu images where
     # en_US.UTF-8 usually is not.
+    # Match on the normalized name rather than two literal spellings: glibc
+    # reports both 'C.UTF-8' and 'C.utf8' depending on the system, and a
+    # literal list skips the test on hosts that do have a usable locale.
     local utf8_locale=""
-    local cand
-    for cand in C.UTF-8 en_US.UTF-8; do
-        if locale -a 2>/dev/null | grep -qixF "$cand"; then
-            utf8_locale="$cand"
-            break
-        fi
-    done
+    local cand norm
+    while IFS= read -r cand; do
+        norm=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]' | tr -d -- '-_')
+        case "$norm" in
+            *utf8)
+                # C.UTF-8 for preference - it is on minimal Debian/Ubuntu
+                # images where en_US.UTF-8 usually is not - else the first.
+                if [ "$norm" = "c.utf8" ]; then
+                    utf8_locale="$cand"
+                    break
+                fi
+                [ -n "$utf8_locale" ] || utf8_locale="$cand"
+                ;;
+        esac
+    done < <(locale -a 2>/dev/null)
     [ -n "$utf8_locale" ] || skip "no UTF-8 locale available to test byte-vs-character length"
 
     LC_ALL="$utf8_locale" run validate_disk_id "$multibyte_id"

@@ -98,11 +98,36 @@ my $health = \&{"${P}::nmdstat_health"};
 # Member mounts must come from the array's own devices.
 {
     my $ok = $P->can('member_source_ok');
-    ok($ok->('/dev/nmd1p1', 1), 'member device for its slot');
-    ok($ok->('/dev/mapper/nmd1', 1), 'LUKS member device for its slot');
+
+    # The driver exposes exactly one partition per slot, and nmdctl names the
+    # LUKS mapping after it (diskName.N is 'nmdNp1'). Anything else mounted at
+    # a member's mountpoint would be unioned into a guest-writable pool.
+    ok($ok->('/dev/nmd1p1', 1), 'the member device for its slot');
+    ok(!$ok->('/dev/nmd1p2', 1), 'a different partition of the same slot rejected');
+    ok(!$ok->('/dev/nmd1', 1), 'the whole-disk node rejected: members are partitions');
+    ok(!$ok->('/dev/nmd11p1', 1), 'slot 11 is not slot 1');
     ok(!$ok->('/dev/nmd2p1', 1), 'member device for a different slot rejected');
     ok(!$ok->('/dev/sdz1', 1), 'foreign device rejected');
     ok(!$ok->(undef, 1), 'undef source rejected');
+
+    # Device-mapper members are decided by the kernel's slave list, not by the
+    # mapper's name: 'nmd1p1' does not end on a word boundary, so name-matching
+    # rejected the real LUKS path, and any mapping whose name merely contained
+    # the string passed.
+    my $slaves = sub {
+        my ($source) = @_;
+        return ['nmd1p1'] if $source eq '/dev/mapper/nmd1p1';
+        return ['nmd1p1'] if $source eq '/dev/mapper/anything-at-all';
+        return ['sda1'] if $source eq '/dev/mapper/nmd1-decoy';
+        return undef; # not a dm device
+    };
+    ok($ok->('/dev/mapper/nmd1p1', 1, $slaves), 'the real LUKS mapper path for its slot');
+    ok($ok->('/dev/mapper/anything-at-all', 1, $slaves),
+        'a differently-named mapping over the member is still the member');
+    ok(!$ok->('/dev/mapper/nmd1-decoy', 1, $slaves),
+        'a mapper whose name contains the member but is backed by something else');
+    ok(!$ok->('/dev/mapper/nmd1p1', 2, $slaves), 'the right member, the wrong slot');
+    ok(!$ok->('/dev/sdz1', 1, $slaves), 'a non-dm foreign device has no slaves to save it');
 }
 
 done_testing();

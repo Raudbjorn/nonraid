@@ -7,19 +7,42 @@ mounts the member disks and unions them into a mergerfs pool at the storage
 
 ## Install
 
+The plugin `Depends` on `nonraid-tools`, which is in no apt archive — upstream
+publishes it as a GitHub release artifact. On a host that does not already have
+it, installing the plugin alone therefore fails to resolve, and both packages
+have to be built:
+
 ```sh
 apt install build-essential debhelper fakeroot   # build-time only
+
+# nonraid-tools. debhelper looks for the units under tools/debian/ with these
+# names; the release workflow that used to put them there is not carried in
+# this fork, so a plain dpkg-buildpackage in tools/ fails on the first unit.
+cd tools
+for u in nonraid.service nonraid.default nonraid-parity-check.service \
+         nonraid-parity-check.timer nonraid-notify.service nonraid-notify.timer; do
+    cp "systemd/$u" "debian/nonraid-tools.$u"
+done
+cp udev/nonraid.udev debian/nonraid-tools.nonraid.udev
+dpkg-buildpackage -b -us -uc
+cd ..
+
 make package-plugin                              # from the repo root, on Debian
-apt install ./libpve-storage-nonraid-perl_*.deb
+apt install ./nonraid-tools_*.deb ./libpve-storage-nonraid-perl_*.deb
 ```
 
-Runtime dependencies are `nonraid-tools`, `mergerfs` and a working
-`nonraid-dkms` module for the running kernel. The plugin needs nmdctl 1.23
-semantics (the expected-state argument to `start`, and `-u`), but the
-dependency is unversioned on purpose: `tools/debian/changelog` in this tree
-still says `1.0.0-1`, so a locally built nonraid-tools could not satisfy a
-version bound that release artifacts do satisfy. Check `nmdctl --version` if
-you built it yourself.
+Both in one `apt install`: the plugin's dependency is only satisfiable by the
+package built alongside it. `.github/workflows/pve-plugin-tests.yml` runs
+exactly this sequence, so it stays honest.
+
+The other runtime dependencies are `mergerfs` and a working `nonraid-dkms`
+module for the running kernel. The plugin needs nmdctl 1.23 semantics (the
+expected-state argument to `start`, and `-u`), but the dependency is
+unversioned on purpose: `tools/debian/changelog` in this tree still says
+`1.0.0-1`, so a locally built nonraid-tools could not satisfy a version bound
+that release artifacts do satisfy — and dpkg orders `1.4.0` *below* `1.23`, so
+the obvious bound is a trap in both directions. Check `nmdctl --version` if you
+built it yourself.
 
 ## Use
 

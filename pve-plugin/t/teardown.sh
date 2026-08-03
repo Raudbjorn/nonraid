@@ -78,6 +78,56 @@ run || fail "busy pool must still exit 0"
 [ -e "$tmp/array.running" ] || fail "busy pool must keep the marker"
 grep -q "could not unmount" "$tmp/err" || fail "unmount failure not reported"
 
+# --- a pool that stayed mounted stops the teardown there --------------------
+# mergerfs pins every branch it unions, so tearing the layers below it down
+# while a pool is up cannot succeed; attempting it anyway only obscures which
+# failure was the real one.
+grep -q "skipping member unmount and array stop" "$tmp/err" \
+    || fail "lower-layer teardown not skipped while a pool is mounted"
+[ -s "$tmp/nmdctl.log" ] && fail "nmdctl was called with a pool still mounted"
+
+# --- an unreadable mount table is not "no pools" ----------------------------
+# This is the one that matters: if the two collapse, a degraded system removes
+# the unclean-shutdown marker having never looked at a single mountpoint.
+make_nmdctl 0 0
+: > "$tmp/array.running"
+PVE_NONRAID_MOUNTS="$tmp/does-not-exist" PVE_NONRAID_NMDCTL="$tmp/nmdctl" \
+    PVE_NONRAID_MARKER="$tmp/array.running" sh "$script" 2>"$tmp/err" \
+    || fail "unreadable mount table must still exit 0"
+[ -e "$tmp/array.running" ] || fail "unreadable mount table must keep the marker"
+grep -q "cannot read the mount table" "$tmp/err" || fail "unreadable mount table not reported"
+[ -s "$tmp/nmdctl.log" ] && fail "nmdctl was called without knowing what is mounted"
+
+# --- glob characters in a mountpoint must not be expanded -------------------
+# /proc/mounts escapes whitespace but not '*', '?' or brackets, so an unquoted
+# expansion would match unrelated local paths instead.
+make_nmdctl 0 0
+: > "$tmp/array.running"
+mkdir -p "$tmp/star"
+: > "$tmp/star/decoy"
+cat > "$tmp/mounts" <<EOF
+nonraid-nrpool $tmp/star/* fuse.mergerfs rw 0 0
+EOF
+run || fail "glob mountpoint must still exit 0"
+grep -q "could not unmount pool $tmp/star/\*" "$tmp/err" \
+    || fail "mountpoint was glob-expanded (got: $(cat "$tmp/err"))"
+
+# --- nested pools come down deepest first -----------------------------------
+# Taking /proc/mounts order would hit the parent first, get EBUSY, and never
+# come back to the child.
+make_nmdctl 0 0
+: > "$tmp/array.running"
+mkdir -p "$tmp/nest/inner"
+cat > "$tmp/mounts" <<EOF
+nonraid-outer $tmp/nest fuse.mergerfs rw 0 0
+nonraid-inner $tmp/nest/inner fuse.mergerfs rw 0 0
+EOF
+run || fail "nested pools must still exit 0"
+order=$(grep -o "could not unmount pool $tmp/nest[^ ]*" "$tmp/err" | head -2)
+first=$(echo "$order" | head -1)
+[ "$first" = "could not unmount pool $tmp/nest/inner" ] \
+    || fail "parent unmounted before child (order: $order)"
+
 # --- a mountpoint containing whitespace is decoded, not split ---------------
 make_nmdctl 0 0
 : > "$tmp/array.running"

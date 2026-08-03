@@ -20,9 +20,17 @@ RemainAfterExit=yes
 # same work pvestatd's first cycle would do, just early enough to precede
 # pve-guests. '-': an activation failure (degraded array with autostart off,
 # a missing module) must not mark the unit failed, or its ExecStop teardown
-# would never run. Bounded so a single unreachable storage of any type cannot
-# hold up the boot for systemd's 90s default.
-ExecStart=-/usr/sbin/pvesm status
+# would never run.
+#
+# The bound is 'timeout', not TimeoutStartSec alone, and that distinction is
+# the point: '-' turns a non-zero EXIT into success, but it does not turn a
+# systemd start-timeout into success. A pvesm blocked on some unrelated
+# unreachable storage would fail the unit, and a failed unit does not run
+# ExecStop - so an array mounted moments earlier would lose its ordered
+# teardown for the rest of the boot. Bounding it in user space means ExecStart
+# always exits, always as success, and the unit always reaches active.
+# TimeoutStartSec stays as a backstop for a 'timeout' that itself wedges.
+ExecStart=-/usr/bin/timeout -k 10 100 /usr/sbin/pvesm status
 TimeoutStartSec=120
 
 # Pools, then member mounts, then the array. The script attempts every step

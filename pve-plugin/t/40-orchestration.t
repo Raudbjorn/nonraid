@@ -250,4 +250,117 @@ sub member_mounts {
     ok(!$P->can('pool_is_ours')->('nrpool', $scfg, []), 'nothing mounted is not our pool');
 }
 
+# ---- bookkeeping: independently retryable ---------------------------------
+#
+# Marker and unit registration are separate steps because they fail separately,
+# and the fast path retries whichever is missing - without that, one transient
+# failure (a full /var, systemd busy for a moment) would persist for as long as
+# the array stayed up, since every later activation short-circuits before
+# reaching them.
+
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+
+    reset_commands();
+    ok($P->can('_ensure_marker')->('nrpool'), 'the marker is created');
+    ok(-e "$bk/var/array.running", 'and it is where it says it is');
+
+    reset_commands();
+    ok($P->can('_ensure_unit_registered')->('nrpool'), 'unit registration succeeds');
+    like(
+        join(' ', @{ cmds() }),
+        qr{systemctl start --no-block pve-nonraid\.service},
+        'systemctl start is issued with --no-block',
+    );
+
+    reset_commands();
+    $P->can('_ensure_bookkeeping')->('nrpool');
+    is_deeply(cmds(), [], 'settled state costs two stats, not a fork');
+}
+
+{
+    # A failed registration must not leave the stamp behind: the retry on the
+    # next activation is the entire point of recording it.
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+
+    reset_commands();
+    $PVE::Tools::run_command_hook = sub { die "systemd is busy\n" };
+    my @warnings;
+    my $ok = do {
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        $P->can('_ensure_unit_registered')->('nrpool');
+    };
+    ok(!$ok, 'a failed unit start is reported, not swallowed');
+    ok(!-e "$bk/run/unit-started", 'no stamp is left behind to suppress the retry');
+    like(join('', @warnings), qr/pve-nonraid\.service/, 'and it is warned about');
+
+    # Retry succeeds once systemd is willing.
+    reset_commands();
+    ok($P->can('_ensure_unit_registered')->('nrpool'), 'the retry goes through');
+    ok(-e "$bk/run/unit-started", 'and now it is stamped');
+}
+
+{
+    # An unwritable marker directory is surfaced and retried, never silently
+    # accepted: a missing marker makes the next crash look like a clean stop.
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/blocked/array.running";
+    open(my $fh, '>', "$bk/blocked") or die $!; # a file where a directory belongs
+    close($fh);
+
+    my @warnings;
+    my $ok = do {
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        $P->can('_ensure_marker')->('nrpool');
+    };
+    ok(!$ok, 'an unwritable marker path is a failure');
+    like(join('', @warnings), qr/could not write/, 'and it says so');
+}
+
+# ---- refusal backoff ------------------------------------------------------
+#
+# A STOPPED array's degradedness is only knowable after an import, so refusing
+# one costs an import - and the array stays STOPPED, so pvestatd would pay it
+# again every cycle forever.
+
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+    my $degraded = { path => $POOL, 'nonraid-super' => '/nonraid.dat',
+        'nonraid-degraded-autostart' => 0 };
+
+    reset_commands();
+    my $err = '';
+    with_fixture('nmdstat-stopped-degraded.txt', sub {
+        eval { $P->can('_ensure_array_started')->('nrpool', $degraded, $P->can('read_nmdstat')->()) };
+        $err = $@;
+    });
+    like($err, qr/degraded/, 'a degraded STOPPED array with autostart off is refused');
+    like(join(' ', @{ cmds() }), qr/import/, 'the first refusal did cost an import');
+
+    reset_commands();
+    my $again = '';
+    with_fixture('nmdstat-stopped-degraded.txt', sub {
+        eval { $P->can('_ensure_array_started')->('nrpool', $degraded, $P->can('read_nmdstat')->()) };
+        $again = $@;
+    });
+    is($again, $err, 'the cached refusal is the same refusal');
+    is_deeply(cmds(), [], 'and the second cycle imports nothing');
+
+    # Clearing it is what lets a repaired array start again without waiting out
+    # the backoff.
+    $P->can('_clear_refusal')->('nrpool');
+    reset_commands();
+    with_fixture('nmdstat-stopped-degraded.txt', sub {
+        eval { $P->can('_ensure_array_started')->('nrpool', $degraded, $P->can('read_nmdstat')->()) };
+    });
+    like(join(' ', @{ cmds() }), qr/import/, 'once cleared, it tries again');
+}
+
 done_testing();

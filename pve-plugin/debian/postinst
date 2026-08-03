@@ -1,18 +1,31 @@
 #!/bin/sh
 set -e
 
+# An offline-root operation (debootstrap, image builds) sets DPKG_ROOT to the
+# target tree. Our own actions here touch THIS host - the live PVE template and
+# this host's services - so they are skipped in that case; nothing they do is
+# essential to the package, and doing them would be actively wrong. The
+# debhelper-generated snippets below still run: they are DPKG_ROOT-aware
+# themselves. (Do not write the debhelper token in a comment - it is
+# substituted wherever it appears, and the rest of the sentence becomes code.)
+host_actions() {
+    [ -z "${DPKG_ROOT:-}" ]
+}
+
 # configure: fresh install/upgrade of this package.
 # triggered: another package (pve-manager) replaced index.html.tpl.
 # The GUI injection is cosmetic - never fail the dpkg run over it.
 case "$1" in
     configure)
-        /usr/share/pve-nonraid/pve-nonraid-gui apply || true
-        for s in pvedaemon pvestatd pveproxy pvescheduler; do
-            systemctl try-restart "$s.service" >/dev/null 2>&1 || true
-        done
+        if host_actions; then
+            /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+            for s in pvedaemon pvestatd pveproxy pvescheduler; do
+                systemctl try-restart "$s.service" >/dev/null 2>&1 || true
+            done
+        fi
         ;;
     triggered)
-        /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+        host_actions && { /usr/share/pve-nonraid/pve-nonraid-gui apply || true; }
         ;;
 esac
 

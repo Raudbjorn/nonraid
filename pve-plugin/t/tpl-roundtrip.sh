@@ -85,6 +85,67 @@ block=$(grep -n 'BEGIN pve-nonraid-gui' "$tmp/twoanchors.tpl" | cut -d: -f1)
 [ "$block" -eq "$((first_anchor + 1))" ] \
     || fail "block at line $block, expected $((first_anchor + 1)) (just after the first anchor)"
 
+# A commented-out loader BEFORE the live one must not be taken for the anchor.
+# Injecting there puts our script ahead of pvemanagerlib.js, where its own
+# guard makes it a no-op: installed, and silently doing nothing.
+cp "$pristine" "$tmp/work.tpl"
+awk '/pvemanagerlib/ && !d { print "    <!-- <script src=\"/pve2/js/pvemanagerlib.js\"></script> -->"; d = 1 } { print }' \
+    "$tmp/work.tpl" > "$tmp/deadanchor.tpl"
+PVE_NONRAID_TPL="$tmp/deadanchor.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+live=$(grep -n 'pvemanagerlib' "$tmp/deadanchor.tpl" | grep -v '<!--' | head -1 | cut -d: -f1)
+block=$(grep -n 'BEGIN pve-nonraid-gui' "$tmp/deadanchor.tpl" | cut -d: -f1)
+[ "$block" -eq "$((live + 1))" ] \
+    || fail "block at line $block, expected $((live + 1)) (after the LIVE loader, not the commented one)"
+
+# END before BEGIN passes any check that merely counts markers, and a range
+# delete keyed off it takes the whole tail of the template with it.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+b=$(grep -n 'BEGIN pve-nonraid-gui' "$tmp/work.tpl" | cut -d: -f1)
+e=$(grep -n 'END pve-nonraid-gui' "$tmp/work.tpl" | cut -d: -f1)
+bt=$(sed -n "${b}p" "$tmp/work.tpl")
+et=$(sed -n "${e}p" "$tmp/work.tpl")
+awk -v b="$b" -v e="$e" -v bt="$bt" -v et="$et" \
+    'NR == b { print et; next } NR == e { print bt; next } { print }' \
+    "$tmp/work.tpl" > "$tmp/swapped.tpl"
+before=$(wc -l < "$tmp/swapped.tpl")
+if PVE_NONRAID_TPL="$tmp/swapped.tpl" PVE_NONRAID_VER=2.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply accepted a template whose END precedes its BEGIN"
+fi
+[ "$(wc -l < "$tmp/swapped.tpl")" = "$before" ] || fail "misordered template was modified"
+
+# Two markers on one line are two markers, however many lines match.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|\(<!-- BEGIN pve-nonraid-gui 1.0.0 -->\)|\1\1|' "$tmp/work.tpl" > "$tmp/doubled.tpl"
+if PVE_NONRAID_TPL="$tmp/doubled.tpl" PVE_NONRAID_VER=2.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply accepted two BEGIN markers sharing one line"
+fi
+
+# A trailing space on the BEGIN marker must be read the same way everywhere.
+# It used to defeat the version matcher only, so the block counted as "not
+# applied" and a second one was injected on top of the first.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|\(<!-- BEGIN pve-nonraid-gui 1.0.0 -->\)|\1 |' "$tmp/work.tpl" > "$tmp/trailing.tpl"
+PVE_NONRAID_TPL="$tmp/trailing.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" status | grep -q 'applied (1.0.0)' \
+    || fail "status does not see a version marker with trailing whitespace"
+PVE_NONRAID_TPL="$tmp/trailing.tpl" PVE_NONRAID_VER=2.0.0 sh "$tool" apply >/dev/null
+[ "$(grep -c 'BEGIN pve-nonraid-gui' "$tmp/trailing.tpl")" = 1 ] \
+    || fail "a second block was injected over one with trailing whitespace"
+grep -q 'BEGIN pve-nonraid-gui 2.0.0' "$tmp/trailing.tpl" || fail "version not replaced"
+
+# Markers with no loader between them are not an applied GUI, whatever the
+# version says - otherwise a half-stripped block is accepted forever.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+grep -v 'pve-nonraid-storage.js' "$tmp/work.tpl" > "$tmp/nopayload.tpl"
+if PVE_NONRAID_TPL="$tmp/nopayload.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply accepted a marker block with no loader inside it"
+fi
+PVE_NONRAID_TPL="$tmp/nopayload.tpl" sh "$tool" status | grep -q MALFORMED \
+    || fail "status does not report a block with no loader"
+
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
     || fail "status on a missing template should report it"

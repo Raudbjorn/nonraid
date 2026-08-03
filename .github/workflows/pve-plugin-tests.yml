@@ -4,14 +4,19 @@ on:
   pull_request:
     paths:
       - 'pve-plugin/**'
+      - 'tools/**'
       - 'Makefile'
       - '.github/workflows/pve-plugin-tests.yml'
   push:
     branches: [ main ]
     paths:
       - 'pve-plugin/**'
+      - 'tools/**'
       - 'Makefile'
       - '.github/workflows/pve-plugin-tests.yml'
+
+permissions:
+  contents: read
 
 jobs:
   plugin-unit:
