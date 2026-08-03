@@ -37,12 +37,11 @@ HAVE_FAKEROOT := $(shell command -v fakeroot >/dev/null 2>&1 && echo yes)
 # for the former also establishes that the latter is present.
 HAVE_BUILDDEPS := $(shell command -v dpkg-checkbuilddeps >/dev/null 2>&1 && dpkg-checkbuilddeps >/dev/null 2>&1 && echo yes)
 
-ifeq ($(IS_DEBIAN)$(HAVE_DH)$(HAVE_FAKEROOT)$(HAVE_BUILDDEPS),yesyesyesyes)
-package: package-native
-else
-package: package-docker
-
-# Only probed on the fallback path; the native build never needs it.
+# These belong outside the conditional below: 'make package-docker' is a
+# documented way to force the container path, and a native-capable host is
+# exactly where someone would use it. Defining them only on the fallback branch
+# left HAVE_DOCKER empty there, so the target refused with "no docker in PATH"
+# on machines that had docker installed.
 HAVE_DOCKER := $(shell command -v $(DOCKER) >/dev/null 2>&1 && echo yes)
 
 # Rootless podman (and rootless docker) map container uid 0 to the invoking user
@@ -70,6 +69,12 @@ ENGINE_ADVICE := Is it running ('systemctl start docker'), and are you in the 'd
 ENGINE_SWITCH := Set DOCKER=podman to use podman instead.
 endif
 
+# Only the default for a bare 'make package' depends on the host toolchain;
+# package-native and package-docker stay individually reachable either way.
+ifeq ($(IS_DEBIAN)$(HAVE_DH)$(HAVE_FAKEROOT)$(HAVE_BUILDDEPS),yesyesyesyes)
+package: package-native
+else
+package: package-docker
 endif
 
 package-native:
