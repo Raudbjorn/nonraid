@@ -81,8 +81,44 @@ upgrades; `/usr/share/pve-nonraid/pve-nonraid-gui status` shows the current
 state (the tool is not on `$PATH`). If injection fails the plugin is
 unaffected — use `pvesm`.
 
-Without the GUI script loaded, clicking Edit on an existing nonraid storage
-throws `no editor registered for storage type: nonraid` (that click only).
+### Adding a storage
+
+**Datacenter → Storage → Add** gains a NonRAID entry at the bottom of the
+list:
+
+![The Add menu with the NonRAID entry](images/add-menu.png)
+
+The panel asks for the same options as `pvesm`. Only the ID is mandatory:
+leave Path empty and it becomes `/mnt/pve/<id>`, and the remaining fields
+fall back to the defaults in the table above. Set **Nodes** to the one node
+that has the array.
+
+![The Add: NonRAID dialog](images/add-dialog.png)
+
+*Autostart when degraded* is on by default, matching the backend. Unchecking
+it means a degraded array is not started automatically and activation fails
+with the manual command to run — see the fail-stop note above. **mergerfs
+Options** replaces the computed defaults; the plugin appends its own
+`fsname=` regardless, because the shutdown teardown finds pools by it.
+
+### After it is added
+
+The storage appears with type **NonRAID**. It is created immediately but only
+activates when something first uses it — that activation is what starts the
+array and mounts the pool.
+
+![The storage list showing a NonRAID entry](images/storage-list.png)
+
+Selecting it shows the usual Summary. *Active: Yes* means the array is
+started, the members are mounted and the mergerfs pool is up; the usage
+figures are the pool's, i.e. the sum of the data disks.
+
+![The storage Summary for a NonRAID pool](images/storage-summary.png)
+
+Editing works the same way, with ID and Path shown read-only. Without the GUI
+script loaded, clicking Edit on an existing nonraid storage throws
+`no editor registered for storage type: nonraid` (that click only) — the
+storage itself keeps working.
 
 ## Kernel upgrades
 
