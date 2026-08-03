@@ -13,6 +13,7 @@ use warnings;
 use Cwd;
 use File::Path qw(make_path);
 use File::Spec;
+use JSON::PP;
 
 use PVE::ProcFSTools;
 use PVE::SafeSyslog;
@@ -96,6 +97,30 @@ sub properties {
             description => "Override the mergerfs mount options for the pool.",
             type => 'string',
         },
+        # Write-only actions, not state. PVE has no extension point for
+        # per-plugin node actions, so these ride in on the storage create/update
+        # hooks and are deleted before the config is written - they never
+        # persist. Named 'create' because that is what they do to the disks.
+        'nonraid-create-parity' => {
+            description => "Build a NEW array on storage creation, using these"
+                . " whole disks as parity (P, then Q). DESTROYS their contents."
+                . " Refused if an array already exists.",
+            type => 'string',
+            format => 'string-list',
+        },
+        'nonraid-create-data' => {
+            description => "Data disks for the array built by"
+                . " nonraid-create-parity. DESTROYS their contents.",
+            type => 'string',
+            format => 'string-list',
+        },
+        'nonraid-unmount-disks' => {
+            description => "Unmount these block devices, so they can be wiped"
+                . " and assigned. Refuses anything held by LVM, ZFS, MD or"
+                . " Ceph, and any member of the running array.",
+            type => 'string',
+            format => 'string-list',
+        },
     };
 }
 
@@ -106,6 +131,9 @@ sub options {
         'nonraid-disk-prefix' => { optional => 1 },
         'nonraid-degraded-autostart' => { optional => 1 },
         'nonraid-mergerfs-opts' => { optional => 1 },
+        'nonraid-create-parity' => { optional => 1 },
+        'nonraid-create-data' => { optional => 1 },
+        'nonraid-unmount-disks' => { optional => 1 },
         nodes => { optional => 1 },
         disable => { optional => 1 },
         content => { optional => 1 },
@@ -238,6 +266,19 @@ sub nmdstat_health {
 # $degraded comes from nmdstat_health() AFTER the members are imported.
 # It matters because a degraded array that was stopped reports plain STOPPED,
 # not DISABLE_DISK - mdState alone cannot carry the fail-stop decision.
+# Mountpoints this must never unmount, whatever the operator asked for. The
+# kernel refuses '/' because it is busy, but that is luck, not a guarantee: a
+# quiet /boot/efi or /var would unmount cleanly and take the system with it.
+sub system_mountpoint {
+    my ($mp) = @_;
+    return 0 if !defined($mp) || $mp eq '';
+    return 1 if $mp eq '/';
+    for my $dir (qw(/boot /usr /var /etc /proc /sys /dev /run /lib /bin /sbin)) {
+        return 1 if $mp eq $dir || index($mp, "$dir/") == 0;
+    }
+    return 0;
+}
+
 # Disk assignment gate
 #
 # A disk may only be handed to 'nmdctl create'/'add' once nothing else claims
@@ -635,6 +676,179 @@ sub _log_health_transition {
         . " '" . ($prev || 'unknown') . "' -> '$health->{summary}'";
     $msg .= " ($health->{resync_pct}%)" if defined($health->{resync_pct});
     syslog($health->{degraded} ? 'warning' : 'notice', $msg);
+}
+
+# Disk actions
+#
+# These run from the storage create/update hooks, which hold the cluster-wide
+# storage config lock - so everything here must return promptly. nmdctl create,
+# start and check all return as soon as the driver accepts the command; the
+# parity build then runs in the kernel. Nothing here waits for it.
+
+sub _lsblk_entry {
+    my ($dev) = @_;
+    my $json = '';
+    eval {
+        run_command(
+            ['/usr/bin/lsblk', '-J', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', $dev],
+            timeout => 15,
+            outfunc => sub { $json .= shift },
+            errfunc => sub { },
+        );
+    };
+    return undef if $@ || $json eq '';
+    my $decoded = eval { JSON::PP::decode_json($json) };
+    return undef if !$decoded;
+    return $decoded->{blockdevices}->[0];
+}
+
+# Every device named by an action goes through the gate first, and the error
+# lists every reason for every device rather than dying on the first - an
+# operator fixing three disks should not have to discover them one at a time.
+my sub require_assignable {
+    my ($devs, $st) = @_;
+    my @problems;
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        my $blockers = disk_blockers(_lsblk_entry($dev), $st);
+        push @problems, "$dev: " . join(', ', @$blockers) if @$blockers;
+    }
+    die "refusing to touch these disks:\n  " . join("\n  ", @problems) . "\n"
+        if @problems;
+}
+
+my sub unmount_disks {
+    my ($storeid, $devs, $st) = @_;
+
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        my $entry = _lsblk_entry($dev)
+            or die "'$dev': device not found\n";
+
+        # Only unmounting. A holder - LVM, ZFS, MD, a Ceph OSD - is undone by
+        # the tool that created it, and guessing at that from here is how an
+        # unrelated pool gets destroyed.
+        my @children = @{ $entry->{children} // [] };
+        for my $child (@children) {
+            my $ctype = $child->{type} // '';
+            die "'$dev' is held by $child->{name} ($ctype); release it with the"
+                . " tool that created it (LVM, ZFS, Ceph, mdadm) first\n"
+                if $ctype ne 'part';
+        }
+
+        # An array member must never be unmounted this way: it would pull a
+        # live filesystem out from under the pool.
+        my $blockers = disk_blockers($entry, $st);
+        for my $b (@$blockers) {
+            die "'$dev' is $b\n" if $b =~ /already in this array/;
+        }
+
+        my @points = grep { defined($_) && $_ ne '' }
+            ($entry->{mountpoint}, map { $_->{mountpoint} } @children);
+
+        # Checked before anything is unmounted, so a disk carrying both a data
+        # filesystem and a system one is refused outright rather than half done.
+        for my $mp (@points) {
+            die "'$dev' carries the system mountpoint '$mp'; refusing to"
+                . " unmount it\n" if system_mountpoint($mp);
+        }
+
+        if (!@points) {
+            syslog('info', "storage $storeid: '$dev' is not mounted, nothing to do");
+            next;
+        }
+        for my $mp (@points) {
+            syslog('warning', "storage $storeid: unmounting '$mp' ($dev) on request");
+            run_command(['/bin/umount', $mp], timeout => 60,
+                errmsg => "could not unmount '$mp'");
+        }
+    }
+}
+
+my sub create_array {
+    my ($storeid, $scfg, $parity, $data) = @_;
+
+    die "nonraid-create-parity needs at least one disk\n" if !@$parity;
+    die "nonraid-create-data needs at least one disk\n" if !@$data;
+
+    my $st = read_nmdstat();
+
+    # One array per node - the superblock is a module parameter - so building
+    # one on top of a loaded array would take its disks with it.
+    if ($st && (($st->{mdState} // '') ne '' || nmdstat_num($st->{mdNumDisks}) > 0)) {
+        die "an array is already loaded (state '" . ($st->{mdState} // '?')
+            . "', superblock '" . ($st->{sbName} // '?') . "'); stop and unassign"
+            . " it with nmdctl before building a new one\n";
+    }
+
+    my %seen;
+    for my $dev (@$parity, @$data) {
+        die "'$dev' listed twice\n" if $seen{$dev}++;
+    }
+    require_assignable([@$parity, @$data], $st);
+
+    my @specs = build_assign_specs($parity, $data, 1);
+    my $super = _scfg_super($scfg);
+    syslog('warning', "storage $storeid: creating a NonRAID array on $super"
+        . " with " . join(' ', @specs) . " - this destroys their contents");
+
+    run_command([$NMDCTL, '-u', '-s', $super, 'create', '--force', @specs],
+        timeout => 300, errmsg => 'creating the NonRAID array failed');
+
+    # A freshly created array sits in NEW_ARRAY, which activation refuses by
+    # design. Start it here so the storage this hook is creating can actually
+    # come up; the parity build the driver then begins runs in the kernel, so
+    # this returns without holding the storage lock for it.
+    run_command([$NMDCTL, '-u', '-v', '-s', $super, 'start', 'NEW_ARRAY'],
+        timeout => 300, errmsg => 'starting the new array failed');
+    run_command([$NMDCTL, '-u', '-s', $super, 'check', 'recon'],
+        timeout => 60, errmsg => 'starting the parity build failed');
+
+    syslog('warning', "storage $storeid: array created and started;"
+        . " parity is building - watch it with 'nmdctl status'");
+}
+
+# Actions are consumed here and deleted from the config, so they never persist.
+my sub run_disk_actions {
+    my ($storeid, $scfg, $target) = @_;
+
+    my $unmount = $target->{'nonraid-unmount-disks'};
+    my $parity = $target->{'nonraid-create-parity'};
+    my $data = $target->{'nonraid-create-data'};
+
+    delete $target->{'nonraid-unmount-disks'};
+    delete $target->{'nonraid-create-parity'};
+    delete $target->{'nonraid-create-data'};
+
+    unmount_disks($storeid, [PVE::Tools::split_list($unmount)], read_nmdstat())
+        if defined($unmount) && $unmount ne '';
+
+    if ((defined($parity) && $parity ne '') || (defined($data) && $data ne '')) {
+        create_array(
+            $storeid, $scfg,
+            [PVE::Tools::split_list($parity // '')],
+            [PVE::Tools::split_list($data // '')],
+        );
+    }
+}
+
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %param) = @_;
+    run_disk_actions($storeid, $scfg, $scfg);
+    return undef;
+}
+
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+    # Building an array under an existing storage would need the array stopped,
+    # which means stopping every guest on it - not something to do from a
+    # config edit. Unmounting is fine.
+    die "nonraid-create-* only applies when creating a storage; to extend an"
+        . " existing array use 'nmdctl add', which needs the array stopped\n"
+        if defined($update->{'nonraid-create-parity'})
+        || defined($update->{'nonraid-create-data'});
+    run_disk_actions($storeid, $scfg, $update);
+    return undef;
 }
 
 # Storage implementation

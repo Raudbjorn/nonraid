@@ -20,6 +20,14 @@ sub run_command {
     return 0;
 }
 
+# Same splitting the real one does for 'string-list' properties: comma or
+# whitespace separated, empty elements dropped.
+sub split_list {
+    my ($list) = @_;
+    return () if !defined($list) || $list eq '';
+    return grep { $_ ne '' } split(/[,;\s]+/, $list);
+}
+
 # Not exported: the plugin calls this fully qualified, like the real one.
 # Runs the callback inline - the lock itself is not what these tests exercise.
 sub lock_file {
