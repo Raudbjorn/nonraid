@@ -626,16 +626,53 @@ sub mount_entry_for {
 # "Is the pool at $path the one this storage mounted?" - not merely "is
 # something mounted there". Used by the activation fast path and by status(),
 # so a foreign filesystem at the path can never be served as array content.
-# The branch manifest: which member directories the live pool was built from.
+# What the mounted pool is ACTUALLY built from, read out of the running
+# mergerfs process, or undef when that cannot be established.
 #
-# fsname proves WHOSE pool is mounted, not WHAT is in it. A pool mounted
-# before a slot was added, removed or re-ordered keeps its fsname and sails
-# through the fast path while unioning a stale branch set - exposing an
-# obsolete member directory, or missing a new one, for as long as it stays
-# mounted. The manifest is the missing half of the identity.
-sub _pool_manifest_file {
-    my ($storeid) = @_;
-    return _run_dir() . "/pool-$storeid.branches";
+# fsname proves whose pool is mounted, not what is in it: a pool mounted before
+# a slot changed keeps its fsname while unioning a stale member set. The
+# earlier attempt at this recorded the branches we INTENDED to mount into a
+# manifest file - which cannot answer the question for a pool we did not mount
+# (a pre-existing stale mount, a deleted manifest, a failed write). Adopting
+# the expected set as the observed set certified a guess as a fact.
+#
+# mergerfs takes its branches as an argv element, so the kernel is holding the
+# real answer the whole time. /proc/<pid>/comm is checked first so this reads
+# one tiny file per process rather than every cmdline on the node.
+sub mounted_pool_branches {
+    my ($storeid, $scfg, $procdir) = @_;
+    $procdir //= $ENV{PVE_NONRAID_PROC} // '/proc';
+
+    my $fsname = _pool_fsname($storeid);
+    my $want_mp = canon_path($scfg->{path}) // $scfg->{path};
+
+    opendir(my $dh, $procdir) or return undef;
+    my @pids = grep { /^\d+$/ } readdir($dh);
+    closedir($dh);
+
+    for my $pid (@pids) {
+        open(my $ch, '<', "$procdir/$pid/comm") or next;
+        my $comm = <$ch> // '';
+        close($ch);
+        chomp($comm);
+        next if $comm ne 'mergerfs';
+
+        open(my $fh, '<', "$procdir/$pid/cmdline") or next;
+        my $raw = do { local $/; <$fh> };
+        close($fh);
+        my @args = grep { defined($_) && $_ ne '' } split(/\0/, $raw // '');
+        next if scalar(@args) < 3;
+
+        # Ours? The fsname rides in the -o option string.
+        next if !grep { index($_, "fsname=$fsname") >= 0 } @args;
+
+        # mergerfs argv ends '<branches> <mountpoint>'.
+        my $mp = $args[-1];
+        next if (canon_path($mp) // $mp) ne $want_mp;
+
+        return [sort grep { $_ ne '' } split(/:/, $args[-2])];
+    }
+    return undef;
 }
 
 sub _expected_branches {
@@ -645,35 +682,16 @@ sub _expected_branches {
     return map { $prefix . $_ } data_slots($st);
 }
 
-sub _write_pool_manifest {
-    my ($storeid, @branches) = @_;
-    return 0 if !eval { make_path(_run_dir()); 1 };
-    my $tmp = _pool_manifest_file($storeid) . ".tmp.$$";
-    open(my $fh, '>', $tmp) or return 0;
-    print {$fh} join("\n", sort @branches), "\n";
-    close($fh) or do { unlink($tmp); return 0 };
-    rename($tmp, _pool_manifest_file($storeid)) or do { unlink($tmp); return 0 };
-    return 1;
-}
-
-sub _read_pool_manifest {
-    my ($storeid) = @_;
-    open(my $fh, '<', _pool_manifest_file($storeid)) or return undef;
-    my @lines = <$fh>;
-    close($fh);
-    chomp @lines;
-    return [grep { $_ ne '' } @lines];
-}
-
-# undef = "cannot tell" (no manifest); 1 = matches; 0 = stale.
-sub pool_manifest_matches {
+# undef = the mount could not be inspected; 1 = branches match the live array;
+# 0 = they do not. Never "assume it is fine".
+sub pool_branches_match {
     my ($storeid, $scfg, $st) = @_;
-    my $have = _read_pool_manifest($storeid);
-    return undef if !defined($have);
+    my $actual = mounted_pool_branches($storeid, $scfg);
+    return undef if !defined($actual);
     my @want = sort(_expected_branches($scfg, $st));
-    return 0 if scalar(@$have) != scalar(@want);
+    return 0 if scalar(@$actual) != scalar(@want);
     for my $i (0 .. $#want) {
-        return 0 if $have->[$i] ne $want[$i];
+        return 0 if $actual->[$i] ne $want[$i];
     }
     return 1;
 }
@@ -685,20 +703,10 @@ sub pool_is_ours {
     return 0 if $entry->[2] ne 'fuse.mergerfs';
     return 0 if $entry->[0] ne _pool_fsname($storeid);
 
-    # Ours by name; is it ours by content? A missing manifest means the pool
-    # predates this check (upgrade path) - adopt the live set rather than
-    # forcing a remount of a working pool.
-    my $matches = pool_manifest_matches($storeid, $scfg, $st);
-    if (!defined($matches)) {
-        my @want = _expected_branches($scfg, $st);
-        if (@want) {
-            _write_pool_manifest($storeid, @want);
-            syslog('notice', '%s', "storage $storeid: adopted the running"
-                . " pool's branch list (" . scalar(@want) . " members)");
-        }
-        return 1;
-    }
-    return $matches;
+    # Ours by name; ours by content? Fail closed when that cannot be
+    # established - the slow path then reports what is wrong instead of this
+    # returning a cheerful yes about a pool it could not look inside.
+    return pool_branches_match($storeid, $scfg, $st) ? 1 : 0;
 }
 
 # A STOPPED array's degradedness is only knowable after import, so a policy
@@ -918,16 +926,21 @@ sub _ensure_pool_mounted {
             if $entry->[0] ne _pool_fsname($storeid);
 
         # Ours, mounted - but built from which branches? Without this the
-        # fast path's manifest refusal would land here and return silently,
-        # leaving the stale pool serving. mergerfs cannot be re-branched in
-        # place, so this needs an operator.
+        # fast path's refusal would land here and return silently, leaving the
+        # stale pool serving. mergerfs cannot be re-branched in place, so this
+        # needs an operator either way.
         my $live = read_nmdstat();
-        my $matches = pool_manifest_matches($storeid, $scfg, $live);
-        if (defined($matches) && !$matches) {
-            my $have = _read_pool_manifest($storeid) // [];
-            my @want = sort(_expected_branches($scfg, $live));
+        my $actual = mounted_pool_branches($storeid, $scfg);
+        die "'$path' holds a mergerfs pool this plugin cannot inspect (no"
+            . " mergerfs process found for fsname " . _pool_fsname($storeid)
+            . " at that path), so its member list cannot be verified."
+            . " Unmount it and activate again.\n"
+            if !defined($actual);
+
+        my @want = sort(_expected_branches($scfg, $live));
+        if (join('|', @$actual) ne join('|', @want)) {
             die "'$path' holds a pool built from a different set of members"
-                . " (mounted: @$have; array now has: @want). The array"
+                . " (mounted: @$actual; array now has: @want). The array"
                 . " changed while the pool stayed up; stop it with"
                 . " 'systemctl stop pve-nonraid.service' (or umount '$path')"
                 . " and activate again.\n";
@@ -969,13 +982,6 @@ sub _ensure_pool_mounted {
         errmsg => 'mergerfs pool mount failed',
     );
 
-    # Record what this pool was actually built from, so a later fast-path
-    # activation can tell "our pool" from "our pool, from a stale array".
-    _write_pool_manifest($storeid, @branches)
-        or syslog('warning', '%s', "storage $storeid: could not record the"
-            . " pool's branch list - a later array change may go unnoticed"
-            . " while this pool stays mounted");
-
     # Member mounts are not re-checked per status() cycle on purpose: once the
     # pool is up mergerfs holds every branch busy, so a member cannot be
     # unmounted from under it, and the check would fork on pvestatd's path.
@@ -999,14 +1005,30 @@ sub _post_start_bookkeeping {
     # cleanly. Record the debt durably; paying it is _ensure_bookkeeping's
     # job, so that a debt recorded now but unpayable now still gets retried
     # from the fast path once the array is up.
+    #
+    # Recording it is NOT best-effort. If the debt cannot be written, the
+    # obligation exists only in this process: _ensure_bookkeeping would find
+    # no pending file, start no check, and report success - and the unclean
+    # shutdown that the marker was reporting would be forgotten the moment
+    # this call returned. The caller turns a false here into a failed
+    # activation, and pvestatd retries.
+    my $recorded = 1;
     if ($unclean && !-e _correction_pending_file()) {
-        if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }
-            && open(my $fh, '>', _correction_pending_file())) {
-            close($fh);
+        $recorded = 0;
+        if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }) {
+            if (open(my $fh, '>', _correction_pending_file())) {
+                $recorded = 1 if close($fh);
+            }
+        }
+        if (!$recorded) {
+            syslog('warning', '%s', "storage $storeid: unclean shutdown"
+                . " detected but the correcting-check debt could not be"
+                . " recorded at " . _correction_pending_file() . " ($!)");
+            warn "could not record the correcting-check debt: $!\n";
         }
     }
 
-    return _ensure_bookkeeping($storeid, $scfg);
+    return _ensure_bookkeeping($storeid, $scfg) && $recorded;
 }
 
 # Pay the correcting-parity debt if one is outstanding. Called from

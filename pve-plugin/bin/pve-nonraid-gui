@@ -84,6 +84,28 @@ commit_tmp() {
 # line are two markers.
 parse_block() {
     awk -v mark="$MARK" -v url="$JS_URL" '
+        # The un-commented part of a line. parse_block has to be as
+        # comment-aware as anchor_line: a COMPLETE script element inside an
+        # HTML comment satisfied every substring test here and reported the
+        # GUI as applied while the browser executed nothing. Markers are
+        # matched against the raw line (they ARE comments); the payload is
+        # matched against this.
+        function uncommented(line,   out, p, seg) {
+            out = ""
+            while (length(line) > 0) {
+                if (incomment) {
+                    p = index(line, "-->")
+                    if (p == 0) { line = "" }
+                    else { line = substr(line, p + 3); incomment = 0 }
+                } else {
+                    p = index(line, "<!--")
+                    if (p == 0) { seg = line; line = "" }
+                    else { seg = substr(line, 1, p - 1); line = substr(line, p + 4); incomment = 1 }
+                    out = out seg
+                }
+            }
+            return out
+        }
         function countstr(s, t,   n, p) {
             n = 0
             p = index(s, t)
@@ -128,14 +150,18 @@ parse_block() {
             # names - not any line mentioning the URL. A comment containing the
             # path, or a tag left at the previous cache-busting version, is not
             # an applied GUI.
+            # Comment state is advanced for EVERY line, in order, so a
+            # comment opened before the block is still open inside it.
+            live = uncommented($0)
+
             if (bline > 0 && NR > bline && eline == 0) {
-                # A structurally valid element, not just the string. A comment
-                # or a fragment carrying the URL is not an applied GUI, and
-                # accepting one leaves the block "applied" forever with
-                # nothing actually loading.
-                src = index($0, "src=\"" url "?ver=" ver "\"")
-                if (src > 0 && index(substr($0, 1, src), "<script") > 0 &&
-                    index(substr($0, src), "</script>") > 0) { payload = 1 }
+                # A structurally valid element that is actually live, not just
+                # the string. A commented-out element - complete or not - is
+                # not an applied GUI, and accepting one leaves the block
+                # "applied" forever with nothing loading.
+                src = index(live, "src=\"" url "?ver=" ver "\"")
+                if (src > 0 && index(substr(live, 1, src), "<script") > 0 &&
+                    index(substr(live, src), "</script>") > 0) { payload = 1 }
             }
         }
         END {

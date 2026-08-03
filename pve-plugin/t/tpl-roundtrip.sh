@@ -215,6 +215,29 @@ grep -q 'BEGIN pve-nonraid-gui' "$tmp/work.tpl.pve-nonraid.bak" \
 cmp -s "$tmp/work.tpl.pve-nonraid.bak" "$pristine" \
     || fail "the backup is not the pristine template"
 
+# A COMPLETE script element inside a comment. The earlier "URL in a comment"
+# test did not include <script>, so it passed the structural check and missed
+# this: status reported the GUI applied while the browser executed nothing.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|^\( *\)\(<script type="text/javascript" src="/pve2/js/pve-nonraid-storage.js?ver=1.0.0"></script>\)|\1<!-- \2 -->|' \
+    "$tmp/work.tpl" > "$tmp/commented-element.tpl"
+grep -q '<!-- <script' "$tmp/commented-element.tpl" || fail "fixture did not comment the payload out"
+PVE_NONRAID_TPL="$tmp/commented-element.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" status \
+    | grep -q MALFORMED || fail "a fully commented-out script element was reported as applied"
+
+# A comment that OPENS and CLOSES around the payload on separate lines - what
+# an operator disabling the GUI by hand would leave behind. (A comment opened
+# before BEGIN does not reach the payload: HTML comments do not nest, so the
+# BEGIN marker's own "-->" closes it. That is correct, and why this fixture
+# opens the comment after BEGIN instead.)
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+awk '/pve-nonraid-storage\.js/ { print "    <!--"; print; print "    -->"; next } { print }' \
+    "$tmp/work.tpl" > "$tmp/spanning.tpl"
+PVE_NONRAID_TPL="$tmp/spanning.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" status \
+    | grep -q MALFORMED || fail "a payload inside a multi-line comment was reported as applied"
+
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
     || fail "status on a missing template should report it"

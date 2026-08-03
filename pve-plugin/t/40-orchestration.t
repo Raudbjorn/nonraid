@@ -37,6 +37,21 @@ sub reset_commands {
 # The nmdctl capability probe is filtered out: it fires at most once per boot
 # and says nothing about the orchestration these assertions are about. It has
 # its own coverage below.
+# A live pool always has a mergerfs process holding it; the plugin reads the
+# branch list out of that process rather than trusting a record of its own.
+sub fake_mergerfs {
+    my ($procdir, $pid, $fsname, $branches, $mp) = @_;
+    mkdir "$procdir/$pid";
+    open(my $c, '>', "$procdir/$pid/comm") or die $!;
+    print {$c} "mergerfs\n";
+    close($c);
+    open(my $f, '>', "$procdir/$pid/cmdline") or die $!;
+    print {$f} join("\0", '/usr/bin/mergerfs', '-o', "fsname=$fsname",
+        $branches, $mp) . "\0";
+    close($f);
+    return $procdir;
+}
+
 sub cmds {
     return [grep { $_ !~ /nmdctl --version$/ }
         map { join(' ', @$_) } @PVE::Tools::run_command_log];
@@ -231,9 +246,13 @@ sub member_mounts {
     like($err, qr/belonging to another storage/, "another storage's pool refused");
 }
 
-# Our own pool already mounted: idempotent, no second mount.
+# Our own pool already mounted, with the branches the array implies:
+# idempotent, no second mount.
 {
     reset_commands();
+    my $pd = tempdir(CLEANUP => 1);
+    fake_mergerfs($pd, 301, 'nonraid-nrpool', '/mnt/disk1:/mnt/disk2', $POOL);
+    local $ENV{PVE_NONRAID_PROC} = $pd;
     local $PVE::ProcFSTools::mounts =
         [@{ member_mounts() }, ['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
     with_fixture('nmdstat-started-clean.txt', sub {
@@ -245,15 +264,24 @@ sub member_mounts {
 # ---- pool identity --------------------------------------------------------
 
 {
+    my $pd = tempdir(CLEANUP => 1);
+    fake_mergerfs($pd, 302, 'nonraid-nrpool', '/mnt/disk1:/mnt/disk2', $POOL);
+    local $ENV{PVE_NONRAID_PROC} = $pd;
+    my $st = with_fixture('nmdstat-started-clean.txt', sub {
+        return $P->can('read_nmdstat')->();
+    });
+
     my $ours = [['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
-    ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours), 'our pool recognised');
-    ok(!$P->can('pool_is_ours')->('other', $scfg, $ours), 'fsname must match the storage id');
+    ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st), 'our pool recognised');
+    ok(!$P->can('pool_is_ours')->('other', $scfg, $ours, $st),
+        'fsname must match the storage id');
     ok(
         !$P->can('pool_is_ours')
-            ->('nrpool', $scfg, [['/dev/sdz1', $POOL, 'ext4']]),
+            ->('nrpool', $scfg, [['/dev/sdz1', $POOL, 'ext4']], $st),
         'a foreign filesystem at the path is not our pool',
     );
-    ok(!$P->can('pool_is_ours')->('nrpool', $scfg, []), 'nothing mounted is not our pool');
+    ok(!$P->can('pool_is_ours')->('nrpool', $scfg, [], $st),
+        'nothing mounted is not our pool');
 }
 
 # ---- bookkeeping: independently retryable ---------------------------------
@@ -455,69 +483,117 @@ sub member_mounts {
     ok(!-e "$bk/run/nmdctl-checked", 'a failed probe is not stamped as passed');
 }
 
-# ---- pool identity: the branch manifest ------------------------------------
+# ---- pool identity: observed branches, never assumed ----------------------
 #
-# fsname proves WHOSE pool is mounted, not what is in it. A pool mounted
-# before a slot changed keeps its fsname and would sail through the fast path
-# unioning a stale member set.
+# fsname proves whose pool is mounted, not what is in it. The answer has to be
+# read out of the running mergerfs process: recording what we INTENDED to
+# mount cannot answer the question for a pool we did not mount, and adopting
+# the expected set as the observed set certifies a guess as a fact.
 {
-    my $bk = tempdir(CLEANUP => 1);
-    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
-    my $ours = [['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
+    my $procdir = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_PROC} = $procdir;
 
     my $st = with_fixture('nmdstat-started-clean.txt', sub {
         return $P->can('read_nmdstat')->();
     });
+    my $ours = [['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
 
-    # No manifest yet (a pool that predates this check): adopt, do not remount.
+    # Nothing running: the mount cannot be inspected, so it is not accepted.
+    is($P->can('mounted_pool_branches')->('nrpool', $scfg), undef,
+        'no mergerfs process means the branch set is unknown');
+    ok(!$P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st),
+        'and an uninspectable pool is refused, not assumed fine');
+
+    # The real thing, with the branches the live array implies.
+    fake_mergerfs($procdir, 101, 'nonraid-nrpool', '/mnt/disk1:/mnt/disk2', $POOL);
+    is_deeply($P->can('mounted_pool_branches')->('nrpool', $scfg),
+        ['/mnt/disk1', '/mnt/disk2'], 'the branches are read from the process');
     ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st),
-        'a pool with no manifest is adopted rather than refused');
-    ok(-e "$bk/run/pool-nrpool.branches", 'and the live branch set is recorded');
+        'a pool whose branches match the array is ours');
 
-    # Recorded and unchanged: still ours.
-    is($P->can('pool_manifest_matches')->('nrpool', $scfg, $st), 1,
-        'the adopted manifest matches the array it was taken from');
-    ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st),
-        'and the fast path still accepts it');
+    # A process for a DIFFERENT storage at a different path is not ours.
+    fake_mergerfs($procdir, 102, 'nonraid-other', '/mnt/disk1:/mnt/disk2', '/mnt/pve/other');
+    is_deeply($P->can('mounted_pool_branches')->('nrpool', $scfg),
+        ['/mnt/disk1', '/mnt/disk2'], "another storage's pool is not confused for ours");
 
-    # The array gains a slot while the pool stays mounted.
+    # The array grew while the pool stayed up: the mount is now stale.
     my $grown = with_fixture('nmdstat-started-clean.txt', sub {
         my $x = $P->can('read_nmdstat')->();
         $x->{'diskName.3'} = 'nmd3p1';
         $x->{'diskSize.3'} = '1000000';
         return $x;
     });
-    is($P->can('pool_manifest_matches')->('nrpool', $scfg, $grown), 0,
-        'a changed slot set no longer matches the manifest');
+    is($P->can('pool_branches_match')->('nrpool', $scfg, $grown), 0,
+        'a pool missing a new member no longer matches');
     ok(!$P->can('pool_is_ours')->('nrpool', $scfg, $ours, $grown),
-        'so the fast path refuses the stale pool');
+        'so the fast path refuses it');
 }
 
 {
-    # And the slow path must not silently accept it either - without this the
-    # refusal above would fall into the already-mounted early return.
-    my $bk = tempdir(CLEANUP => 1);
-    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
-    mkdir "$bk/run";
-    open(my $fh, '>', "$bk/run/pool-nrpool.branches") or die $!;
-    # A pool built when slot 9 existed and slot 2 did not. The clean fixture's
-    # live array is slots 1+2, so this manifest is genuinely stale.
-    print {$fh} "/mnt/disk1\n/mnt/disk9\n";
-    close($fh);
+    # The slow path must not silently accept what the fast path refused -
+    # without this the refusal falls into the already-mounted early return.
+    my $procdir = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_PROC} = $procdir;
+    fake_mergerfs($procdir, 201, 'nonraid-nrpool', '/mnt/disk1:/mnt/disk9', $POOL);
 
     reset_commands();
     local $PVE::ProcFSTools::mounts =
         [@{ member_mounts() }, ['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
     my $err = '';
-    # ...against a fixture whose live array has different members.
     with_fixture('nmdstat-started-clean.txt', sub {
         eval { $P->can('_ensure_pool_mounted')->('nrpool', $scfg) };
         $err = $@;
     });
     like($err, qr/built from a different set of members/,
         'the slow path refuses a stale pool instead of returning silently');
-    like($err, qr/systemctl stop pve-nonraid/, 'and names how to clear it');
+    like($err, qr{/mnt/disk9}, 'and names what is actually mounted');
     is_deeply(cmds(), [], 'nothing was mounted over the top of it');
+}
+
+{
+    # A pool we cannot inspect at all: refuse with an actionable message
+    # rather than serving it.
+    my $procdir = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_PROC} = $procdir;
+    reset_commands();
+    local $PVE::ProcFSTools::mounts =
+        [@{ member_mounts() }, ['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
+    my $err = '';
+    with_fixture('nmdstat-started-clean.txt', sub {
+        eval { $P->can('_ensure_pool_mounted')->('nrpool', $scfg) };
+        $err = $@;
+    });
+    like($err, qr/cannot inspect/, 'an uninspectable pool is refused');
+    is_deeply(cmds(), [], 'and nothing is mounted over it');
+}
+
+# ---- the correction debt must not vanish ----------------------------------
+{
+    # If the debt cannot be recorded, the obligation exists only in this
+    # process: the next call finds no pending file, starts no check, and
+    # reports success. Activation has to fail instead.
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
+    mkdir "$bk/units";
+    symlink('deadbeef', "$bk/units/invocation:pve-nonraid.service") or die $!;
+    mkdir "$bk/var";
+    open(my $m, '>', "$bk/var/array.running") or die $!;
+    close($m);
+    chmod 0500, "$bk/var";      # the sibling debt file cannot be created
+
+    reset_commands();
+    my @warnings;
+    my $ok = do {
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        $P->can('_post_start_bookkeeping')->('nrpool', $scfg, 1, 1);
+    };
+    chmod 0700, "$bk/var";
+    ok(!$ok, 'an unrecordable correction debt fails the bookkeeping');
+    like(join('', @warnings), qr/correcting-check debt/, 'and says so');
+    ok(!-e "$bk/var/array.running.correct-pending", 'no debt file was created');
+    is_deeply(cmds(), [], 'and no check was silently skipped as if paid');
 }
 
 done_testing();
