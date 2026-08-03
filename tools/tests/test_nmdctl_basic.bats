@@ -1221,8 +1221,14 @@ mock_import_with_status() {
           echo "$RESYNC_ELAPSED_DIR")
 
     [ -n "$dir" ]
+    # The mount points themselves, not only paths below them: a default of
+    # exactly /run or /tmp is just as volatile and matches neither /run/* nor
+    # /tmp/*.
+    [ "$dir" != /run ] && [ "$dir" != /tmp ] && [ "$dir" != /var/run ]
     [[ "$dir" != /run/* ]]
     [[ "$dir" != /tmp/* ]]
+    [[ "$dir" != /var/run/* ]]
+    [[ "$dir" != /dev/shm/* ]]
 }
 
 # Seed the state handle_check reads for a running check, so it skips

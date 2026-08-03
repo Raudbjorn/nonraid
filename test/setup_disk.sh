@@ -75,7 +75,15 @@ for i in $(seq 1 "$DISK_COUNT"); do
        ! grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null; then
         die "/dev/disk/by-id/$linkname already exists and is not ours; choose another NONRAID_TEST_PREFIX"
     fi
-    ln -s "$loop_dev" "/dev/disk/by-id/$linkname" 2>/dev/null || ln -sf "$loop_dev" "/dev/disk/by-id/$linkname"
+    # -f only after re-proving ownership. The check above already refuses a
+    # link that is not ours, but an unconditional 'ln -sf' fallback would also
+    # take anything that appeared in between - and the whole point of the
+    # check is that this path can point at a real disk.
+    if ! ln -s "$loop_dev" "/dev/disk/by-id/$linkname" 2>/dev/null; then
+        grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null ||
+            die "/dev/disk/by-id/$linkname appeared and is not ours; refusing to replace it"
+        ln -sf "$loop_dev" "/dev/disk/by-id/$linkname"
+    fi
     # Once each: a re-run repoints the same link and must not duplicate the entry.
     grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null || \
         echo "/dev/disk/by-id/$linkname" >> "$OWNED_LINKS"

@@ -627,6 +627,15 @@
             });
         };
 
+        // Captured BEFORE the override is defined, and that ordering is the
+        // whole point: Ext.define({override: ...}) REPLACES
+        // PVE.storage.BaseEdit.prototype.submit, so reaching for that property
+        // from inside the override finds the override. Confirming the dialog
+        // then re-entered it, re-read the still-staged actions and asked again,
+        // forever. callParent is not usable either - the real submit happens in
+        // the confirmation's callback, long after the calling frame it needs.
+        var baseSubmit = PVE.storage.BaseEdit.prototype.submit;
+
         // Only wrap our own panel's window, never anyone else's storage dialog.
         Ext.define('PVE.storage.NonRAIDBaseEditHook', {
             override: 'PVE.storage.BaseEdit',
@@ -648,7 +657,7 @@
                     return me.callParent(arguments);
                 }
                 return confirmDiskActions(me, function () {
-                    PVE.storage.BaseEdit.prototype.submit.apply(me, []);
+                    baseSubmit.apply(me, []);
                 });
             },
         });

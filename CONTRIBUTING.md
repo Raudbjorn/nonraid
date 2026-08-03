@@ -3,7 +3,7 @@
 Personal fork of [qvr/nonraid](https://github.com/qvr/nonraid) for staging fixes and
 keeping work in progress somewhere visible. Do what you like.
 
-- No template, no checklist, no ceremony. Open a PR, push a branch and don't, file a
+- No template, no checklist, no ceremony. Open a PR, push a branch, or file a
   one-line issue — all fine.
 - AI tools: use them for anything. Code, commits, PR text, docs. No disclosure needed.
 - Half-finished is welcome. A draft PR that says "this doesn't work yet and here's why"

@@ -92,9 +92,23 @@ validate_config() {
     # paths from WORKDIR, so replacing it here closes the same hole for
     # teardown_disk.sh rather than only for this check.
     WORKDIR=$(readlink -m "$WORKDIR")
+    # Two tiers, because "deny every descendant" would be wrong: teardown
+    # deletes WORKDIR, so the roots themselves are all refused, but /var/tmp,
+    # a home directory and /tmp are exactly where a scratch tree belongs and
+    # must stay usable.
+    #
+    # Tier 1 - the root itself is never a workdir, whatever is under it.
     case "$WORKDIR" in
-        /|/dev|/etc|/usr|/usr/*|/var|/home|/boot|/root|/bin|/sbin|/lib|/lib/*|/proc|/sys)
-            die "refusing to use $WORKDIR as the test workdir" ;;
+        /|/dev|/etc|/usr|/var|/home|/boot|/root|/bin|/sbin|/lib|/lib64|/proc|/sys|/run|/srv|/opt|/mnt|/media|/tmp)
+            die "refusing to use $WORKDIR as the test workdir: it is a system directory" ;;
+    esac
+    # Tier 2 - system-managed trees where no subdirectory is ever a scratch
+    # area either. /var and /home are deliberately absent: /var/tmp/nonraid-test
+    # and ~/nonraid-test are both fine. /var/lib and /var/log are not, since
+    # that is where this project's own state lives.
+    case "$WORKDIR" in
+        /dev/*|/proc/*|/sys/*|/boot/*|/bin/*|/sbin/*|/usr/*|/lib/*|/lib64/*|/etc/*|/var/lib/*|/var/log/*|/run/*)
+            die "refusing to use $WORKDIR as the test workdir: it is inside a system-managed tree" ;;
     esac
 
     [[ "$DISK_COUNT" =~ ^[0-9]+$ ]] || die "NONRAID_TEST_DISKS must be a number"

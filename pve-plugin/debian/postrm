@@ -30,10 +30,19 @@ case "$1" in
             # package Half-Installed, which is a far worse state to be in than
             # one with a stale <script> tag.
             if [ -f "$TPL" ] && grep -q '<!-- BEGIN pve-nonraid-gui' "$TPL"; then
-                if ! grep -q '<!-- END pve-nonraid-gui -->' "$TPL"; then
-                    echo "pve-nonraid: $TPL has an unterminated marker block;" >&2
-                    echo "  leaving it alone - remove the block by hand." >&2
-                elif ! sed -i '/<!-- BEGIN pve-nonraid-gui/,/<!-- END pve-nonraid-gui -->/d' "$TPL"; then
+                # "Both markers exist somewhere" is not enough to delete a
+                # range by: an END above the BEGIN, or a second stray END,
+                # makes sed take template content that is not ours with it.
+                # Require exactly one of each, in that order, or leave it.
+                nb=$(grep -c '<!-- BEGIN pve-nonraid-gui' "$TPL" || true)
+                ne=$(grep -c '<!-- END pve-nonraid-gui -->' "$TPL" || true)
+                bline=$(grep -n '<!-- BEGIN pve-nonraid-gui' "$TPL" | head -1 | cut -d: -f1)
+                eline=$(grep -n '<!-- END pve-nonraid-gui -->' "$TPL" | head -1 | cut -d: -f1)
+                if [ "$nb" != 1 ] || [ "$ne" != 1 ] || [ -z "$eline" ] \
+                    || [ "$eline" -lt "$bline" ]; then
+                    echo "pve-nonraid: $TPL has a malformed marker block" >&2
+                    echo "  ($nb BEGIN, $ne END); leaving it alone - remove it by hand." >&2
+                elif ! sed -i "${bline},${eline}d" "$TPL"; then
                     echo "pve-nonraid: could not edit $TPL; the GUI <script> tag" >&2
                     echo "  is still there and will 404. Remove it by hand." >&2
                 fi

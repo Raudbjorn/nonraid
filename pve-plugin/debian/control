@@ -3,6 +3,13 @@ Section: perl
 Priority: optional
 Maintainer: Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>
 Build-Depends: debhelper-compat (= 13)
+# Nothing here needs to be built as root or own a file it does not create:
+# every path is a plain root:root file that dh_installdeb and
+# 'dpkg-deb --root-owner-group' handle on their own. Declaring that means the
+# build needs no root emulation at all, so the '-rfakeroot' the Makefile passes
+# is a no-op rather than a dependency - and fakeroot is only a *Recommends* of
+# dpkg-dev, so it is genuinely absent under --no-install-recommends.
+Rules-Requires-Root: no
 Standards-Version: 4.6.2
 Homepage: https://github.com/Raudbjorn/nonraid
 

@@ -80,8 +80,12 @@ and only then removes `/var/lib/nonraid/array.running`. That file is the
 unclean-shutdown marker: if you tear the array down by hand and leave it
 behind, the next activation concludes the node crashed and starts a
 *correcting parity check*, which on a real array is hours of I/O. Doing it by
-hand means `umount <pool>`, `nmdctl unmount`, `nmdctl stop`, **and**
-`rm -f /var/lib/nonraid/array.running`.
+hand means `umount <pool>` for every NonRAID pool, then `nmdctl unmount` and
+`nmdctl stop` — and removing `/var/lib/nonraid/array.running` **only if every
+one of those succeeded**. If any step failed, leave the marker: the array did
+not come down cleanly, which is exactly when the next activation should
+re-check parity. `systemctl stop pve-nonraid.service` does all of this for you
+and applies that rule itself.
 
 The same marker is why an actual crash does trigger that check on the next
 activation — that is the point of it, but it is worth knowing before it
@@ -173,9 +177,11 @@ not part of the storage configuration.
 
 ### After it is added
 
-The storage appears with type **NonRAID**. It is created immediately but only
-activates when something first uses it — that activation is what starts the
-array and mounts the pool.
+The storage appears with type **NonRAID**. It is created immediately; if
+`pve-nonraid.service` is not enabled it then activates only when something
+first uses it, and that activation is what starts the array and mounts the
+pool. With the unit enabled (see above), activation instead happens at boot,
+before `pve-guests`.
 
 ![The storage list showing a NonRAID entry](images/storage-list.png)
 
