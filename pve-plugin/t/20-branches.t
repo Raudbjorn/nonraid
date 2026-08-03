@@ -6,6 +6,7 @@ use Test::More;
 use FindBin;
 use lib "$FindBin::Bin/lib", "$FindBin::Bin/..";
 
+use PVE::Storage::DirPlugin;  # stub: satisfies the -norequire parent for ->can()
 use PVE::Storage::Custom::NonRAIDPlugin;
 
 my $P = 'PVE::Storage::Custom::NonRAIDPlugin';

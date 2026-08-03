@@ -6,6 +6,7 @@ use Test::More;
 use FindBin;
 use lib "$FindBin::Bin/lib", "$FindBin::Bin/..";
 
+use PVE::Storage::DirPlugin;  # stub: satisfies the -norequire parent for ->can()
 use PVE::Storage::Custom::NonRAIDPlugin;
 
 my $P = 'PVE::Storage::Custom::NonRAIDPlugin';
@@ -60,6 +61,48 @@ my $health = \&{"${P}::nmdstat_health"};
     my $h = $health->($st);
     is($h->{rebuilding}, 1, 'size 0: still rebuilding');
     is($h->{resync_pct}, undef, 'size 0: no percentage, no division by zero');
+}
+
+# /proc/nmdstat can report a key with an empty value. It is defined, so '//'
+# does not catch it, and every numeric comparison used to warn - once per
+# pvestatd cycle, forever.
+{
+    my @warnings;
+    local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+
+    my $st = load_fixture('nmdstat-empty-values.txt');
+    my $h = $health->($st);
+
+    is_deeply(\@warnings, [], 'empty counters produce no warnings');
+    is($h->{degraded}, 0, 'empty counters read as zero, not as degraded');
+    is($h->{rebuilding}, 0, 'empty mdResync reads as not rebuilding');
+    is($h->{summary}, 'STARTED', 'summary stays clean');
+
+    # data_slots already guarded empty values; an empty size must still drop
+    # the slot rather than warn.
+    is_deeply([$P->can('data_slots')->($st)], [1], 'slot with an empty size is dropped');
+    is_deeply(\@warnings, [], 'data_slots stays warning-free too');
+}
+
+# Superblock identity: the driver holds one array per node, so a storage
+# pointed at a different superblock must not adopt whatever is running.
+{
+    my $matches = $P->can('superblock_matches');
+    ok($matches->({ sbName => '/nonraid.dat' }, '/nonraid.dat'), 'same path matches');
+    ok($matches->({ sbName => '/nonraid.dat' }, '//nonraid.dat'), 'canonicalized before compare');
+    ok(!$matches->({ sbName => '/nonraid.dat' }, '/srv/other.dat'), 'different superblock refused');
+    ok($matches->({ sbName => '' }, '/nonraid.dat'), 'no live superblock: nothing to contradict');
+    ok($matches->({}, '/nonraid.dat'), 'missing sbName: nothing to contradict');
+}
+
+# Member mounts must come from the array's own devices.
+{
+    my $ok = $P->can('member_source_ok');
+    ok($ok->('/dev/nmd1p1', 1), 'member device for its slot');
+    ok($ok->('/dev/mapper/nmd1', 1), 'LUKS member device for its slot');
+    ok(!$ok->('/dev/nmd2p1', 1), 'member device for a different slot rejected');
+    ok(!$ok->('/dev/sdz1', 1), 'foreign device rejected');
+    ok(!$ok->(undef, 1), 'undef source rejected');
 }
 
 done_testing();
