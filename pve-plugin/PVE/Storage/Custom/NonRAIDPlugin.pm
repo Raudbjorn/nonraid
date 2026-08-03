@@ -238,6 +238,96 @@ sub nmdstat_health {
 # $degraded comes from nmdstat_health() AFTER the members are imported.
 # It matters because a degraded array that was stopped reports plain STOPPED,
 # not DISABLE_DISK - mdState alone cannot carry the fail-stop decision.
+# Disk assignment gate
+#
+# A disk may only be handed to 'nmdctl create'/'add' once nothing else claims
+# it, because both commands write to it immediately. The rules are deliberately
+# strict and stated as reasons rather than a boolean: the UI shows the reason,
+# and the operator needs to know whether the answer is "unmount it", "wipe it"
+# or "that is already in this array".
+#
+# Split pure/impure so the rules are testable against fixtures: this half takes
+# a parsed lsblk entry plus /proc/nmdstat and returns why not, if not.
+sub disk_blockers {
+    my ($entry, $st) = @_;
+    my @blockers;
+
+    return ['device not found'] if !$entry;
+
+    my $name = $entry->{name} // '';
+
+    # Already a member of this array - the most important case to name
+    # explicitly, or an operator could "wipe" a live member. Slot 0 is P and
+    # 29 is Q; rdevName is the physical partition, so compare on its disk.
+    if ($st) {
+        for my $key (keys %$st) {
+            next if $key !~ /^rdevName\.(\d+)$/;
+            my $slot = $1;
+            my $rdev = $st->{$key} // '';
+            next if $rdev eq '';
+            # rdevName is e.g. 'vde1'; strip the partition to get the disk.
+            my $disk = $rdev;
+            $disk =~ s/p?\d+$//;
+            if ($disk eq $name || $rdev eq $name) {
+                my $role = $slot == 0 ? 'parity P'
+                    : $slot == 29 ? 'parity Q'
+                    : "data slot $slot";
+                push @blockers, "already in this array as $role";
+                last;
+            }
+        }
+    }
+
+    push @blockers, "mounted at $entry->{mountpoint}"
+        if defined($entry->{mountpoint}) && $entry->{mountpoint} ne '';
+    push @blockers, "holds a $entry->{fstype} filesystem"
+        if defined($entry->{fstype}) && $entry->{fstype} ne '';
+
+    my @children = @{ $entry->{children} // [] };
+    for my $child (@children) {
+        my $ctype = $child->{type} // '';
+        if (defined($child->{mountpoint}) && $child->{mountpoint} ne '') {
+            push @blockers, "$child->{name} is mounted at $child->{mountpoint}";
+        } elsif ($ctype ne 'part') {
+            # A non-partition child is a holder: LVM, dm-crypt, MD, a Ceph OSD.
+            # Undoing those is the business of the tool that made them.
+            push @blockers, "$child->{name} ($ctype) holds it";
+        }
+    }
+    my @parts = grep { ($_->{type} // '') eq 'part' } @children;
+    push @blockers, scalar(@parts) . " partition(s)" if @parts;
+
+    return \@blockers;
+}
+
+# 'nmdctl create'/'add' take slot:device:id. Build that from a validated set,
+# so the argv is testable without touching a disk.
+sub build_assign_specs {
+    my ($parity, $data, $first_slot) = @_;
+    my @specs;
+    my @p = @{ $parity // [] };
+    die "at most two parity disks (P and Q)\n" if scalar(@p) > 2;
+    push @specs, "P:$p[0]" if defined $p[0];
+    push @specs, "Q:$p[1]" if defined $p[1];
+    my $slot = $first_slot // 1;
+    for my $dev (@{ $data // [] }) {
+        die "no free data slot left (1..28)\n" if $slot > 28;
+        push @specs, "$slot:$dev";
+        $slot++;
+    }
+    return @specs;
+}
+
+# Lowest unused data slot, so 'add' extends an array rather than overwriting.
+sub next_free_slot {
+    my ($st) = @_;
+    my %used = map { $_ => 1 } data_slots($st);
+    for my $slot (1 .. 28) {
+        return $slot if !$used{$slot};
+    }
+    return undef;
+}
+
 sub decide_start_action {
     my ($state, $autostart, $degraded) = @_;
     $state //= '';
