@@ -17,7 +17,7 @@ Package: libpve-storage-nonraid-perl
 Architecture: all
 Depends: ${perl:Depends}, ${misc:Depends},
  libpve-storage-perl (>= 9.0~),
- nonraid-tools,
+ nonraid-tools (>= 1.23.0-2),
  mergerfs
 # pve-manager Recommends rather than Depends: the GUI surface (a JS file under
 # its tree and a tag in its template) is cosmetic and self-heals via the dpkg

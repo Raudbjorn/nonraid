@@ -50,11 +50,13 @@ jobs:
       - name: Read the version
         # No synthesis any more: the unit copies are committed under
         # tools/debian/ and debian/rules refuses a changelog that disagrees
-        # with nmdctl's VERSION=.
+        # with nmdctl's VERSION=. The changelog revision (-N) is read from
+        # the changelog itself, not assumed to be -1: rules only enforces
+        # that the UPSTREAM part matches nmdctl.
         run: |
-          VERSION=$(grep '^VERSION=' tools/nmdctl | head -1 | cut -d= -f2 | tr -d '"')
-          test -n "$VERSION"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          PKG_VERSION=$(cd tools && dpkg-parsechangelog -SVersion)
+          test -n "$PKG_VERSION"
+          echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
@@ -65,14 +67,14 @@ jobs:
       - name: Sanity-check the package
         run: |
           deb=$(ls nonraid-tools_*.deb | head -1)
-          dpkg-deb -I "$deb" | grep -q "Version: $VERSION-1"
+          dpkg-deb -I "$deb" | grep -q "Version: $PKG_VERSION"
           dpkg-deb -c "$deb" | grep -q './usr/bin/nmdctl'
           dpkg-deb -c "$deb" | grep -q 'nonraid.service'
-          echo "package carries $VERSION-1 and its payload"
+          echo "package carries $PKG_VERSION and its payload"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nonraid-tools-${{ env.VERSION }}
+          name: nonraid-tools-${{ env.PKG_VERSION }}
           path: "*.deb"
           retention-days: 30

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Same reasoning as postinst: debhelper's generated reload snippet is not
+# DPKG_ROOT-aware, so it is suppressed in debian/rules and written out here
+# instead, guarded.
+case "$1" in
+    remove|purge)
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#

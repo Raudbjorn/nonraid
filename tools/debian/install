@@ -1,1 +1,12 @@
-nmdctl  usr/bin/
+#!/usr/bin/dh-exec
+# dh_installsystemd is skipped for the unit files themselves (see rules for
+# why); dh-exec's '=>' renames the committed debian/nonraid-tools.<unit>
+# copies (named per debhelper's own <package>.<unit> convention, so
+# checks/fast.sh can diff them against tools/systemd/* unchanged) to their
+# real installed names.
+nmdctl usr/bin
+debian/nonraid-tools.nonraid.service => usr/lib/systemd/system/nonraid.service
+debian/nonraid-tools.nonraid-parity-check.service => usr/lib/systemd/system/nonraid-parity-check.service
+debian/nonraid-tools.nonraid-parity-check.timer => usr/lib/systemd/system/nonraid-parity-check.timer
+debian/nonraid-tools.nonraid-notify.service => usr/lib/systemd/system/nonraid-notify.service
+debian/nonraid-tools.nonraid-notify.timer => usr/lib/systemd/system/nonraid-notify.timer

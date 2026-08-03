@@ -22,7 +22,8 @@ step() {
 
 step "shellcheck nmdctl"      shellcheck -x tools/nmdctl
 step "shellcheck plugin bins" shellcheck -x pve-plugin/bin/pve-nonraid-gui pve-plugin/bin/pve-nonraid-teardown
-step "shellcheck maintainer"  shellcheck -x pve-plugin/debian/postinst pve-plugin/debian/prerm pve-plugin/debian/postrm
+step "shellcheck maintainer"  shellcheck -x pve-plugin/debian/postinst pve-plugin/debian/prerm pve-plugin/debian/postrm \
+                                  tools/debian/postinst tools/debian/postrm
 step "shellcheck harness"     shellcheck -x test/lib.sh test/setup_disk.sh test/teardown_disk.sh test/mk_array.sh
 step "shellcheck checks"      sh -c 'shellcheck -x checks/*.sh .githooks/pre-push'
 step "bash -n nmdctl"         bash -n tools/nmdctl

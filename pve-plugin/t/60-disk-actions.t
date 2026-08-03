@@ -359,7 +359,24 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
     like($@, qr/no 'nodes' restriction/, 'an unrestricted storage is refused');
     is_deeply(cmds(), [], 'nothing was issued');
 
-    # Named, and this is the node: allowed through to the gate.
+    # Named, and this is the sole node: allowed through to the gate.
+    reset_commands();
+    eval {
+        $P->on_add_hook('nrpool', {
+            %$scfg,
+            nodes => { 'testnode' => 1 },
+            'nonraid-wipe-disks' => '/dev/sdb',
+        });
+    };
+    is($@, '', 'a storage that names only this node proceeds');
+    like(join(' ', @{ cmds() }), qr{wipefs -a /dev/sdb}, 'and the wipe ran');
+
+    # A legacy multi-node restriction that HAPPENS to include this node used
+    # to pass the gate, which meant the same config authorised the identical
+    # wipe on every OTHER node it named too - device names are node-local, so
+    # "wipe /dev/sdb" means a different disk on each. check_config leaves
+    # such configs editable (no flag day for what's already on disk), so the
+    # hook itself has to fail closed on them.
     reset_commands();
     eval {
         $P->on_add_hook('nrpool', {
@@ -368,8 +385,9 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
             'nonraid-wipe-disks' => '/dev/sdb',
         });
     };
-    is($@, '', 'a storage that names this node proceeds');
-    like(join(' ', @{ cmds() }), qr{wipefs -a /dev/sdb}, 'and the wipe ran');
+    like($@, qr/names more than one node/,
+        'a legacy multi-node restriction is refused even though it names this node');
+    is_deeply(cmds(), [], 'and the wipe did not run');
 }
 
 {

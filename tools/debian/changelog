@@ -1,3 +1,19 @@
+nonraid-tools (1.23.0-2) stable; urgency=medium
+
+  * nonraid.service, nonraid-parity-check.{service,timer} and
+    nonraid-notify.{service,timer}: stop relying on dh_installsystemd's
+    generated maintainer-script snippets, which reload the BUILD HOST's
+    systemd on an offline-root (DPKG_ROOT) install or removal. Install the
+    units via debian/install and reload only from hand-written,
+    DPKG_ROOT-guarded postinst/postrm.
+  * libpve-storage-nonraid-perl now requires this revision: nonraid.service's
+    ConditionPathExists only skips a FUTURE start on a host with the plugin
+    installed, so an already-active nonraid.service from an older install
+    keeps owning the array until this revision's coexistence fix is in
+    place.
+
+ -- Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>  Mon, 03 Aug 2026 00:00:00 +0000
+
 nonraid-tools (1.23.0-1) stable; urgency=medium
 
   * Reconcile the Debian package version with tools/nmdctl (1.23.0).

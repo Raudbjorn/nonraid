@@ -20,10 +20,17 @@ execute_after_dh_install:
 	install -D -m 0600 systemd/nonraid.default \
 		debian/nonraid-tools/etc/default/nonraid
 
+# Skipped ENTIRELY, not merely defanged with --no-enable --no-start
+# --no-stop-on-upgrade: those flags suppress the enable/start/stop snippets
+# but dh_installsystemd still emits postinst/postrm daemon-reload autoscripts
+# guarded only on `[ -d /run/systemd/system ]` - the BUILD HOST's systemd,
+# with no DPKG_ROOT test. A `dpkg --root` install or removal of this package
+# would reload the host's systemd on behalf of a target tree it never
+# touched. The five unit files are installed by debian/install instead; the
+# reloads are hand-written and DPKG_ROOT-guarded in postinst/postrm. Nothing
+# is enabled/started/stopped at install/remove either way, matching the old
+# --no-enable --no-start --no-stop-on-upgrade semantics exactly.
 override_dh_installsystemd:
-	dh_installsystemd --name=nonraid --no-stop-on-upgrade --no-start --no-enable
-	dh_installsystemd --name=nonraid-parity-check --no-stop-on-upgrade --no-start --no-enable
-	dh_installsystemd --name=nonraid-notify --no-stop-on-upgrade --no-start --no-enable
 
 override_dh_installudev:
 	dh_installudev --name=nonraid --priority=90

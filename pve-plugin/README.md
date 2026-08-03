@@ -115,7 +115,22 @@ ConditionPathExists=!/usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
 ```
 
 so installing this plugin disables them without any `/etc/default/nonraid`
-edit. Two consequences worth knowing:
+edit.
+
+`ConditionPathExists` only ever gates a **future** start — it does nothing to
+an already-active `nonraid.service`. On a host being converted from a manual
+nonraid-tools setup to this plugin, if `nonraid.service` is already running
+when the plugin activates, the plugin refuses activation outright rather than
+starting or mounting anything alongside a unit whose `ExecStop` tears down
+mounts and the array out from under it. The refusal names the fix:
+`systemctl disable --now nonraid.service`, done once, by hand — never
+automatically, for the same ExecStop reason. This is why
+`libpve-storage-nonraid-perl` depends on `nonraid-tools (>= 1.23.0-2)`: only
+that revision's units carry the `ConditionPathExists` guard above, so an
+older nonraid-tools install would otherwise never even get the chance to stay
+stopped on its own for a future start.
+
+Two more consequences worth knowing:
 
 - **Scheduled parity checks stop.** `nonraid-parity-check.timer` still fires,
   but its service is now condition-skipped, and the plugin does not schedule

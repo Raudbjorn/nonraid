@@ -17,7 +17,7 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 DOCKERFILE='FROM debian:13
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-        build-essential debhelper fakeroot devscripts dh-dkms dkms \
+        build-essential debhelper fakeroot devscripts dh-dkms dkms dh-exec \
         curl ca-certificates perl gdisk shellcheck mergerfs \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL -o /usr/share/keyrings/proxmox-archive-keyring.gpg \

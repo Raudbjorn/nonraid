@@ -567,33 +567,93 @@ sub member_mounts {
     is_deeply(cmds(), [], 'and nothing is mounted over it');
 }
 
-# ---- the correction debt must not vanish ----------------------------------
+# ---- the correction debt must not vanish -----------------------------------
+# _record_correction_debt is now called BEFORE the array is started or the
+# pool is mounted (see activate_storage), so a false return has to fail
+# activation with nothing yet mutated - not merely warn once the array is
+# already serving. A directory conflict, not chmod, blocks the write here: a
+# permission bit is a no-op for root, which is exactly who runs this in the
+# package's real DPKG_ROOT-free path, and the fast tier should catch this
+# regression under either.
 {
-    # If the debt cannot be recorded, the obligation exists only in this
-    # process: the next call finds no pending file, starts no check, and
-    # reports success. Activation has to fail instead.
     my $bk = tempdir(CLEANUP => 1);
-    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
-    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
-    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
-    mkdir "$bk/units";
-    symlink('deadbeef', "$bk/units/invocation:pve-nonraid.service") or die $!;
-    mkdir "$bk/var";
-    open(my $m, '>', "$bk/var/array.running") or die $!;
-    close($m);
-    chmod 0500, "$bk/var";      # the sibling debt file cannot be created
+    open(my $blocker, '>', "$bk/blocker") or die $!;
+    close($blocker); # a plain file where the marker's directory must go
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/blocker/array.running";
 
     reset_commands();
     my @warnings;
     my $ok = do {
         local $SIG{__WARN__} = sub { push @warnings, $_[0] };
-        $P->can('_post_start_bookkeeping')->('nrpool', $scfg, 1, 1);
+        $P->can('_record_correction_debt')->('nrpool', 1);
     };
-    chmod 0700, "$bk/var";
-    ok(!$ok, 'an unrecordable correction debt fails the bookkeeping');
+    ok(!$ok, 'an unrecordable correction debt reports failure');
     like(join('', @warnings), qr/correcting-check debt/, 'and says so');
-    ok(!-e "$bk/var/array.running.correct-pending", 'no debt file was created');
+    ok(!-e "$bk/blocker/array.running.correct-pending", 'no debt file was created');
     is_deeply(cmds(), [], 'and no check was silently skipped as if paid');
+
+    # Retry once the obstruction is gone: the SAME debt, recorded on the next
+    # activation attempt, the way pvestatd would actually retry it.
+    unlink("$bk/blocker") or die $!;
+    mkdir("$bk/blocker") or die $!;
+    reset_commands();
+    my $ok2 = $P->can('_record_correction_debt')->('nrpool', 1);
+    ok($ok2, 'the retried call records the debt once the path is writable');
+    ok(-e "$bk/blocker/array.running.correct-pending",
+        'the pending file now exists, so _ensure_correction will pay it');
+}
+
+# Nothing to record: a clean shutdown ($unclean = 0) is always a no-op
+# success, even against the same unwritable path above.
+{
+    my $bk = tempdir(CLEANUP => 1);
+    open(my $blocker, '>', "$bk/blocker") or die $!;
+    close($blocker);
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/blocker/array.running";
+    my $ok = $P->can('_record_correction_debt')->('nrpool', 0);
+    ok($ok, 'a clean shutdown records nothing and cannot fail on it');
+}
+
+# ---- nonraid-tools' own unit must stand aside ------------------------------
+# A host upgraded from before the two units learned to coexist can still have
+# nonraid.service active (ConditionPathExists only ever gated a future
+# start). Reusing the "invocation:" liveness stat rather than forking
+# systemctl keeps this cheap on every activation, not only the first.
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
+    mkdir "$bk/units";
+    symlink('deadbeef', "$bk/units/invocation:nonraid.service") or die $!;
+
+    reset_commands();
+    my $err = '';
+    eval { $P->can('_refuse_if_legacy_unit_active')->('nrpool') };
+    $err = $@;
+    like($err, qr/nonraid\.service/, 'refuses while the legacy unit is active');
+    like($err, qr/disable --now nonraid\.service/, 'and says how to stop it');
+    is_deeply(cmds(), [], 'nothing was issued before the refusal');
+}
+
+# The plugin's own unit being active does not trip this - only nonraid.service
+# (nonraid-tools') does; they are two different invocation files.
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
+    mkdir "$bk/units";
+    symlink('deadbeef', "$bk/units/invocation:pve-nonraid.service") or die $!;
+
+    reset_commands();
+    eval { $P->can('_refuse_if_legacy_unit_active')->('nrpool') };
+    is($@, '', 'pve-nonraid.service being active does not refuse activation');
+}
+
+# Neither unit active: the ordinary case, no refusal.
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
+    mkdir "$bk/units";
+    eval { $P->can('_refuse_if_legacy_unit_active')->('nrpool') };
+    is($@, '', 'no legacy unit active: nothing to refuse');
 }
 
 done_testing();

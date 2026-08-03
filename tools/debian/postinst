@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+# An offline-root operation (debootstrap, image builds) sets DPKG_ROOT to the
+# target tree; this host's systemd has nothing to do with it. Hand-written
+# because dh_installsystemd's own reload autoscript guards on
+# `[ -d /run/systemd/system ]` with no DPKG_ROOT test - see debian/rules.
+#
+# No deb-systemd-helper enable-state bookkeeping here: the package never
+# enables any of these units (--no-enable was the old dh_installsystemd
+# behaviour and nothing here changes that), so there is no enablement state
+# to track or restore.
+case "$1" in
+    configure)
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#

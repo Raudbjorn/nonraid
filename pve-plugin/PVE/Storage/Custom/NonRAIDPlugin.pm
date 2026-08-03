@@ -998,37 +998,37 @@ sub _correction_pending_file {
     return _marker_file() . '.correct-pending';
 }
 
-sub _post_start_bookkeeping {
-    my ($storeid, $scfg, $started, $unclean) = @_;
+# Recording is NOT best-effort, and it has to happen before the array is
+# started or the pool is mounted. If the debt cannot be written after those
+# steps, the caller can only refuse to report activation as successful with
+# the array already up and guests possibly attaching to it - the worse of two
+# bad options. Called before anything is mutated instead, a failure here
+# means nothing has happened yet: the caller dies, nothing is started, and
+# pvestatd retries the whole slow path from a clean state.
+#
+# A false here is not "no debt to record" - that case (no leftover marker, or
+# the pending file already exists) returns true. It means an unclean shutdown
+# WAS detected and the obligation to correct for it could not be made
+# durable: without failing the caller, _ensure_bookkeeping would find no
+# pending file once the array is up, start no check, and report success - the
+# unclean shutdown the marker was reporting would be forgotten.
+sub _record_correction_debt {
+    my ($storeid, $unclean) = @_;
+    return 1 if !$unclean || -e _correction_pending_file();
 
-    # A leftover marker means the previous shutdown never tore the array down
-    # cleanly. Record the debt durably; paying it is _ensure_bookkeeping's
-    # job, so that a debt recorded now but unpayable now still gets retried
-    # from the fast path once the array is up.
-    #
-    # Recording it is NOT best-effort. If the debt cannot be written, the
-    # obligation exists only in this process: _ensure_bookkeeping would find
-    # no pending file, start no check, and report success - and the unclean
-    # shutdown that the marker was reporting would be forgotten the moment
-    # this call returned. The caller turns a false here into a failed
-    # activation, and pvestatd retries.
-    my $recorded = 1;
-    if ($unclean && !-e _correction_pending_file()) {
-        $recorded = 0;
-        if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }) {
-            if (open(my $fh, '>', _correction_pending_file())) {
-                $recorded = 1 if close($fh);
-            }
-        }
-        if (!$recorded) {
-            syslog('warning', '%s', "storage $storeid: unclean shutdown"
-                . " detected but the correcting-check debt could not be"
-                . " recorded at " . _correction_pending_file() . " ($!)");
-            warn "could not record the correcting-check debt: $!\n";
+    my $recorded = 0;
+    if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }) {
+        if (open(my $fh, '>', _correction_pending_file())) {
+            $recorded = 1 if close($fh);
         }
     }
-
-    return _ensure_bookkeeping($storeid, $scfg) && $recorded;
+    if (!$recorded) {
+        syslog('warning', '%s', "storage $storeid: unclean shutdown"
+            . " detected but the correcting-check debt could not be"
+            . " recorded at " . _correction_pending_file() . " ($!)");
+        warn "could not record the correcting-check debt: $!\n";
+    }
+    return $recorded;
 }
 
 # Pay the correcting-parity debt if one is outstanding. Called from
@@ -1100,6 +1100,24 @@ sub _ensure_marker {
         return 0;
     }
     return 1;
+}
+
+# nonraid-tools' own unit (nonraid.service, oneshot + RemainAfterExit) may
+# still own this array on a host upgraded from before the two learned to
+# coexist: its ConditionPathExists only skips a FUTURE start, it does not stop
+# an already-active unit. Its ExecStop tears down mounts and the array, so
+# nothing here may start or mount alongside it - refuse and say how to fix it.
+# Same "invocation:" liveness check as _ensure_unit_registered below, so this
+# stays a stat rather than a fork.
+sub _refuse_if_legacy_unit_active {
+    my ($storeid) = @_;
+    die "refusing to activate storage '$storeid': nonraid.service"
+        . " (nonraid-tools) is active and already owns the NonRAID array on"
+        . " this node. Stop it deliberately - its ExecStop unmounts members"
+        . " and stops the array - with 'systemctl disable --now"
+        . " nonraid.service', then retry.\n"
+        if -l _systemd_units_dir() . '/invocation:nonraid.service';
+    return;
 }
 
 # The unit's ExecStop is the ordered teardown (pools -> members -> array); its
@@ -1428,6 +1446,17 @@ sub _check_disk_action_node {
         . " $here. Set --nodes to the node that has the array.\n"
         if !$nodes || !%$nodes;
 
+    # More than one node named is a legacy configuration check_config lets
+    # stay editable, but the driver holds exactly one array per node - naming
+    # several authorises destructive actions on all of them, since this test
+    # only ever checked "does $here appear", not "is $here the only one".
+    die "refusing disk actions on storage '$storeid': its 'nodes' restriction"
+        . " names more than one node ('" . join(',', sort keys %$nodes) . "'),"
+        . " but a NonRAID array is one node's hardware and device names are"
+        . " node-local - naming several would authorise this action on all"
+        . " of them. Set --nodes to the single node that has the array.\n"
+        if scalar(keys %$nodes) != 1;
+
     die "refusing disk actions on storage '$storeid': these disks belong to"
         . " '" . join(',', sort keys %$nodes) . "', but this request is being"
         . " served by '$here' and device names are node-local. Re-issue it"
@@ -1559,7 +1588,17 @@ sub activate_storage {
         PVE::Tools::lock_file("/run/lock/pve-nonraid-array.lck", 10, sub {
             $st = read_nmdstat(); # re-check under the lock
             my $unclean = -e _marker_file();
-            my $started = _ensure_array_started($storeid, $scfg, $st);
+
+            _refuse_if_legacy_unit_active($storeid);
+
+            # Recorded before anything is started or mounted: see
+            # _record_correction_debt for why the ordering is load-bearing.
+            _record_correction_debt($storeid, $unclean)
+                or die "refusing to activate storage '$storeid': the"
+                . " correcting-check debt for the last unclean shutdown"
+                . " could not be recorded; see the warnings above\n";
+
+            _ensure_array_started($storeid, $scfg, $st);
             _ensure_members_mounted($scfg);
             _ensure_pool_mounted($storeid, $scfg);
             # Fatal here, unlike the fast path: nothing is serving yet, so
@@ -1567,7 +1606,7 @@ sub activate_storage {
             # be made durable would mean the next unclean shutdown looks
             # clean and parity is never re-checked. pvestatd retries this
             # whole path idempotently.
-            _post_start_bookkeeping($storeid, $scfg, $started, $unclean)
+            _ensure_bookkeeping($storeid, $scfg)
                 or die "activation bookkeeping failed - refusing to report"
                 . " storage '$storeid' as active; see the warnings above\n";
         });

@@ -501,6 +501,133 @@
 
                 injectDesignTokens();
 
+                // Building a new array happens only through nonraid-create-*,
+                // which on_update_hook_full always rejects outside create
+                // ("nonraid-create-* only applies when creating a storage").
+                // Hiding the column - not merely disabling it - keeps Edit
+                // from offering a capability the backend refuses; see also
+                // stagedDiskActions() and onGetValues() below, which stop
+                // collecting and serializing it in Edit for the same reason.
+                var diskColumns = [
+                    {
+                        text: gettext('Device'),
+                        dataIndex: 'devpath',
+                        flex: 2,
+                        renderer: function (v) {
+                            return '<span class="nonraid-dev">'
+                                + Ext.String.htmlEncode(v || '') + '</span>';
+                        },
+                    },
+                    {
+                        text: gettext('Size'),
+                        dataIndex: 'size',
+                        flex: 1,
+                        renderer: function (v) {
+                            return Ext.isFunction(Proxmox.Utils.format_size)
+                                ? Proxmox.Utils.format_size(v) : v;
+                        },
+                    },
+                    {
+                        text: gettext('Status'),
+                        dataIndex: 'statusText',
+                        flex: 2,
+                        renderer: function (v, meta, rec) {
+                            var cls = 'nonraid-status-used';
+                            if (!rec.get('used') && !(rec.get('osdid') >= 0)) {
+                                cls = 'nonraid-status-free';
+                            } else if (rec.get('unmountWhy')
+                                && /Held by/.test(rec.get('unmountWhy'))) {
+                                cls = 'nonraid-status-held';
+                            }
+                            return '<span class="' + cls + '">'
+                                + Ext.String.htmlEncode(v || '') + '</span>';
+                        },
+                    },
+                    {
+                        xtype: 'widgetcolumn',
+                        text: gettext('Disconnect'),
+                        flex: 1,
+                        widget: {
+                            xtype: 'button',
+                            text: gettext('Unmount'),
+                            enableToggle: true,
+                            handler: function (btn) {
+                                btn.getWidgetRecord().set('doUnmount', btn.pressed);
+                            },
+                        },
+                        onWidgetAttach: function (col, widget, rec) {
+                            // Grey with the reason rather than letting
+                            // the click fail server-side.
+                            var why = rec.get('unmountWhy');
+                            widget.setDisabled(!!why);
+                            setWidgetTip(widget, why || gettext(
+                                'Unmount every filesystem on this disk when this form is submitted. '
+                                + 'Refused on the node if the disk is an array member or carries a system mountpoint.'));
+                            widget.toggle(rec.get('doUnmount'), true);
+                        },
+                    },
+                    {
+                        xtype: 'widgetcolumn',
+                        text: gettext('Wipe'),
+                        flex: 1,
+                        widget: {
+                            xtype: 'button',
+                            text: gettext('Wipe'),
+                            enableToggle: true,
+                            handler: function (btn) {
+                                var rec = btn.getWidgetRecord();
+                                rec.set('doWipe', btn.pressed);
+                                syncAssignWidget(btn.up('grid'), rec);
+                            },
+                        },
+                        onWidgetAttach: function (col, widget, rec) {
+                            var why = rec.get('wipeWhy');
+                            widget.setDisabled(!!why);
+                            setWidgetTip(widget, why || gettext(
+                                'Erase all signatures on this disk when this form is submitted. '
+                                + 'Refused on the node if the disk is an array member, mounted, or held by another subsystem.'));
+                            widget.toggle(rec.get('doWipe'), true);
+                        },
+                    },
+                ];
+
+                if (me.isCreate) {
+                    diskColumns.push({
+                        xtype: 'widgetcolumn',
+                        text: gettext('Assign as'),
+                        flex: 1.4,
+                        widget: {
+                            xtype: 'combobox',
+                            editable: false,
+                            queryMode: 'local',
+                            valueField: 'v',
+                            displayField: 't',
+                            store: me.roleStore,
+                            listeners: {
+                                // Writing to the record while the
+                                // column is still attaching widgets
+                                // refreshes the view underneath the
+                                // attach loop, and every row after
+                                // this one silently ends up with no
+                                // combobox at all. Only write on a
+                                // real user change.
+                                change: function (cb, v) {
+                                    var rec = cb.getWidgetRecord();
+                                    if (!rec || cb.nonraidAttaching) {
+                                        return;
+                                    }
+                                    if (rec.get('role') !== (v || '')) {
+                                        rec.set('role', v || '');
+                                    }
+                                },
+                            },
+                        },
+                        onWidgetAttach: function (col, widget, rec) {
+                            applyAssignState(widget, rec);
+                        },
+                    });
+                }
+
                 me.columnB = [
                     {
                         xtype: 'grid',
@@ -529,122 +656,7 @@
                                 return '';
                             },
                         },
-                        columns: [
-                            {
-                                text: gettext('Device'),
-                                dataIndex: 'devpath',
-                                flex: 2,
-                                renderer: function (v) {
-                                    return '<span class="nonraid-dev">'
-                                        + Ext.String.htmlEncode(v || '') + '</span>';
-                                },
-                            },
-                            {
-                                text: gettext('Size'),
-                                dataIndex: 'size',
-                                flex: 1,
-                                renderer: function (v) {
-                                    return Ext.isFunction(Proxmox.Utils.format_size)
-                                        ? Proxmox.Utils.format_size(v) : v;
-                                },
-                            },
-                            {
-                                text: gettext('Status'),
-                                dataIndex: 'statusText',
-                                flex: 2,
-                                renderer: function (v, meta, rec) {
-                                    var cls = 'nonraid-status-used';
-                                    if (!rec.get('used') && !(rec.get('osdid') >= 0)) {
-                                        cls = 'nonraid-status-free';
-                                    } else if (rec.get('unmountWhy')
-                                        && /Held by/.test(rec.get('unmountWhy'))) {
-                                        cls = 'nonraid-status-held';
-                                    }
-                                    return '<span class="' + cls + '">'
-                                        + Ext.String.htmlEncode(v || '') + '</span>';
-                                },
-                            },
-                            {
-                                xtype: 'widgetcolumn',
-                                text: gettext('Disconnect'),
-                                flex: 1,
-                                widget: {
-                                    xtype: 'button',
-                                    text: gettext('Unmount'),
-                                    enableToggle: true,
-                                    handler: function (btn) {
-                                        btn.getWidgetRecord().set('doUnmount', btn.pressed);
-                                    },
-                                },
-                                onWidgetAttach: function (col, widget, rec) {
-                                    // Grey with the reason rather than letting
-                                    // the click fail server-side.
-                                    var why = rec.get('unmountWhy');
-                                    widget.setDisabled(!!why);
-                                    setWidgetTip(widget, why || gettext(
-                                        'Unmount every filesystem on this disk when this form is submitted. '
-                                        + 'Refused on the node if the disk is an array member or carries a system mountpoint.'));
-                                    widget.toggle(rec.get('doUnmount'), true);
-                                },
-                            },
-                            {
-                                xtype: 'widgetcolumn',
-                                text: gettext('Wipe'),
-                                flex: 1,
-                                widget: {
-                                    xtype: 'button',
-                                    text: gettext('Wipe'),
-                                    enableToggle: true,
-                                    handler: function (btn) {
-                                        var rec = btn.getWidgetRecord();
-                                        rec.set('doWipe', btn.pressed);
-                                        syncAssignWidget(btn.up('grid'), rec);
-                                    },
-                                },
-                                onWidgetAttach: function (col, widget, rec) {
-                                    var why = rec.get('wipeWhy');
-                                    widget.setDisabled(!!why);
-                                    setWidgetTip(widget, why || gettext(
-                                        'Erase all signatures on this disk when this form is submitted. '
-                                        + 'Refused on the node if the disk is an array member, mounted, or held by another subsystem.'));
-                                    widget.toggle(rec.get('doWipe'), true);
-                                },
-                            },
-                            {
-                                xtype: 'widgetcolumn',
-                                text: gettext('Assign as'),
-                                flex: 1.4,
-                                widget: {
-                                    xtype: 'combobox',
-                                    editable: false,
-                                    queryMode: 'local',
-                                    valueField: 'v',
-                                    displayField: 't',
-                                    store: me.roleStore,
-                                    listeners: {
-                                        // Writing to the record while the
-                                        // column is still attaching widgets
-                                        // refreshes the view underneath the
-                                        // attach loop, and every row after
-                                        // this one silently ends up with no
-                                        // combobox at all. Only write on a
-                                        // real user change.
-                                        change: function (cb, v) {
-                                            var rec = cb.getWidgetRecord();
-                                            if (!rec || cb.nonraidAttaching) {
-                                                return;
-                                            }
-                                            if (rec.get('role') !== (v || '')) {
-                                                rec.set('role', v || '');
-                                            }
-                                        },
-                                    },
-                                },
-                                onWidgetAttach: function (col, widget, rec) {
-                                    applyAssignState(widget, rec);
-                                },
-                            },
-                        ],
+                        columns: diskColumns,
                     },
                 ];
 
@@ -658,17 +670,32 @@
                 // storage is actually being restricted to.
                 var nodesField = me.down('field[name=nodes]');
                 if (nodesField) {
+                    var nodesList = function () {
+                        var v = nodesField.getValue();
+                        return Ext.isArray(v) ? v : (v ? String(v).split(',') : []);
+                    };
+
                     // The backend refuses a nonraid storage without exactly
                     // one node (check_config): the driver holds one array per
                     // node. Say so in the form rather than after the round
-                    // trip.
+                    // trip. allowBlank alone only rejects an EMPTY selection
+                    // - the inherited field is multiSelect, so two or more
+                    // nodes pass it and only fail server-side.
                     nodesField.allowBlank = false;
+                    nodesField.validator = function () {
+                        var n = nodesList().length;
+                        if (n === 1) {
+                            return true;
+                        }
+                        return n === 0
+                            ? true // allowBlank's own message covers this case
+                            : gettext('Select exactly one node - a NonRAID array is one node’s hardware.');
+                    };
                     if (Ext.isFunction(nodesField.validate)) {
                         nodesField.validate();
                     }
                     var refresh = function () {
-                        var v = nodesField.getValue();
-                        var list = Ext.isArray(v) ? v : (v ? String(v).split(',') : []);
+                        var list = nodesList();
                         describeDisks(me, list.length === 1 ? list[0] : undefined);
                     };
                     nodesField.on('change', refresh);
@@ -694,9 +721,16 @@
                     if (rec.get('doWipe')) {
                         out.wipe.push(dev);
                     }
-                    if (rec.get('role') === 'parity') {
+                    // The Assign-as column only exists on create (see
+                    // diskColumns above), so 'role' should never be set here
+                    // in Edit - this is the defensive backstop, not the
+                    // primary guard: on_update_hook_full rejects
+                    // nonraid-create-* unconditionally, and building an array
+                    // under an EXISTING storage needs the array stopped
+                    // first, which a config edit must never do.
+                    if (me.isCreate && rec.get('role') === 'parity') {
                         out.parity.push(dev);
-                    } else if (rec.get('role') === 'data') {
+                    } else if (me.isCreate && rec.get('role') === 'data') {
                         out.data.push(dev);
                     }
                 });

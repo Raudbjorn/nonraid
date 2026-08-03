@@ -19,11 +19,15 @@ in_image '
     make package-plugin >/dev/null 2>&1
 
     echo ">>> nonraid-tools (bare build: units are committed, rules checks the manifest)"
-    VERSION=$(grep "^VERSION=" tools/nmdctl | head -1 | cut -d= -f2 | tr -d "\"")
-    test -n "$VERSION"
+    # The changelog revision (the -N suffix) is not pinned to -1 - rules
+    # itself only enforces that the UPSTREAM part matches nmdctl VERSION=, so
+    # this reads the real expected version from the changelog rather than
+    # assuming a suffix that a packaging-only revision bump would break.
+    PKG_VERSION=$(cd tools && dpkg-parsechangelog -SVersion)
+    test -n "$PKG_VERSION"
     cd tools && dpkg-buildpackage -b -us -uc >/dev/null 2>&1 && cd ..
     deb=$(ls ../nonraid-tools_*.deb nonraid-tools_*.deb 2>/dev/null | head -1)
-    dpkg-deb -I "$deb" | grep -q "Version: $VERSION-1"
+    dpkg-deb -I "$deb" | grep -q "Version: $PKG_VERSION"
 
     # Nothing may land outside the tree: that is the whole point of OUTDIR.
     for stray in ../nonraid-dkms_*.deb ../libpve-storage-nonraid-perl_*.deb; do
