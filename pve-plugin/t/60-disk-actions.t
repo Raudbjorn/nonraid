@@ -246,6 +246,70 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat' };
     is_deeply(cmds(), [], 'the data mountpoint is not unmounted either');
 }
 
+# --- wiping -----------------------------------------------------------------
+
+# The reason wipe does not go straight to PVE's /disks/wipedisk: to that
+# endpoint a live array member is indistinguishable from a spare - not mounted
+# (the driver's nmdNp1 is), no holder, just partitions. The clean fixture has
+# rdevName.1=sdb1, so /dev/sdb is data slot 1.
+{
+    reset_commands();
+    stub_lsblk('/dev/sdb' => {
+        name => 'sdb', type => 'disk',
+        children => [{ name => 'sdb1', type => 'part' }],
+    });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/nmdstat-started-clean.txt";
+    eval {
+        $P->on_update_hook_full('nrpool', $scfg,
+            { 'nonraid-wipe-disks' => '/dev/sdb' }, undef, {});
+    };
+    like($@, qr/refusing to wipe .*already in this array as data slot 1/,
+        'a live array member is never wiped');
+    is_deeply(cmds(), [], 'and nothing runs');
+}
+
+# Partitions are the reason to wipe, so they must not block it.
+{
+    reset_commands();
+    stub_lsblk('/dev/sdz' => {
+        name => 'sdz', type => 'disk',
+        children => [{ name => 'sdz1', type => 'part' }, { name => 'sdz2', type => 'part' }],
+    });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+    my $target = { 'nonraid-wipe-disks' => '/dev/sdz' };
+    $P->on_update_hook_full('nrpool', $scfg, $target, undef, {});
+    like(cmds()->[0], qr{^/sbin/wipefs -a /dev/sdz$}, 'a partitioned spare is wiped');
+    ok(!exists $target->{'nonraid-wipe-disks'}, 'the action does not persist');
+}
+
+# Everything else still blocks.
+{
+    reset_commands();
+    stub_lsblk('/dev/sdz' => {
+        name => 'sdz', type => 'disk',
+        children => [{ name => 'sdz1', type => 'part', mountpoint => '/srv' }],
+    });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+    eval {
+        $P->on_update_hook_full('nrpool', $scfg,
+            { 'nonraid-wipe-disks' => '/dev/sdz' }, undef, {});
+    };
+    like($@, qr{refusing to wipe.*mounted at /srv}, 'a mounted disk is not wiped');
+    is_deeply(cmds(), [], 'nothing runs');
+
+    reset_commands();
+    stub_lsblk('/dev/sdz' => {
+        name => 'sdz', type => 'disk',
+        children => [{ name => 'vg0', type => 'lvm' }],
+    });
+    eval {
+        $P->on_update_hook_full('nrpool', $scfg,
+            { 'nonraid-wipe-disks' => '/dev/sdz' }, undef, {});
+    };
+    like($@, qr/refusing to wipe.*vg0 \(lvm\) holds it/, 'a held disk is not wiped');
+    is_deeply(cmds(), [], 'nothing runs');
+}
+
 # Nothing mounted is a no-op, not an error: the UI may ask blindly.
 {
     reset_commands();

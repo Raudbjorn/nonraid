@@ -109,21 +109,44 @@ list beats retyping a path. Neither is a closed set: type any path.
 
 ![The Superblock File dropdown offering derived values](images/add-dialog-suggest.png)
 
-**Node disks** lists what the selected node actually has, so you can confirm
-you are pointing at the machine you think. Disks that something already
-claims — a filesystem, LVM, ZFS, a Ceph OSD, and that includes NonRAID array
-members, which carry their own filesystems — are dimmed, marked with the
-claim, and inert: they cannot be selected or copied. Unclaimed disks stay
-bright, marked `(free)`, and remain selectable so the path can be copied into
-an `nmdctl` command.
+### Building an array from the dialog
 
-![Node disks, claimed ones dimmed](images/add-dialog-disks.png)
+**Disks on the selected node** lists what that node actually has, with a
+`Size` and a `Status` taken from PVE's own disk inventory. Each row has three
+staged actions, and they form a funnel — a disk only becomes assignable once
+nothing else claims it:
 
-These are the *node's* disks, not the array's members. The slot-to-disk
-mapping lives in `/proc/nmdstat`, which no PVE API exposes; run
-`nmdctl status` for that. Array membership is not part of the storage
-configuration at all — `nmdctl create`/`add` own it (see the note on manual
-ceremony above).
+| Column | Does | Enabled when |
+|---|---|---|
+| Disconnect → *Unmount* | unmounts every filesystem on the disk | nothing else holds it |
+| *Wipe* | `wipefs -a` on the whole disk | it has something to erase |
+| *Assign as* | stages the disk as **Parity** or **Data** | the disk is empty, or staged for a wipe |
+
+Nothing runs while you click. Pressing **Add** shows one confirmation naming
+every disk in every staged action, and only then does the plugin's hook run
+them in order: unmount, wipe, create.
+
+![The Add dialog with the disk manager](images/add-dialog-diskmanager.png)
+
+![The batch confirmation](images/add-dialog-confirm.png)
+
+A disabled button carries the reason as a tooltip. Ceph OSDs, LVM, ZFS and
+Device Mapper are refused outright rather than unmounted — release those with
+the tool that owns them.
+
+**The browser is not the authority here.** The node re-validates every disk
+before touching it and refuses array members, system mountpoints (`/`,
+`/boot`, `/usr`, …) and anything with a holder, whatever the dialog offered.
+That gap is deliberate: array membership lives in `/proc/nmdstat`, which no
+PVE API exposes, so a live member is indistinguishable from a partitioned
+spare in the browser. Unmount and Wipe therefore stay enabled on disks the
+node will refuse — the refusal comes back as the task error.
+
+Creating from here needs a node with no array loaded; the driver takes its
+superblock as a module parameter and holds one array. To *add* disks to an
+array that already exists, use `nmdctl add` (see the note on manual ceremony
+above). The slot-to-disk mapping is likewise `nmdctl status` territory: it is
+not part of the storage configuration.
 
 ### After it is added
 

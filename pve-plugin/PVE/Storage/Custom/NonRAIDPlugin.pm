@@ -114,6 +114,14 @@ sub properties {
             type => 'string',
             format => 'string-list',
         },
+        'nonraid-wipe-disks' => {
+            description => "Erase all filesystem and partition signatures on"
+                . " these block devices. DESTROYS their contents. Refuses"
+                . " members of the running array, mounted disks, and anything"
+                . " held by LVM, ZFS, MD or Ceph.",
+            type => 'string',
+            format => 'string-list',
+        },
         'nonraid-unmount-disks' => {
             description => "Unmount these block devices, so they can be wiped"
                 . " and assigned. Refuses anything held by LVM, ZFS, MD or"
@@ -133,6 +141,7 @@ sub options {
         'nonraid-mergerfs-opts' => { optional => 1 },
         'nonraid-create-parity' => { optional => 1 },
         'nonraid-create-data' => { optional => 1 },
+        'nonraid-wipe-disks' => { optional => 1 },
         'nonraid-unmount-disks' => { optional => 1 },
         nodes => { optional => 1 },
         disable => { optional => 1 },
@@ -765,6 +774,34 @@ my sub unmount_disks {
     }
 }
 
+# Wiping goes through here rather than straight to PVE's /disks/wipedisk,
+# which is the obvious implementation and the wrong one: that endpoint knows
+# nothing about NonRAID, and a live array member looks exactly like a spare to
+# it - not mounted (the driver's /dev/nmdNp1 is), no holder, just partitions.
+# Wiping one destroys a member beneath the parity layer. So membership is
+# checked here first, and only then is the disk wiped.
+my sub wipe_disks {
+    my ($storeid, $devs, $st) = @_;
+
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        my $entry = _lsblk_entry($dev)
+            or die "'$dev': device not found\n";
+
+        # Partitions are why one wipes, so they are not a blocker here. Every
+        # other reason still is.
+        my @fatal = grep { !/^\d+ partition/ } @{ disk_blockers($entry, $st) };
+        die "refusing to wipe '$dev': " . join(', ', @fatal) . "\n" if @fatal;
+
+        syslog('warning', "storage $storeid: wiping '$dev' on request"
+            . " - its contents are being destroyed");
+        # -a takes every signature on the device, the partition table included.
+        run_command(['/sbin/wipefs', '-a', $dev], timeout => 120,
+            errmsg => "wiping '$dev' failed");
+        eval { run_command(['/usr/bin/udevadm', 'trigger', $dev], timeout => 30) };
+    }
+}
+
 my sub create_array {
     my ($storeid, $scfg, $parity, $data) = @_;
 
@@ -813,15 +850,21 @@ my sub run_disk_actions {
     my ($storeid, $scfg, $target) = @_;
 
     my $unmount = $target->{'nonraid-unmount-disks'};
+    my $wipe = $target->{'nonraid-wipe-disks'};
     my $parity = $target->{'nonraid-create-parity'};
     my $data = $target->{'nonraid-create-data'};
 
     delete $target->{'nonraid-unmount-disks'};
+    delete $target->{'nonraid-wipe-disks'};
     delete $target->{'nonraid-create-parity'};
     delete $target->{'nonraid-create-data'};
 
+    # Ordered the way the operator works: free it, clear it, then use it.
     unmount_disks($storeid, [PVE::Tools::split_list($unmount)], read_nmdstat())
         if defined($unmount) && $unmount ne '';
+
+    wipe_disks($storeid, [PVE::Tools::split_list($wipe)], read_nmdstat())
+        if defined($wipe) && $wipe ne '';
 
     if ((defined($parity) && $parity ne '') || (defined($data) && $data ne '')) {
         create_array(
