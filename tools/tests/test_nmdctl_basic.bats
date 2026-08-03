@@ -1220,15 +1220,27 @@ mock_import_with_status() {
           source "$BATS_TEST_DIRNAME/../nmdctl"
           echo "$RESYNC_ELAPSED_DIR")
 
-    [ -n "$dir" ]
-    # The mount points themselves, not only paths below them: a default of
-    # exactly /run or /tmp is just as volatile and matches neither /run/* nor
-    # /tmp/*.
-    [ "$dir" != /run ] && [ "$dir" != /tmp ] && [ "$dir" != /var/run ]
-    [[ "$dir" != /run/* ]]
-    [[ "$dir" != /tmp/* ]]
-    [[ "$dir" != /var/run/* ]]
-    [[ "$dir" != /dev/shm/* ]]
+    # And the path the helper actually returns, not only the variable it is
+    # built from: resync_elapsed_file could be changed to ignore
+    # RESYNC_ELAPSED_DIR entirely and this test would have stayed green.
+    local helper_dir
+    helper_dir=$(unset RESYNC_ELAPSED_DIR STATE_DIRECTORY
+                 source "$BATS_TEST_DIRNAME/../nmdctl"
+                 NMDSTAT_VALUES=([sbName]=/test.dat)
+                 dirname "$(resync_elapsed_file)")
+
+    local d
+    for d in "$dir" "$helper_dir"; do
+        [ -n "$d" ]
+        # The mount points themselves, not only paths below them: a default of
+        # exactly /run or /tmp is just as volatile and matches neither /run/*
+        # nor /tmp/*.
+        [ "$d" != /run ] && [ "$d" != /tmp ] && [ "$d" != /var/run ]
+        [[ "$d" != /run/* ]]
+        [[ "$d" != /tmp/* ]]
+        [[ "$d" != /var/run/* ]]
+        [[ "$d" != /dev/shm/* ]]
+    done
 }
 
 # Seed the state handle_check reads for a running check, so it skips

@@ -22,6 +22,11 @@ set -u
 MOUNTS="${PVE_NONRAID_MOUNTS:-/proc/mounts}"
 NMDCTL="${PVE_NONRAID_NMDCTL:-/usr/bin/nmdctl}"
 MARKER="${PVE_NONRAID_MARKER:-/var/lib/nonraid/array.running}"
+# Each external command is bounded on its own. systemd's stop timeout kills the
+# whole ExecStop, so one wedged umount would take every later pool and layer
+# with it; a per-step bound keeps the rest of the teardown reachable and leaves
+# systemd's timeout as the looser backstop.
+STEP_TIMEOUT="${PVE_NONRAID_STEP_TIMEOUT:-60}"
 
 ok=1
 pools_known=0
@@ -43,8 +48,16 @@ pools_known=0
 # a sort that happily succeeds on empty input - exactly the failure this
 # check exists to catch.
 if raw=$(awk '$1 ~ /^nonraid-/ && $3 == "fuse.mergerfs" { print $2 }' "$MOUNTS" 2>/dev/null); then
-    pools=$(printf '%s\n' "$raw" | LC_ALL=C sort -r)
-    pools_known=1
+    # The sort is checked too. Treating a failed sort as "no pools" would hand
+    # partial or empty output to the loop below as if it were the whole truth,
+    # which is the same fail-open the awk check exists to prevent.
+    if pools=$(printf '%s\n' "$raw" | LC_ALL=C sort -r); then
+        pools_known=1
+    else
+        echo "pve-nonraid: could not order the pool list; treating the mount" \
+            "table as unread" >&2
+        ok=0
+    fi
 else
     echo "pve-nonraid: cannot read the mount table ($MOUNTS); mounted pools" \
         "cannot be ruled out, so nothing below them is torn down" >&2
@@ -59,7 +72,7 @@ if [ "$pools_known" = 1 ] && [ -n "$pools" ]; then
     while IFS= read -r escaped; do
         [ -n "$escaped" ] || continue
         mp=$(printf '%b' "$escaped")
-        if umount "$mp" 2>/dev/null; then
+        if timeout "$STEP_TIMEOUT" umount "$mp" 2>/dev/null; then
             echo "pve-nonraid: unmounted pool $mp"
         else
             echo "pve-nonraid: could not unmount pool $mp" >&2
@@ -76,15 +89,21 @@ fi
 # "busy" cannot be established. Fail closed and leave the stack up - the marker
 # stays, and the next activation runs the correcting check.
 if [ "$ok" = 1 ]; then
-    "$NMDCTL" -u unmount >/dev/null 2>&1 || {
-        echo "pve-nonraid: nmdctl unmount failed" >&2
+    # 'stop' only after 'unmount' succeeded. Stopping the array while a member
+    # filesystem is still mounted pulls the block device out from under a live
+    # filesystem - the very thing this ordered teardown exists to prevent - so
+    # a failed unmount has to stop the sequence rather than be noted and
+    # stepped over.
+    if timeout "$STEP_TIMEOUT" "$NMDCTL" -u unmount >/dev/null 2>&1; then
+        if ! timeout "$STEP_TIMEOUT" "$NMDCTL" -u stop >/dev/null 2>&1; then
+            echo "pve-nonraid: nmdctl stop failed" >&2
+            ok=0
+        fi
+    else
+        echo "pve-nonraid: nmdctl unmount failed; not stopping the array while" \
+            "a member may still be mounted" >&2
         ok=0
-    }
-
-    "$NMDCTL" -u stop >/dev/null 2>&1 || {
-        echo "pve-nonraid: nmdctl stop failed" >&2
-        ok=0
-    }
+    fi
 else
     echo "pve-nonraid: a pool is still mounted or unaccounted for;" \
         "skipping member unmount and array stop" >&2

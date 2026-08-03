@@ -12,6 +12,8 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+mkdir -p "$tmp/bin"
+
 # A fake nmdctl with a per-subcommand exit code, so a test can make one step
 # fail while the others succeed - "every call fails" would not distinguish
 # "stop failed" from "the teardown stopped after the first failure".
@@ -59,12 +61,16 @@ grep -q "nmdctl unmount failed" "$tmp/err" && fail "unmount reported as failed b
 grep -q "teardown incomplete" "$tmp/err" || fail "incomplete teardown not reported"
 grep -qx -- "-u stop" "$tmp/nmdctl.log" || fail "stop was never attempted"
 
-# --- only nmdctl unmount fails -> stop is still attempted -------------------
+# --- nmdctl unmount fails -> stop must NOT be attempted ---------------------
+# Stopping the array while a member filesystem is still mounted pulls the block
+# device out from under a live filesystem, which is the exact thing this
+# ordered teardown exists to prevent. A failed unmount therefore has to end the
+# sequence, not be noted and stepped over.
 make_nmdctl 1 0
 : > "$tmp/array.running"
 run || fail "failed unmount must still exit 0"
 grep -q "nmdctl unmount failed" "$tmp/err" || fail "unmount failure not reported"
-grep -qx -- "-u stop" "$tmp/nmdctl.log" || fail "stop skipped after unmount failed"
+grep -qx -- "-u stop" "$tmp/nmdctl.log" && fail "array stopped with a member possibly still mounted"
 [ -e "$tmp/array.running" ] || fail "failed teardown must keep the marker"
 
 # --- an unmountable pool keeps the marker too -------------------------------
@@ -149,5 +155,30 @@ EOF
 run || fail "foreign pool run should exit 0"
 grep -q "could not unmount" "$tmp/err" && fail "foreign mergerfs pool must not be touched"
 [ ! -e "$tmp/array.running" ] || fail "no pools of ours: marker should be removed"
+
+# --- a wedged umount does not eat the rest of the teardown ------------------
+# systemd's stop timeout kills the whole ExecStop, so one hung umount would
+# take every later pool with it. Each step carries its own bound.
+make_nmdctl 0 0
+: > "$tmp/array.running"
+mkdir -p "$tmp/wedge"
+cat > "$tmp/bin/umount" <<'UMOUNT'
+#!/bin/sh
+case "$1" in
+    *wedge*) sleep 30 ;;
+esac
+exit 1
+UMOUNT
+chmod +x "$tmp/bin/umount"
+cat > "$tmp/mounts" <<EOF
+nonraid-a $tmp/wedge fuse.mergerfs rw 0 0
+EOF
+start=$(date +%s)
+PATH="$tmp/bin:$PATH" PVE_NONRAID_STEP_TIMEOUT=2 \
+    PVE_NONRAID_MOUNTS="$tmp/mounts" PVE_NONRAID_NMDCTL="$tmp/nmdctl" \
+    PVE_NONRAID_MARKER="$tmp/array.running" sh "$script" 2>"$tmp/err"
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -lt 15 ] || fail "a wedged umount was not bounded (took ${elapsed}s)"
+grep -q "could not unmount" "$tmp/err" || fail "wedged umount not reported"
 
 echo "teardown: OK"

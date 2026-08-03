@@ -45,9 +45,25 @@ trap cleanup EXIT HUP INT TERM
 # command's status, so a generator that emitted half a template and then died
 # would still be renamed over the live file by a writer that succeeded.
 new_tmp() {
+    # A symlinked template is refused rather than handled. 'cp -a' preserves a
+    # symlink, so $tmp would become a second link to the SAME target, and the
+    # truncation below would then empty the live template before a single
+    # validation had run - an empty index.html.tpl blanks the entire web
+    # interface.
+    if [ -L "$TPL" ]; then
+        echo "pve-nonraid-gui: $TPL is a symlink; refusing to rewrite it." >&2
+        echo "  Point PVE_NONRAID_TPL at the real file if this is deliberate." >&2
+        return 1
+    fi
     tmp="$TPL.tmp.$$"
-    cp -a "$TPL" "$tmp" || return 1
-    : > "$tmp" || return 1
+    # Fail if it already exists, so a pre-planted path cannot be followed.
+    ( set -o noclobber 2>/dev/null; : > "$tmp" ) 2>/dev/null || {
+        echo "pve-nonraid-gui: $tmp already exists; refusing to overwrite it" >&2
+        tmp=""
+        return 1
+    }
+    # Mode/owner/ACLs from the original, content still empty.
+    cp -a --attributes-only "$TPL" "$tmp" 2>/dev/null || chmod 644 "$tmp"
 }
 
 commit_tmp() {

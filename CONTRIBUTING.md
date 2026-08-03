@@ -12,6 +12,11 @@ keeping work in progress somewhere visible. Do what you like.
 
 Two habits worth keeping anyway, because they have actually bitten here:
 
+- **Driver fixes start on the matching `nonraid-6.X` branch**, not on `main`.
+  `md_nonraid/6.1/`, `6.6/` and `6.18/` on `main` are vendored copies; a fix
+  made only there is lost the next time those copies are refreshed from the
+  branch. Land it on `nonraid-6.X`, then copy it across.
+
 - **Say how you tested it**, even when the answer is "built it, didn't run it". Driver
   and `nmdctl` bugs fail quietly — imports that report success and do nothing, status
   fields that are confidently wrong — so a claim of verification that didn't happen

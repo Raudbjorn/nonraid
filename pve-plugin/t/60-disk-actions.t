@@ -227,7 +227,7 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
         $P->on_update_hook_full('nrpool', $scfg,
             { 'nonraid-unmount-disks' => '/dev/sda' }, undef, {});
     };
-    like($@, qr{carries the system mountpoint '/'}, 'the OS disk is refused');
+    like($@, qr{it is the system mountpoint '/'}, 'the OS disk is refused');
     is_deeply(cmds(), [], 'and nothing is unmounted, not even the EFI partition');
 }
 
@@ -422,6 +422,52 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
     };
     is($@, '', 'a caller with Sys.Modify proceeds');
     like(join(' ', @{ cmds() }), qr{wipefs -a /dev/sdb}, 'and the wipe ran');
+}
+
+# --- unmount must not reach another storage --------------------------------
+#
+# run_disk_actions goes unmount -> wipe in one pass, and wipe_disks re-reads
+# lsblk. So a single call naming the same disk in both lists could unmount
+# another PVE storage's filesystem, observe the disk is no longer mounted, and
+# wipe it - with guests on it. Each step's own guard was right; the sequence
+# walked between them. The unmount guard is what closes it.
+{
+    my $refusal = $P->can('unmount_refusal');
+    my $paths = { '/mnt/pve/otherstore' => 'otherstore', '/srv/backups' => 'bkp' };
+
+    is($refusal->('/mnt/data', $paths), undef, 'an unrelated mountpoint is fine');
+    like($refusal->('/mnt/pve/otherstore', $paths), qr/belongs to the configured storage/,
+        "another storage's own path is refused");
+    like($refusal->('/mnt/pve/otherstore/images', $paths), qr/'otherstore'/,
+        'and so is anything beneath it');
+    like($refusal->('/srv/backups', $paths), qr/'bkp'/,
+        'a storage mounted outside /mnt/pve is refused too');
+    like($refusal->('/', $paths), qr/system mountpoint/, 'system paths still refused');
+    is($refusal->('/mnt/pve/otherstore-not-really', $paths), undef,
+        'a path that merely shares a prefix is not a child');
+}
+
+{
+    # End to end through the hook, with the storage config stubbed.
+    reset_commands();
+    no warnings 'redefine';
+    local *PVE::Storage::Custom::NonRAIDPlugin::configured_storage_paths =
+        sub { return { '/mnt/pve/otherstore' => 'otherstore' } };
+    use warnings 'redefine';
+
+    stub_lsblk('/dev/sdd' => {
+        name => 'sdd', type => 'disk',
+        children => [{ name => 'sdd1', type => 'part', mountpoint => '/mnt/pve/otherstore' }],
+    });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+    eval {
+        $P->on_update_hook_full('nrpool', $scfg,
+            { 'nonraid-unmount-disks' => '/dev/sdd', 'nonraid-wipe-disks' => '/dev/sdd' },
+            undef, {});
+    };
+    like($@, qr/belongs to the configured storage 'otherstore'/,
+        "unmount+wipe in one call cannot launder another storage's disk");
+    is_deeply(cmds(), [], 'and neither the umount nor the wipefs ran');
 }
 
 done_testing();

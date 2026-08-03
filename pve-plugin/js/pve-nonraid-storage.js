@@ -234,14 +234,26 @@
             if (!store) {
                 return;
             }
+            // Clear FIRST, and tag this request. Leaving the previous node's
+            // rows on screen while the new listing is in flight means the
+            // operator can stage - and submit - actions against disks that
+            // belong to a different machine; and two responses arriving out of
+            // order would leave the older one displayed. Only the newest
+            // request may write to the store.
+            var grid;
+            var generation = (panel.nonraidDiskGeneration || 0) + 1;
+            panel.nonraidDiskGeneration = generation;
+            store.removeAll();
             if (!node) {
-                store.removeAll();
                 return;
             }
             Proxmox.Utils.API2Request({
                 url: '/nodes/' + node + '/disks/list',
                 method: 'GET',
                 success: function (response) {
+                    if (panel.nonraidDiskGeneration !== generation) {
+                        return; // a newer node selection has already won
+                    }
                     try {
                         var disks = (response.result && response.result.data) || [];
                         store.loadData(Ext.Array.map(disks, function (d) {
@@ -265,8 +277,24 @@
                         console.warn('pve-nonraid: could not list disks', err);
                     }
                 },
-                failure: function () {
+                failure: function (response) {
+                    if (panel.nonraidDiskGeneration !== generation) {
+                        return;
+                    }
                     store.removeAll();
+                    // Not swallowed: an empty list and "the node did not
+                    // answer" look identical on screen, and the second one is
+                    // the case where an operator must not go on to assign
+                    // disks from it.
+                    var msg = (response && (response.htmlStatus || response.result))
+                        || gettext('unknown error');
+                    grid = panel.down('grid[name=nonraid-disk-manager]');
+                    if (grid) {
+                        grid.getView().emptyText = Ext.String.htmlEncode(
+                            gettext('Could not list this node\'s disks: ') + msg);
+                        grid.getView().refresh();
+                    }
+                    console.warn('pve-nonraid: disk listing failed', msg);
                 },
             });
         };

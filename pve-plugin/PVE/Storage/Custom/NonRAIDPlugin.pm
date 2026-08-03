@@ -855,21 +855,48 @@ sub _ensure_pool_mounted {
     # unmounted from under it, and the check would fork on pvestatd's path.
 }
 
+# The correcting check is owed by the ARRAY, not by the activation that
+# noticed. Tying it to "this invocation moved the array to STARTED" meant an
+# array someone started by hand never got one, and a check that failed to
+# start was never retried - in both cases the marker was rewritten and the
+# reason to correct disappeared with it.
+#
+# Next to the marker rather than under /run: the debt outlives a reboot.
+sub _correction_pending_file {
+    return _marker_file() . '.correct-pending';
+}
+
 sub _post_start_bookkeeping {
     my ($storeid, $scfg, $started, $unclean) = @_;
 
-    # Same handshake nonraid.service uses: a leftover state file means the
-    # previous shutdown never tore the array down cleanly.
-    if ($started && $unclean) {
+    # A leftover marker means the previous shutdown never tore the array down
+    # cleanly. Record the debt durably before the marker is rewritten.
+    if ($unclean && !-e _correction_pending_file()) {
+        if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }
+            && open(my $fh, '>', _correction_pending_file())) {
+            close($fh);
+        }
+    }
+
+    if (-e _correction_pending_file()) {
         syslog('warning', '%s', "storage $storeid: unclean shutdown detected"
             . " - starting correcting parity check");
-        eval {
+        my $ok = eval {
             run_command(
                 [$NMDCTL, '-u', '-s', _scfg_super($scfg), 'check', 'correct'],
                 timeout => 60,
             );
+            1;
         };
-        warn "could not start parity check: $@" if $@;
+        if ($ok) {
+            unlink(_correction_pending_file());
+        } else {
+            # Left in place on purpose: the next activation tries again.
+            syslog('warning', '%s', "storage $storeid: could not start the"
+                . " correcting parity check ($@) - will retry on the next"
+                . " activation");
+            warn "could not start parity check: $@";
+        }
     }
 
     _ensure_bookkeeping($storeid);
@@ -893,8 +920,17 @@ sub _ensure_marker {
     } elsif (!open($fh, '>', $marker)) {
         $err = "$!";
     } else {
-        eval { $fh->flush and $fh->sync };
-        $err = "$!" if !close($fh);
+        # flush and sync both have to be checked, and so does the eval: a
+        # marker that never reached the platter is exactly the marker a crash
+        # loses, and accepting it because close() happened to succeed is how
+        # the correcting check silently stops running.
+        my $durable = eval { $fh->flush && $fh->sync };
+        $err = ($@ || "$!") if !$durable;
+        my $closed = close($fh);
+        $err //= "$!" if !$closed;
+        # A marker we cannot vouch for is worse than none: it reads as "the
+        # array came up cleanly" on the next boot.
+        unlink($marker) if defined($err);
     }
 
     if (defined($err)) {
@@ -1012,6 +1048,46 @@ my sub require_assignable {
         if @problems;
 }
 
+# Mountpoints that belong to a configured PVE storage, as a path => storeid
+# map. Wrapped in eval and split out so the unit tests can stub it: reading the
+# cluster config is not something the pure-helper tests should need.
+sub configured_storage_paths {
+    my $paths = {};
+    my $cfg = eval { PVE::Storage::config() };
+    return $paths if !$cfg || ref($cfg->{ids}) ne 'HASH';
+    for my $sid (keys %{ $cfg->{ids} }) {
+        my $scfg = $cfg->{ids}->{$sid};
+        for my $key (qw(path mountpoint export)) {
+            my $p = $scfg->{$key};
+            $paths->{$p} = $sid if defined($p) && $p ne '';
+        }
+    }
+    return $paths;
+}
+
+# Why a mountpoint may not be unmounted from here, or undef if it may.
+#
+# system_mountpoint() alone was not enough. It covers /, /boot, /usr and the
+# rest, but not /mnt/pve/* - so another PVE storage's filesystem was fair game,
+# and because run_disk_actions goes unmount -> wipe in one pass and wipe_disks
+# re-reads lsblk, a single call could unmount that storage, observe the disk is
+# no longer mounted, and wipe it out from under running guests. Each step's own
+# guard was right; the sequence walked between them.
+sub unmount_refusal {
+    my ($mp, $storage_paths) = @_;
+    return undef if !defined($mp) || $mp eq '';
+
+    return "it is the system mountpoint '$mp'" if system_mountpoint($mp);
+
+    $storage_paths //= {};
+    for my $path (keys %$storage_paths) {
+        next if $path ne $mp && index($mp, "$path/") != 0;
+        return "'$mp' belongs to the configured storage"
+            . " '$storage_paths->{$path}'";
+    }
+    return undef;
+}
+
 my sub unmount_disks {
     my ($storeid, $devs, $st) = @_;
 
@@ -1042,10 +1118,12 @@ my sub unmount_disks {
             ($entry->{mountpoint}, map { $_->{mountpoint} } @children);
 
         # Checked before anything is unmounted, so a disk carrying both a data
-        # filesystem and a system one is refused outright rather than half done.
+        # filesystem and a protected one is refused outright rather than half
+        # done.
+        my $storage_paths = configured_storage_paths();
         for my $mp (@points) {
-            die "'$dev' carries the system mountpoint '$mp'; refusing to"
-                . " unmount it\n" if system_mountpoint($mp);
+            my $why = unmount_refusal($mp, $storage_paths);
+            die "refusing to unmount '$dev': $why\n" if defined($why);
         }
 
         if (!@points) {
@@ -1107,10 +1185,19 @@ my sub create_array {
 
     # One array per node - the superblock is a module parameter - so building
     # one on top of a loaded array would take its disks with it.
-    if ($st && (($st->{mdState} // '') ne '' || nmdstat_num($st->{mdNumDisks}) > 0)) {
+    # Two distinct situations, and the advice differs: a module that is merely
+    # loaded with nothing assigned reports STOPPED with mdNumDisks=0, and
+    # telling that operator to "stop and unassign it" is advice about an array
+    # that does not exist.
+    if ($st && nmdstat_num($st->{mdNumDisks}) > 0) {
         die "an array is already loaded (state '" . ($st->{mdState} // '?')
             . "', superblock '" . ($st->{sbName} // '?') . "'); stop and unassign"
             . " it with nmdctl before building a new one\n";
+    }
+    if ($st && ($st->{mdState} // '') ne '' && ($st->{mdState} // '') ne 'STOPPED') {
+        die "the NonRAID module is in state '$st->{mdState}' with no disks"
+            . " assigned; let it settle (or reload it) before building an"
+            . " array\n";
     }
 
     # Deduped on the resolved path, not the string: /dev/sdb and
@@ -1289,7 +1376,12 @@ sub activate_storage {
         # the path every subsequent cycle takes.
         _ensure_bookkeeping($storeid);
     } else {
-        PVE::Tools::lock_file("/run/lock/pve-nonraid-$storeid.lck", 10, sub {
+        # One lock for the node, not one per storage. The driver holds a
+        # single array - the superblock is a module parameter - so two
+        # storages activating at once would import and start different
+        # superblocks into the same driver. Serialising per storeid let them
+        # do exactly that.
+        PVE::Tools::lock_file("/run/lock/pve-nonraid-array.lck", 10, sub {
             $st = read_nmdstat(); # re-check under the lock
             my $unclean = -e _marker_file();
             my $started = _ensure_array_started($storeid, $scfg, $st);

@@ -42,9 +42,16 @@ for i in $(seq 1 "$DISK_COUNT"); do
         truncate -s "${SIZE_MB}M" "$img"
     fi
 
-    # An image can be attached to more than one loop device; without head -1
-    # loop_dev would become two paths and every use of it below would break.
-    loop_dev=$(losetup -j "$img" | cut -d: -f1 | head -1)
+    # An image can be attached to more than one loop device. Picking one
+    # arbitrarily means operating on whichever mapping happened to sort first -
+    # possibly another process's - and everything below (partitioning, mkfs,
+    # the by-id alias) would then be aimed at it. Ambiguity is refused.
+    existing=$(losetup -j "$img" | cut -d: -f1)
+    count=$(printf '%s\n' "$existing" | grep -c . || true)
+    if [ "$count" -gt 1 ]; then
+        die "$img is attached to $count loop devices ($(printf '%s' "$existing" | tr '\n' ' ')); detach the extras before re-running"
+    fi
+    loop_dev="$existing"
     if [ -z "$loop_dev" ]; then
         loop_dev=$(losetup -fP --show "$img")
     fi

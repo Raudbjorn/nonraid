@@ -146,6 +146,19 @@ fi
 PVE_NONRAID_TPL="$tmp/nopayload.tpl" sh "$tool" status | grep -q MALFORMED \
     || fail "status does not report a block with no loader"
 
+# A symlinked template must be refused, not followed. 'cp -a' preserves a
+# symlink, so the temp file would have been a second link to the same target
+# and the truncation would have emptied the live template - which blanks the
+# whole web UI, not just the Add menu.
+cp "$pristine" "$tmp/real.tpl"
+ln -sf "$tmp/real.tpl" "$tmp/link.tpl"
+before=$(wc -c < "$tmp/real.tpl")
+if PVE_NONRAID_TPL="$tmp/link.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply followed a symlinked template"
+fi
+[ "$(wc -c < "$tmp/real.tpl")" = "$before" ] || fail "the symlink target was modified"
+grep -q 'BEGIN pve-nonraid-gui' "$tmp/real.tpl" && fail "block injected through a symlink"
+
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
     || fail "status on a missing template should report it"

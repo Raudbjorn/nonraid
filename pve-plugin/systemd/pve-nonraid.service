@@ -19,6 +19,12 @@ Documentation=https://github.com/Raudbjorn/nonraid
 Requires=local-fs.target
 After=pve-cluster.service pve-storage.target
 Before=pve-guests.service
+# Before=pvestatd too, which is about SHUTDOWN rather than boot: systemd stops
+# units in reverse order, so ordering ahead of pvestatd at start means pvestatd
+# is already stopped when our ExecStop runs. Without it pvestatd keeps polling
+# through the teardown and re-activates the storage - starting the array again
+# behind the script that is trying to stop it.
+Before=pvestatd.service
 
 [Service]
 Type=oneshot

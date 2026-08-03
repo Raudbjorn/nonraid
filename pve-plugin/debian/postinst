@@ -12,23 +12,32 @@ host_actions() {
     [ -z "${DPKG_ROOT:-}" ]
 }
 
+# The template lives in the tree being built, not necessarily this host's.
+# Skipping the injection entirely under DPKG_ROOT left the produced image
+# permanently without the GUI integration it advertises; pointing the tool at
+# the target does the filesystem half correctly while the service restarts
+# below stay guarded.
+gui() {
+    PVE_NONRAID_TPL="${DPKG_ROOT:-}/usr/share/pve-manager/index.html.tpl" \
+        "${DPKG_ROOT:-}/usr/share/pve-nonraid/pve-nonraid-gui" "$@"
+}
+
 # configure: fresh install/upgrade of this package.
 # triggered: another package (pve-manager) replaced index.html.tpl.
 # The GUI injection is cosmetic - never fail the dpkg run over it.
 case "$1" in
     configure)
+        gui apply || true
         if host_actions; then
-            /usr/share/pve-nonraid/pve-nonraid-gui apply || true
+            # invoke-rc.d, not systemctl: it honours policy-rc.d, which is how
+            # a chroot or an image build says "do not start services here".
             for s in pvedaemon pvestatd pveproxy pvescheduler; do
-                systemctl try-restart "$s.service" >/dev/null 2>&1 || true
+                invoke-rc.d --quiet "$s" try-restart >/dev/null 2>&1 || true
             done
         fi
         ;;
     triggered)
-        # See prerm: an && list that ends false becomes the script's status.
-        if host_actions; then
-            /usr/share/pve-nonraid/pve-nonraid-gui apply || true
-        fi
+        gui apply || true
         ;;
 esac
 
