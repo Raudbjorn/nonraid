@@ -37,6 +37,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # The job never pushes or fetches after checkout; no reason to leave
+          # the token sitting in .git/config for the rest of the run.
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -49,7 +52,7 @@ jobs:
         # tools/debian/ and debian/rules refuses a changelog that disagrees
         # with nmdctl's VERSION=.
         run: |
-          VERSION=$(grep '^VERSION=' tools/nmdctl | cut -d= -f2 | tr -d '"')
+          VERSION=$(grep '^VERSION=' tools/nmdctl | head -1 | cut -d= -f2 | tr -d '"')
           test -n "$VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 

@@ -13,7 +13,7 @@ in_image '
     test -f ../nonraid-dkms_*.deb
 
     echo ">>> nonraid-tools (bare build: units are committed, rules checks the manifest)"
-    VERSION=$(grep "^VERSION=" tools/nmdctl | cut -d= -f2 | tr -d "\"")
+    VERSION=$(grep "^VERSION=" tools/nmdctl | head -1 | cut -d= -f2 | tr -d "\"")
     test -n "$VERSION"
     cd tools && dpkg-buildpackage -b -us -uc >/dev/null 2>&1 && cd ..
     deb=$(ls nonraid-tools_*.deb | head -1)
