@@ -80,7 +80,10 @@
                     {
                         xtype: 'pveContentTypeSelector',
                         name: 'content',
-                        value: ['images'],
+                        // Matches plugindata()'s default content set; 'images'
+                        // alone would silently exclude container rootfs for
+                        // GUI-created storage only.
+                        value: ['images', 'rootdir'],
                         multiSelect: true,
                         fieldLabel: gettext('Content'),
                         allowBlank: false,
@@ -104,7 +107,15 @@
                     if (f.uncheckedValue !== undefined) {
                         field.uncheckedValue = f.uncheckedValue;
                     }
-                    if (f.checked !== undefined && me.isCreate) {
+                    // Unconditional: a checkbox whose key is absent from the
+                    // config must render the BACKEND default, not unchecked.
+                    // The panel defines onGetValues, which forces
+                    // InputPanel.getValues(dirtyOnly=false), so every field is
+                    // submitted on save - an unchecked box would persist
+                    // uncheckedValue and silently flip the setting during an
+                    // edit that only touched something else. When the key IS
+                    // present, setValues overrides this after render.
+                    if (f.checked !== undefined) {
                         field.checked = f.checked;
                     }
                     if (f.deleteEmptyOnEdit) {
