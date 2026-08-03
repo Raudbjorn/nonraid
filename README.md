@@ -92,8 +92,14 @@ cd tools && bats tests/
 ```
 
 `.github/workflows/ci.yml` runs both, plus a guard that packaging variables stay out of
-`make modules`. Upstream's heavier DKMS build matrix, integration lifecycle and
-package-publishing workflows are not carried here — see upstream if you need them.
+`make modules`, a DKMS module build on Debian 12/13 and Ubuntu 24.04, and a loop-device
+array lifecycle (create, sync, write, fail a disk, rebuild, verify). Upstream's
+package-publishing and release workflows are not carried here — see upstream if you need
+them.
+
+`.github/workflows/pve-plugin-tests.yml` covers the Proxmox VE plugin: unit tests, GUI
+lint and template round-trip, a package build, and an install/trigger/remove/purge cycle
+against the PVE 9 repository.
 
 ## Contributing
 

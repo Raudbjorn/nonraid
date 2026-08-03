@@ -83,9 +83,18 @@ validate_config() {
         die "refusing to use '$MOUNT_PREFIX' as the mount prefix: it resolves to /"
 
     case "$WORKDIR" in
-        /|/dev|/etc|/usr|/var|/home|/boot|/root) die "refusing to use $WORKDIR as the test workdir" ;;
         /*) ;;
         *) die "NONRAID_TEST_WORKDIR must be an absolute path" ;;
+    esac
+    # Resolve before the deny-list, and keep the resolved value: "/root/../etc"
+    # is absolute, matches no entry literally, and still lands on /etc - which
+    # teardown would then delete files from. Everything downstream derives its
+    # paths from WORKDIR, so replacing it here closes the same hole for
+    # teardown_disk.sh rather than only for this check.
+    WORKDIR=$(readlink -m "$WORKDIR")
+    case "$WORKDIR" in
+        /|/dev|/etc|/usr|/usr/*|/var|/home|/boot|/root|/bin|/sbin|/lib|/lib/*|/proc|/sys)
+            die "refusing to use $WORKDIR as the test workdir" ;;
     esac
 
     [[ "$DISK_COUNT" =~ ^[0-9]+$ ]] || die "NONRAID_TEST_DISKS must be a number"
@@ -96,10 +105,8 @@ validate_config() {
     # The superblock and the offsets file must live inside the directory this
     # harness owns, or teardown would delete files it did not create - a real
     # /nonraid.dat, or the offsets of a live array.
-    local wd_real
-    wd_real=$(readlink -m "$WORKDIR")
-    require_inside_workdir "$wd_real" "$SUPERBLOCK_FILE" NONRAID_TEST_SUPERBLOCK
-    require_inside_workdir "$wd_real" "$OFFSETS_FILE" NONRAID_TEST_OFFSETS_FILE
+    require_inside_workdir "$WORKDIR" "$SUPERBLOCK_FILE" NONRAID_TEST_SUPERBLOCK
+    require_inside_workdir "$WORKDIR" "$OFFSETS_FILE" NONRAID_TEST_OFFSETS_FILE
 }
 
 # Usage: require_inside_workdir <resolved workdir> <path> <variable name>

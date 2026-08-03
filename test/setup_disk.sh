@@ -42,7 +42,9 @@ for i in $(seq 1 "$DISK_COUNT"); do
         truncate -s "${SIZE_MB}M" "$img"
     fi
 
-    loop_dev=$(losetup -j "$img" | cut -d: -f1)
+    # An image can be attached to more than one loop device; without head -1
+    # loop_dev would become two paths and every use of it below would break.
+    loop_dev=$(losetup -j "$img" | cut -d: -f1 | head -1)
     if [ -z "$loop_dev" ]; then
         loop_dev=$(losetup -fP --show "$img")
     fi
@@ -67,7 +69,10 @@ for i in $(seq 1 "$DISK_COUNT"); do
     fi
 
     # Never clobber an existing by-id alias: it could belong to a real disk.
-    if [ -e "/dev/disk/by-id/$linkname" ] && ! grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null; then
+    # -L as well as -e, or a dangling symlink (a real disk that is currently
+    # detached) reads as absent and the ln -sf below silently repoints it.
+    if { [ -e "/dev/disk/by-id/$linkname" ] || [ -L "/dev/disk/by-id/$linkname" ]; } &&
+       ! grep -qxF "/dev/disk/by-id/$linkname" "$OWNED_LINKS" 2>/dev/null; then
         die "/dev/disk/by-id/$linkname already exists and is not ours; choose another NONRAID_TEST_PREFIX"
     fi
     ln -s "$loop_dev" "/dev/disk/by-id/$linkname" 2>/dev/null || ln -sf "$loop_dev" "/dev/disk/by-id/$linkname"
