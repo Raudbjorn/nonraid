@@ -16,7 +16,7 @@ Two habits worth keeping anyway, because they have actually bitten here:
   and `nmdctl` bugs fail quietly — imports that report success and do nothing, status
   fields that are confidently wrong — so a claim of verification that didn't happen
   costs more than no claim at all.
-- **Keep driver diffs small.** `md_nonraid/6.1/`, `6.6/`, `6.12/` on `main` are vendored
+- **Keep driver diffs small.** `md_nonraid/6.1/`, `6.6/`, `6.18/` on `main` are vendored
   copies of the `nonraid-6.X` branches, and those get rebased onto new upstream drops.
   Every extra line is friction later.
 
