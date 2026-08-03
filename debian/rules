@@ -7,6 +7,26 @@ include /usr/share/dpkg/pkg-info.mk
 export DEB_SOURCE
 export DEB_VERSION_UPSTREAM
 
+# dh_dkms takes the module version from dkms.conf's PACKAGE_VERSION. Derive the
+# usr/src install path from that same field so the sources and dkms.conf always
+# land in one directory; using DEB_VERSION_UPSTREAM here split them across two
+# (usr/src/$(DEB_SOURCE)-{changelog,dkms.conf}) and produced a package whose
+# postinst ran dkms against a directory holding nothing but dkms.conf.
+DKMS_VERSION := $(shell sed -n 's/^PACKAGE_VERSION=//p' dkms.conf | tr -d '"')
+ifeq ($(DKMS_VERSION),)
+$(error could not read PACKAGE_VERSION from dkms.conf)
+endif
+export DKMS_VERSION
+
+# Upstream never bumps debian/changelog: CI installs DKMS by hand from dkms.conf
+# and so never builds the .deb, which is how the split above went unnoticed.
+# Overriding the version at dh_gencontrol is not enough, because dpkg-genchanges
+# and dpkg-genbuildinfo still name their output from the changelog. So require
+# the two to agree, and fail loudly rather than silently shipping a stale one.
+ifneq ($(DKMS_VERSION),$(DEB_VERSION_UPSTREAM))
+$(error debian/changelog is at $(DEB_VERSION_UPSTREAM) but dkms.conf PACKAGE_VERSION is $(DKMS_VERSION); run: dch -v $(DKMS_VERSION)-1)
+endif
+
 %:
 	dh $@ --parallel
 
