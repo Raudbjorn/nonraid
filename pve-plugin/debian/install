@@ -1,4 +1,5 @@
 PVE/Storage/Custom/NonRAIDPlugin.pm usr/share/perl5/PVE/Storage/Custom
 js/pve-nonraid-storage.js usr/share/pve-manager/js
 bin/pve-nonraid-gui usr/share/pve-nonraid
+bin/pve-nonraid-teardown usr/share/pve-nonraid
 systemd/pve-nonraid.service usr/lib/systemd/system
