@@ -88,6 +88,13 @@ from a cold array; degraded autostart with parity-emulated reads (md5-clean
 through mergerfs); the fail-stop refusal; a full unassign/replace/RECON_DISK
 rebuild; a guest with `cache=none,aio=native` qcow2 on the pool surviving
 reboots with data intact, plus qcow2 snapshot/rollback; ordered shutdown
-teardown; the dpkg trigger on a pve-manager reinstall; and the Add/Edit
-dialogs in a real browser. Untested: PVE kernel 7.x with dkms 1.4.0,
-multi-node clusters, and parity-check impact on guest latency.
+teardown; the dpkg trigger on a pve-manager reinstall; the Add/Edit dialogs
+in a real browser; a purge/reinstall cycle (config and running guests
+survive, `pvesm` degrades to an "unsupported type" warning); and the same
+stack rebooted onto PVE's default kernel line - 7.0.14-8-pve with
+nonraid-dkms 1.4.0 - with the array, pool, guest and all payloads intact.
+
+Parity-check impact, measured on that rig (virtual disks - deltas are
+directional only): guest streaming reads dropped ~40% while the check ran,
+direct writes ~10%, and 4k fsync latency was unchanged. Untested:
+multi-node clusters.
