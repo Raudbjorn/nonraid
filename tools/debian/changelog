@@ -1,5 +1,6 @@
-nonraid-tools (1.0.0-1) stable; urgency=medium
+nonraid-tools (1.23.0-1) stable; urgency=medium
 
-  * NonRAID tools Debian Package
+  * Reconcile the Debian package version with tools/nmdctl (1.23.0).
+  * Preserve the tools package as GPL-2.0-only.
 
- -- Matti Hiljanen <matti@hiljanen.com>  Mon, 21 Jul 2025 00:47:04 +0200
+ -- Matti Hiljanen <matti@hiljanen.com>  Mon, 03 Aug 2026 00:00:00 +0000

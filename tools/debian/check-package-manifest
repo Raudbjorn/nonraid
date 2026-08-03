@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright 2026 Sveinbjörn Geirsson
+
+set -eu
+
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    echo "usage: $0 <nonraid-tools.deb>" >&2
+    exit 2
+fi
+
+manifest=$(mktemp)
+trap 'rm -f "$manifest"' EXIT HUP INT TERM
+dpkg-deb --fsys-tarfile "$1" | tar -tf - >"$manifest"
+
+expected_paths='
+./usr/bin/nmdctl
+./etc/default/nonraid
+./usr/lib/systemd/system/nonraid.service
+./usr/lib/systemd/system/nonraid-parity-check.service
+./usr/lib/systemd/system/nonraid-parity-check.timer
+./usr/lib/systemd/system/nonraid-notify.service
+./usr/lib/systemd/system/nonraid-notify.timer
+./usr/lib/udev/rules.d/90-nonraid.rules
+'
+
+printf '%s\n' "$expected_paths" | while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    count=$(grep -Fxc -- "$path" "$manifest" || :)
+    if [ "$count" -ne 1 ]; then
+        echo "$path: expected exactly once in $1, found $count" >&2
+        exit 1
+    fi
+done
+
+for unit in \
+    nonraid.service \
+    nonraid-parity-check.service \
+    nonraid-parity-check.timer \
+    nonraid-notify.service \
+    nonraid-notify.timer
+do
+    count=$(grep -Fc -- "/$unit" "$manifest" || :)
+    if [ "$count" -ne 1 ]; then
+        echo "$unit: duplicate or missing unit payload in $1 (found $count)" >&2
+        exit 1
+    fi
+done

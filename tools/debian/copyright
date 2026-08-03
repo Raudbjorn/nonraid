@@ -1,13 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: nonraid-tools
-Source: https://github.com/qvr/nonraid
+Source: https://github.com/Raudbjorn/nonraid
 
 Files: *
 Copyright:
-  Copyright by respective authors and contributors.
-License: GPL-2
-
-License: GPL-2
+ Copyright by the respective file authors and contributors.
+License: GPL-2.0-only
  This program is free software; you can redistribute it and/or modify it
  under the terms of version 2 of the GNU General Public License as
  published by the Free Software Foundation.

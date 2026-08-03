@@ -1,5 +1,10 @@
 name: PVE plugin tests
 
+# NOTE: GitHub Actions is DELIBERATELY DISABLED on this fork. This workflow is
+# kept for parity (and in case Actions is ever enabled), but the ENFORCED
+# version of these checks lives in checks/ and runs from .githooks/pre-push on
+# every push. If you change a job here, change the matching checks/ script.
+
 on:
   pull_request:
     paths:
@@ -171,17 +176,11 @@ jobs:
         # which a version bound written against nmdctl's own VERSION string
         # (1.23.0) rather than the package version (1.0.0-1) was not.
         #
-        # The synthesis below is what the release workflow used to do before it
-        # was removed; debhelper looks for these names under tools/debian/.
+        # No synthesis: the unit copies are committed under tools/debian/ and
+        # the changelog carries the real version (debian/rules enforces the
+        # match against nmdctl's VERSION=).
         run: |
           cd /work/tools
-          cp systemd/nonraid.service debian/nonraid-tools.nonraid.service
-          cp systemd/nonraid.default debian/nonraid-tools.nonraid.default
-          cp systemd/nonraid-parity-check.service debian/nonraid-tools.nonraid-parity-check.service
-          cp systemd/nonraid-parity-check.timer debian/nonraid-tools.nonraid-parity-check.timer
-          cp systemd/nonraid-notify.service debian/nonraid-tools.nonraid-notify.service
-          cp systemd/nonraid-notify.timer debian/nonraid-tools.nonraid-notify.timer
-          cp udev/nonraid.udev debian/nonraid-tools.nonraid.udev
           dpkg-buildpackage -b -us -uc
           tools_deb=$(find /work -name 'nonraid-tools_*.deb' | head -1)
           test -n "$tools_deb"

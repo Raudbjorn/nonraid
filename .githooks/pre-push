@@ -1,57 +1,78 @@
 #!/bin/sh
-# Local gate, run before every push. GitHub Actions has never executed on this
-# fork, so this hook is the only thing standing between a broken tree and the
-# remote - it runs the same checks the workflows declare.
+# The gate every push passes through. GitHub Actions is DELIBERATELY DISABLED
+# on this fork, so the checks under checks/ are the CI, and this hook is what
+# runs them. Tiered the way the workflows' paths: filters were:
 #
-# Bypass for an emergency push: git push --no-verify
-# Install (once per clone):    git config core.hooksPath .githooks
+#   fast tier    always                      (~12s: lint + unit suites)
+#   package tier pve-plugin/** or tools/**  (docker: build all three debs)
+#   PVE tier     pve-plugin/** or tools/**  (docker: apt install + load + lifecycle)
+#
+# The heavy tiers run in a prebuilt image (first run builds it, ~5 min; after
+# that tens of seconds). Escapes, in order of preference:
+#   NONRAID_PUSH_FAST=1 git push   - fast tier only, says so loudly
+#   git push --no-verify           - no gate at all, for emergencies
+#
+# Install (once per clone): git config core.hooksPath .githooks
 set -u
 
-here=$(git rev-parse --show-toplevel)
-cd "$here" || exit 1
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
 
-fail=0
-step() {
-    name="$1"; shift
-    printf '>>> %s ... ' "$name"
-    if out=$("$@" 2>&1); then
-        echo "ok"
+# What is being pushed? pre-push gets "<local ref> <local sha> <remote ref>
+# <remote sha>" per ref on stdin. Collect the union of changed paths; a
+# deleted remote ref or an up-to-date one contributes nothing.
+zero=0000000000000000000000000000000000000000
+changed=""
+while read -r _ local_sha _ remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue    # deleting a remote ref
+    if [ "$remote_sha" = "$zero" ]; then
+        # New remote branch: diff against where it forked from main, falling
+        # back to everything reachable if there is no main to compare with.
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null \
+            || git merge-base "$local_sha" fork/main 2>/dev/null) || base=""
     else
-        echo "FAIL"
-        printf '%s\n' "$out" | tail -20
-        fail=1
+        base="$remote_sha"
     fi
-}
-
-# A missing tool fails the push rather than skipping the check: this hook
-# replaces CI, and a skipped check that reports nothing reads as a pass.
-for tool in shellcheck perl prove bats node; do
-    command -v "$tool" >/dev/null 2>&1 || {
-        echo "pre-push: '$tool' is not installed; the gate cannot run." >&2
-        echo "  Install it, or bypass deliberately with: git push --no-verify" >&2
-        exit 1
-    }
+    if [ -n "$base" ]; then
+        changed="$changed
+$(git diff --name-only "$base" "$local_sha" 2>/dev/null)"
+    else
+        changed="ALL"
+    fi
 done
 
-step "shellcheck nmdctl"      shellcheck -x tools/nmdctl
-step "shellcheck plugin bins" shellcheck -x pve-plugin/bin/pve-nonraid-gui pve-plugin/bin/pve-nonraid-teardown
-step "shellcheck maintainer"  shellcheck -x pve-plugin/debian/postinst pve-plugin/debian/prerm pve-plugin/debian/postrm
-step "shellcheck harness"     shellcheck -x test/lib.sh test/setup_disk.sh test/teardown_disk.sh test/mk_array.sh
-step "bash -n nmdctl"         bash -n tools/nmdctl
-step "node --check GUI js"    node --check pve-plugin/js/pve-nonraid-storage.js
-step "perl syntax (stubbed)"  perl -c -I pve-plugin/t/lib -I pve-plugin pve-plugin/PVE/Storage/Custom/NonRAIDPlugin.pm
-step "prove pve-plugin/t"     prove -q pve-plugin/t/
-step "tpl-roundtrip"          sh pve-plugin/t/tpl-roundtrip.sh
-step "teardown"               sh pve-plugin/t/teardown.sh
+touches() {
+    [ "$changed" = "ALL" ] && return 0
+    echo "$changed" | grep -qE "$1"
+}
 
-# The bats suite is the slowest step (~10s); it still belongs here, because
-# nmdctl is where the real-world risk lives.
-step "bats tools/tests"       sh -c 'cd tools && bats tests/'
-
-if [ "$fail" -ne 0 ]; then
-    echo
-    echo "pre-push: the gate failed; nothing was pushed." >&2
-    echo "  Fix the failures above, or bypass deliberately: git push --no-verify" >&2
+echo "pre-push: fast tier"
+sh checks/fast.sh || {
+    echo "pre-push: the fast tier failed; nothing was pushed." >&2
     exit 1
+}
+
+if [ "${NONRAID_PUSH_FAST:-0}" = 1 ]; then
+    echo "pre-push: NONRAID_PUSH_FAST=1 - SKIPPING the package and PVE tiers." >&2
+    echo "  This push is gated by lint and unit tests only." >&2
+    exit 0
 fi
+
+if touches '^(pve-plugin/|tools/|debian/|dkms\.conf|Makefile)'; then
+    echo "pre-push: package tier (docker)"
+    sh checks/debs.sh || {
+        echo "pre-push: the package tier failed; nothing was pushed." >&2
+        exit 1
+    }
+fi
+
+if touches '^(pve-plugin/|tools/)'; then
+    echo "pre-push: PVE tier (docker)"
+    sh checks/pve-load.sh || {
+        echo "pre-push: the PVE tier failed; nothing was pushed." >&2
+        exit 1
+    }
+fi
+
+echo "pre-push: gate passed"
 exit 0

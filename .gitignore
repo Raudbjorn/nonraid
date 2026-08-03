@@ -26,7 +26,10 @@ tools/debian/tmp/
 tools/debian/nonraid-tools/
 # Synthesized at build time from tools/systemd and tools/udev, never edited in
 # place (see CLAUDE.md).
-tools/debian/nonraid-tools.*
+# tools/debian/nonraid-tools.* used to be synthesis by-products and were
+# ignored; they are now COMMITTED source (checks/fast.sh guards them against
+# tools/systemd). Only the debhelper debug log stays ignored.
+tools/debian/nonraid-tools.*.debhelper
 pve-plugin/debian/files
 pve-plugin/debian/*.substvars
 pve-plugin/debian/*.debhelper

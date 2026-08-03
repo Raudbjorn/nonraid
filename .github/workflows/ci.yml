@@ -1,5 +1,10 @@
 name: CI
 
+# NOTE: GitHub Actions is DELIBERATELY DISABLED on this fork. This workflow is
+# kept for parity (and in case Actions is ever enabled), but the ENFORCED
+# version of these checks lives in checks/ and runs from .githooks/pre-push on
+# every push. If you change a job here, change the matching checks/ script.
+
 # Trimmed from upstream's five workflows, but not to the point of proving
 # nothing. Upstream's release/publishing jobs are gone (this fork ships no
 # releases); the module build and an end-to-end array lifecycle are kept,

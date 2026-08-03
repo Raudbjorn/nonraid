@@ -10,11 +10,19 @@ keeping work in progress somewhere visible. Do what you like.
   beats a branch on someone's laptop.
 - Batch or split changes however suits you.
 
-**One-time setup:** `git config core.hooksPath .githooks`. That wires up a
-pre-push gate (shellcheck, both test suites, syntax checks, ~12s) so a broken
-tree never reaches the remote — it exists because GitHub Actions sat disabled
-on this fork for the first six review rounds and nobody noticed. Bypass in an
-emergency with `git push --no-verify`.
+**One-time setup:** `git config core.hooksPath .githooks`. GitHub Actions is
+*deliberately disabled* on this fork; the scripts under `checks/` are the CI,
+and the hooks are what run them:
+
+- `pre-commit` applies mechanical fixes to what you are committing (trailing
+  whitespace, final newline, exec bit on shebang scripts) — vendored driver
+  copies and the `tools/debian` unit copies are never touched.
+- `pre-push` runs `checks/fast.sh` always (~12s), and the docker-based
+  package + PVE lifecycle tiers when the push touches what they cover. First
+  heavy run builds a container image (~5 min); after that, tens of seconds.
+
+Escapes: `NONRAID_PUSH_FAST=1 git push` skips the docker tiers loudly;
+`git push --no-verify` skips everything, for emergencies.
 
 Two habits worth keeping anyway, because they have actually bitten here:
 
