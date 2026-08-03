@@ -44,4 +44,49 @@ if PVE_NONRAID_TPL="$tmp/noanchor.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply 2>
     fail "apply succeeded without anchor"
 fi
 
+# pveproxy reads this template as www-data. A restrictive umask (an admin
+# running apply by hand) must not leave it unreadable - that would blank the
+# entire web UI, not just the Add-menu entry.
+cp "$pristine" "$tmp/work.tpl"
+chmod 644 "$tmp/work.tpl"
+( umask 077; PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null )
+mode=$(stat -c '%a' "$tmp/work.tpl")
+[ "$mode" = "644" ] || fail "apply under umask 077 changed the template mode to $mode"
+( umask 077; PVE_NONRAID_VER=1.0.0 sh "$tool" remove >/dev/null )
+mode=$(stat -c '%a' "$tmp/work.tpl")
+[ "$mode" = "644" ] || fail "remove under umask 077 changed the template mode to $mode"
+
+# A malformed block (BEGIN without END) must not be "removed" - the range
+# delete would take the rest of the template with it.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+grep -v 'END pve-nonraid-gui' "$tmp/work.tpl" > "$tmp/broken.tpl"
+before=$(wc -l < "$tmp/broken.tpl")
+if PVE_NONRAID_TPL="$tmp/broken.tpl" PVE_NONRAID_VER=2.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply accepted a template with an unterminated block"
+fi
+[ "$(wc -l < "$tmp/broken.tpl")" = "$before" ] || fail "malformed template was modified"
+PVE_NONRAID_TPL="$tmp/broken.tpl" sh "$tool" status | grep -q MALFORMED \
+    || fail "status does not report a malformed block"
+
+# Only the first anchor gets a block, so a second (or commented-out) loader
+# line cannot produce duplicates.
+cp "$pristine" "$tmp/work.tpl"
+awk '{ print } /pvemanagerlib/ && !d { print "    <!-- " $0 " -->"; d = 1 }' \
+    "$tmp/work.tpl" > "$tmp/twoanchors.tpl"
+PVE_NONRAID_TPL="$tmp/twoanchors.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+[ "$(grep -c 'BEGIN pve-nonraid-gui' "$tmp/twoanchors.tpl")" = 1 ] \
+    || fail "two anchor matches produced more than one block"
+
+# A missing template is a diagnosis, not a crash.
+PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
+    || fail "status on a missing template should report it"
+if PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" apply 2>/dev/null; then
+    fail "apply on a missing template should fail"
+fi
+
+# No temp files left behind anywhere above.
+leftovers=$(find "$tmp" -name '*.tmp.*' | wc -l)
+[ "$leftovers" = 0 ] || fail "$leftovers temp file(s) left behind"
+
 echo "tpl-roundtrip: OK"

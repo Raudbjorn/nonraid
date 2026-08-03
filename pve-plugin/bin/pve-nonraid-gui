@@ -11,13 +11,42 @@
 # Usage: pve-nonraid-gui apply|remove|status
 set -eu
 
+# pveproxy serves this template as www-data. Rewrites below preserve the
+# original file's mode by writing through a copy of it, but a defensive umask
+# covers the paths that create a file from scratch - an operator running this
+# by hand under a restrictive umask must not end up with a template pveproxy
+# cannot read, which would blank the whole web interface rather than just the
+# Add-menu entry.
+umask 022
+
 TPL="${PVE_NONRAID_TPL:-/usr/share/pve-manager/index.html.tpl}"
 JS_URL="/pve2/js/pve-nonraid-storage.js"
 JS_FILE="/usr/share/pve-manager/js/pve-nonraid-storage.js"
 ANCHOR='src="/pve2/js/pvemanagerlib.js'
 MARK="pve-nonraid-gui"
+BAK="$TPL.pve-nonraid.bak"
 
 VER="${PVE_NONRAID_VER:-$(dpkg-query -W -f '${Version}' libpve-storage-nonraid-perl 2>/dev/null || echo dev)}"
+
+tmp=""
+# Must end successfully: the exit trap's status becomes the script's, so a
+# bare test that happens to be false would turn every clean run into a failure.
+cleanup() {
+    [ -n "$tmp" ] && rm -f "$tmp"
+    return 0
+}
+trap cleanup EXIT HUP INT TERM
+
+# Rewrites go through a copy of the original so mode, owner and ACLs survive;
+# truncating that copy keeps its inode metadata, and the rename is atomic.
+rewrite() {
+    tmp="$TPL.tmp.$$"
+    cp -a "$TPL" "$tmp"
+    : > "$tmp"
+    cat > "$tmp"
+    mv "$tmp" "$TPL"
+    tmp=""
+}
 
 # The injected block is indented to match the surrounding markup, so both
 # matchers must tolerate leading whitespace.
@@ -25,24 +54,41 @@ applied_version() {
     sed -n "s/^[[:space:]]*<!-- BEGIN $MARK \(.*\) -->\$/\1/p" "$TPL" | head -1
 }
 
+count_marker() {
+    grep -c "<!-- $1 $MARK" "$TPL" 2>/dev/null || true
+}
+
+# A half-written block (BEGIN without END, or several of either) means someone
+# or something mangled the template. Removing a range whose END is missing
+# would take the rest of the template with it, so refuse instead: the backup
+# is right there, and the plugin does not need the GUI to work.
+check_block_sane() {
+    begins=$(count_marker BEGIN)
+    ends=$(count_marker END)
+    [ "$begins" = "$ends" ] && [ "$begins" -le 1 ] && return 0
+    echo "pve-nonraid-gui: $TPL has a malformed marker block" \
+        "($begins BEGIN, $ends END); refusing to touch it." >&2
+    echo "  Restore $BAK or reinstall pve-manager, then re-run apply." >&2
+    return 1
+}
+
 remove_block() {
-    tmp="$TPL.tmp.$$"
     awk -v mark="$MARK" '
         index($0, "<!-- BEGIN " mark " ") { skip = 1; next }
         index($0, "<!-- END " mark " -->") { skip = 0; next }
         !skip { print }
-    ' "$TPL" > "$tmp"
-    mv "$tmp" "$TPL"
+    ' "$TPL" | rewrite
 }
 
 apply() {
-    [ -w "$TPL" ] || { echo "$TPL is not writable" >&2; return 1; }
+    [ -f "$TPL" ] || { echo "pve-nonraid-gui: $TPL does not exist" >&2; return 1; }
+    [ -w "$TPL" ] || { echo "pve-nonraid-gui: $TPL is not writable" >&2; return 1; }
+    check_block_sane || return 1
 
     cur=$(applied_version)
     if [ "$cur" = "$VER" ]; then
         return 0
     fi
-    [ -n "$cur" ] && remove_block
 
     if ! grep -qF "$ANCHOR" "$TPL"; then
         echo "pve-nonraid-gui: anchor line ($ANCHOR) not found in $TPL;" >&2
@@ -51,37 +97,51 @@ apply() {
         return 1
     fi
 
-    cp -a "$TPL" "$TPL.pve-nonraid.bak"
+    # Back up what was there on entry, before any stale block is stripped -
+    # otherwise the upgrade path would save an already-modified template.
+    cp -a "$TPL" "$BAK"
 
-    tmp="$TPL.tmp.$$"
+    [ -n "$cur" ] && remove_block
+
+    # Only the first anchor is followed: pve-manager ships one loader today,
+    # but appending after every match would inject duplicate blocks if that
+    # ever changes (or if a commented-out loader line appears).
     awk -v anchor="$ANCHOR" -v mark="$MARK" -v ver="$VER" -v url="$JS_URL" '
         { print }
-        index($0, anchor) {
+        !done && index($0, anchor) {
             print "    <!-- BEGIN " mark " " ver " -->"
             print "    <script type=\"text/javascript\" src=\"" url "?ver=" ver "\"></script>"
             print "    <!-- END " mark " -->"
+            done = 1
         }
-    ' "$TPL" > "$tmp"
-    mv "$tmp" "$TPL"
+    ' "$TPL" | rewrite
     echo "pve-nonraid-gui: applied ($VER)"
 }
 
 remove() {
     [ -f "$TPL" ] || return 0
-    if [ -n "$(applied_version)" ]; then
-        remove_block
-        echo "pve-nonraid-gui: removed"
-    fi
+    [ -n "$(applied_version)" ] || return 0
+    check_block_sane || return 1
+    remove_block
+    echo "pve-nonraid-gui: removed"
 }
 
 status() {
-    cur=$(applied_version)
-    if [ -z "$cur" ]; then
-        echo "tpl: absent"
-    elif [ "$cur" = "$VER" ]; then
-        echo "tpl: applied ($cur)"
+    if [ ! -f "$TPL" ]; then
+        echo "tpl: MISSING ($TPL)"
     else
-        echo "tpl: stale (applied $cur, package $VER)"
+        cur=$(applied_version)
+        if [ -z "$cur" ]; then
+            echo "tpl: absent"
+        elif [ "$cur" = "$VER" ]; then
+            echo "tpl: applied ($cur)"
+        else
+            echo "tpl: stale (applied $cur, package $VER)"
+        fi
+        begins=$(count_marker BEGIN)
+        ends=$(count_marker END)
+        [ "$begins" = "$ends" ] && [ "$begins" -le 1 ] \
+            || echo "tpl: MALFORMED ($begins BEGIN, $ends END)"
     fi
     if [ -f "$JS_FILE" ]; then
         echo "js: present"
