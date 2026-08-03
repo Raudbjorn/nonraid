@@ -1,0 +1,34 @@
+[Unit]
+Description=NonRAID array activation/teardown ordering for Proxmox VE storage
+Documentation=https://github.com/Raudbjorn/nonraid
+# Started by the NonRAID storage plugin on first activation. The unit exists
+# so node shutdown tears the stack down in order (guests -> mergerfs pools ->
+# member mounts -> array). Left disabled by default; ENABLE it when guests on
+# a nonraid storage use onboot: qemu-server's cloud-init regeneration stats
+# the cloudinit volume before anything has activated the storage, and on a
+# cold boot that makes "qm start" fail once with "disk image already exists".
+# When enabled, ExecStart activates the enabled storages (starting the array
+# and mounting the pool) before pve-guests runs.
+Requires=local-fs.target
+After=local-fs.target pve-cluster.service pve-storage.target
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 'pvesm status' is the canonical "activate the enabled storages" call - the
+# same work pvestatd's first cycle would do, just early enough to precede
+# pve-guests. '-': an activation failure (degraded array with autostart off,
+# a missing module) must not mark the unit failed, or its ExecStop teardown
+# would never run. Bounded so a single unreachable storage of any type cannot
+# hold up the boot for systemd's 90s default.
+ExecStart=-/usr/sbin/pvesm status
+TimeoutStartSec=120
+
+# Pools, then member mounts, then the array. The script attempts every step
+# even after a failure and keeps the unclean-shutdown marker unless all of
+# them succeeded; it always exits 0, so a busy pool cannot fail the job.
+ExecStop=/usr/share/pve-nonraid/pve-nonraid-teardown
+
+[Install]
+WantedBy=multi-user.target

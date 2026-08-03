@@ -1,0 +1,98 @@
+#!/bin/sh
+# Manage the <script> tag that loads the NonRAID storage GUI into the
+# Proxmox VE web interface.
+#
+# index.html.tpl is not a dpkg conffile: every pve-manager upgrade silently
+# replaces it. A dpkg file trigger on the path re-runs `apply` (see
+# debian/triggers). The GUI is cosmetic - callers in maintainer scripts use
+# `|| true` so a failure here never breaks a dpkg run; the plugin stays fully
+# usable via pvesm and the API.
+#
+# Usage: pve-nonraid-gui apply|remove|status
+set -eu
+
+TPL="${PVE_NONRAID_TPL:-/usr/share/pve-manager/index.html.tpl}"
+JS_URL="/pve2/js/pve-nonraid-storage.js"
+JS_FILE="/usr/share/pve-manager/js/pve-nonraid-storage.js"
+ANCHOR='src="/pve2/js/pvemanagerlib.js'
+MARK="pve-nonraid-gui"
+
+VER="${PVE_NONRAID_VER:-$(dpkg-query -W -f '${Version}' libpve-storage-nonraid-perl 2>/dev/null || echo dev)}"
+
+# The injected block is indented to match the surrounding markup, so both
+# matchers must tolerate leading whitespace.
+applied_version() {
+    sed -n "s/^[[:space:]]*<!-- BEGIN $MARK \(.*\) -->\$/\1/p" "$TPL" | head -1
+}
+
+remove_block() {
+    tmp="$TPL.tmp.$$"
+    awk -v mark="$MARK" '
+        index($0, "<!-- BEGIN " mark " ") { skip = 1; next }
+        index($0, "<!-- END " mark " -->") { skip = 0; next }
+        !skip { print }
+    ' "$TPL" > "$tmp"
+    mv "$tmp" "$TPL"
+}
+
+apply() {
+    [ -w "$TPL" ] || { echo "$TPL is not writable" >&2; return 1; }
+
+    cur=$(applied_version)
+    if [ "$cur" = "$VER" ]; then
+        return 0
+    fi
+    [ -n "$cur" ] && remove_block
+
+    if ! grep -qF "$ANCHOR" "$TPL"; then
+        echo "pve-nonraid-gui: anchor line ($ANCHOR) not found in $TPL;" >&2
+        echo "  pve-manager changed its template - GUI integration skipped." >&2
+        echo "  The nonraid storage type still works via pvesm and the API." >&2
+        return 1
+    fi
+
+    cp -a "$TPL" "$TPL.pve-nonraid.bak"
+
+    tmp="$TPL.tmp.$$"
+    awk -v anchor="$ANCHOR" -v mark="$MARK" -v ver="$VER" -v url="$JS_URL" '
+        { print }
+        index($0, anchor) {
+            print "    <!-- BEGIN " mark " " ver " -->"
+            print "    <script type=\"text/javascript\" src=\"" url "?ver=" ver "\"></script>"
+            print "    <!-- END " mark " -->"
+        }
+    ' "$TPL" > "$tmp"
+    mv "$tmp" "$TPL"
+    echo "pve-nonraid-gui: applied ($VER)"
+}
+
+remove() {
+    [ -f "$TPL" ] || return 0
+    if [ -n "$(applied_version)" ]; then
+        remove_block
+        echo "pve-nonraid-gui: removed"
+    fi
+}
+
+status() {
+    cur=$(applied_version)
+    if [ -z "$cur" ]; then
+        echo "tpl: absent"
+    elif [ "$cur" = "$VER" ]; then
+        echo "tpl: applied ($cur)"
+    else
+        echo "tpl: stale (applied $cur, package $VER)"
+    fi
+    if [ -f "$JS_FILE" ]; then
+        echo "js: present"
+    else
+        echo "js: MISSING ($JS_FILE)"
+    fi
+}
+
+case "${1:-}" in
+    apply) apply ;;
+    remove) remove ;;
+    status) status ;;
+    *) echo "Usage: pve-nonraid-gui apply|remove|status" >&2; exit 2 ;;
+esac

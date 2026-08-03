@@ -1,0 +1,64 @@
+#!/bin/sh
+# Ordered teardown of the NonRAID storage stack, run as pve-nonraid.service's
+# ExecStop after pve-guests has stopped the guests: mergerfs pools, then the
+# member mounts, then the array itself.
+#
+# Every step is attempted even if an earlier one failed - one unmountable pool
+# must not strand the others - but /var/lib/nonraid/array.running is removed
+# only if the whole teardown succeeded. That file is the unclean-shutdown
+# marker: leaving it behind makes the next activation run a correcting parity
+# check, which is the right call when the array was not brought down cleanly.
+#
+# Exits 0 regardless, so a busy pool cannot turn shutdown into a failed job;
+# what went wrong is on stderr and in the journal.
+set -u
+
+MOUNTS="${PVE_NONRAID_MOUNTS:-/proc/mounts}"
+NMDCTL="${PVE_NONRAID_NMDCTL:-/usr/bin/nmdctl}"
+MARKER="${PVE_NONRAID_MARKER:-/var/lib/nonraid/array.running}"
+
+ok=1
+
+# Pools are identified by the fsname the plugin always sets
+# (nonraid-<storeid>), never by path. Field 2 is the mountpoint, which is the
+# operator-set storage path and so may contain whitespace - the kernel escapes
+# that as \040, which printf %b turns back into a space.
+pools=$(awk '$1 ~ /^nonraid-/ && $3 == "fuse.mergerfs" { print $2 }' "$MOUNTS" 2>/dev/null || true)
+
+if [ -n "$pools" ]; then
+    old_ifs=$IFS
+    IFS='
+'
+    for escaped in $pools; do
+        IFS=$old_ifs
+        mp=$(printf '%b' "$escaped")
+        if umount "$mp" 2>/dev/null; then
+            echo "pve-nonraid: unmounted pool $mp"
+        else
+            echo "pve-nonraid: could not unmount pool $mp" >&2
+            ok=0
+        fi
+        IFS='
+'
+    done
+    IFS=$old_ifs
+fi
+
+"$NMDCTL" -u unmount >/dev/null 2>&1 || {
+    echo "pve-nonraid: nmdctl unmount failed" >&2
+    ok=0
+}
+
+"$NMDCTL" -u stop >/dev/null 2>&1 || {
+    echo "pve-nonraid: nmdctl stop failed" >&2
+    ok=0
+}
+
+if [ "$ok" = 1 ]; then
+    rm -f "$MARKER"
+else
+    echo "pve-nonraid: teardown incomplete, keeping $MARKER so the next" \
+        "activation re-checks parity" >&2
+fi
+
+exit 0

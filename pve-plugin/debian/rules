@@ -4,6 +4,10 @@
 	dh $@
 
 # Installed but never enabled or started: the storage plugin starts the unit
-# on first activation; only its ExecStop (ordered teardown) matters.
+# on first activation, and enabling it is an operator decision (see README).
+# --no-stop-on-upgrade matters most: this unit's ExecStop tears down the pools,
+# the member mounts and the array, so debhelper's default stop-during-upgrade
+# would pull the storage out from under running guests when the package is
+# upgraded.
 override_dh_installsystemd:
-	dh_installsystemd --name=pve-nonraid --no-enable --no-start
+	dh_installsystemd --name=pve-nonraid --no-enable --no-start --no-stop-on-upgrade

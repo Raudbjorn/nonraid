@@ -8,12 +8,18 @@ mounts the member disks and unions them into a mergerfs pool at the storage
 ## Install
 
 ```sh
-make package-plugin           # from the repo root, on Debian
+apt install build-essential debhelper fakeroot   # build-time only
+make package-plugin                              # from the repo root, on Debian
 apt install ./libpve-storage-nonraid-perl_*.deb
 ```
 
-Requires `nonraid-tools` (>= 1.23), `mergerfs` and a working `nonraid-dkms`
-module for the running kernel.
+Runtime dependencies are `nonraid-tools`, `mergerfs` and a working
+`nonraid-dkms` module for the running kernel. The plugin needs nmdctl 1.23
+semantics (the expected-state argument to `start`, and `-u`), but the
+dependency is unversioned on purpose: `tools/debian/changelog` in this tree
+still says `1.0.0-1`, so a locally built nonraid-tools could not satisfy a
+version bound that release artifacts do satisfy. Check `nmdctl --version` if
+you built it yourself.
 
 ## Use
 
@@ -45,10 +51,21 @@ Before any manual array ceremony (`unassign`, `replace`, `stop`), run
 restarts - the array every cycle, and will fight the maintenance. Re-enable
 when done.
 
-Stop order: guests, then `umount <pool>`, `nmdctl unmount`, `nmdctl stop`.
-`pve-nonraid.service` (started by the plugin) encodes exactly that for node
-shutdown. **Enable it (`systemctl enable pve-nonraid`) when guests on a
-nonraid storage use onboot**: qemu-server's cloud-init regeneration stats the
+**To stop the stack, use `systemctl stop pve-nonraid.service`** — not the
+individual commands. It unmounts the pools, then the members, then the array,
+and only then removes `/var/lib/nonraid/array.running`. That file is the
+unclean-shutdown marker: if you tear the array down by hand and leave it
+behind, the next activation concludes the node crashed and starts a
+*correcting parity check*, which on a real array is hours of I/O. Doing it by
+hand means `umount <pool>`, `nmdctl unmount`, `nmdctl stop`, **and**
+`rm -f /var/lib/nonraid/array.running`.
+
+The same marker is why an actual crash does trigger that check on the next
+activation — that is the point of it, but it is worth knowing before it
+happens at 3am. `nmdctl status` shows the progress.
+
+**Enable the unit (`systemctl enable pve-nonraid`) when guests on a nonraid
+storage use onboot**: qemu-server's cloud-init regeneration stats the
 cloudinit volume before anything has activated the storage on a cold boot,
 and the first `qm start` fails once with "disk image already exists"; the
 enabled unit activates the storages before pve-guests runs. If
@@ -60,8 +77,9 @@ enabled unit activates the storages before pve-guests runs. If
 The package injects a script tag into `/usr/share/pve-manager/index.html.tpl`
 (pve-manager has no storage-plugin extension point) which adds NonRAID to the
 Add Storage menu. A dpkg file trigger re-applies it after pve-manager
-upgrades; `pve-nonraid-gui status` shows the current state. If injection
-fails the plugin is unaffected — use `pvesm`.
+upgrades; `/usr/share/pve-nonraid/pve-nonraid-gui status` shows the current
+state (the tool is not on `$PATH`). If injection fails the plugin is
+unaffected — use `pvesm`.
 
 Without the GUI script loaded, clicking Edit on an existing nonraid storage
 throws `no editor registered for storage type: nonraid` (that click only).

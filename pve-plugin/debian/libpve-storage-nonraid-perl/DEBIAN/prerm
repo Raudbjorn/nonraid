@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        /usr/share/pve-nonraid/pve-nonraid-gui remove || true
+        ;;
+esac
+
+# Automatically added by dh_installsystemd/14.3
+if [ -z "$DPKG_ROOT" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	deb-systemd-invoke stop 'pve-nonraid.service' >/dev/null || true
+fi
+# End automatically added section
+

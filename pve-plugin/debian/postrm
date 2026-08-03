@@ -3,8 +3,22 @@ set -e
 
 # Unlike postinst, postrm never receives "configure" - guard on remove/purge
 # (the upstream purestorage plugin gets this wrong and its restarts never run).
+TPL=/usr/share/pve-manager/index.html.tpl
+
 case "$1" in
     remove|purge)
+        # prerm removes the injected block, but it is allowed to fail (the GUI
+        # is cosmetic and must never break a dpkg run). If it did fail, the tag
+        # would outlive the package and 404 on every page load, so sweep it
+        # here too - our own script is gone by now, hence the inline sed.
+        if [ -f "$TPL" ] && grep -q '<!-- BEGIN pve-nonraid-gui' "$TPL"; then
+            if grep -q '<!-- END pve-nonraid-gui -->' "$TPL"; then
+                sed -i '/<!-- BEGIN pve-nonraid-gui/,/<!-- END pve-nonraid-gui -->/d' "$TPL"
+            else
+                echo "pve-nonraid: $TPL has an unterminated marker block;" >&2
+                echo "  leaving it alone - remove the block by hand." >&2
+            fi
+        fi
         for s in pve-cluster pvedaemon pvestatd pveproxy pvescheduler; do
             systemctl try-restart "$s.service" >/dev/null 2>&1 || true
         done

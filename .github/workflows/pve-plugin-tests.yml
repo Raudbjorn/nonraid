@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - 'pve-plugin/**'
+      - 'Makefile'
       - '.github/workflows/pve-plugin-tests.yml'
   push:
     branches: [ main ]
     paths:
       - 'pve-plugin/**'
+      - 'Makefile'
       - '.github/workflows/pve-plugin-tests.yml'
 
 jobs:
@@ -28,11 +30,15 @@ jobs:
       - name: ShellCheck
         run: |
           shellcheck pve-plugin/bin/pve-nonraid-gui
+          shellcheck pve-plugin/bin/pve-nonraid-teardown
           shellcheck pve-plugin/t/tpl-roundtrip.sh
+          shellcheck pve-plugin/t/teardown.sh
       - name: JS syntax
         run: node --check pve-plugin/js/pve-nonraid-storage.js
       - name: Template round-trip
         run: sh pve-plugin/t/tpl-roundtrip.sh
+      - name: Teardown script
+        run: sh pve-plugin/t/teardown.sh
 
   plugin-load:
     name: Load through PVE::Storage (Debian 13 + PVE 9)
@@ -95,12 +101,122 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends \
-            build-essential debhelper fakeroot lintian
+            build-essential debhelper fakeroot lintian make
           # Work on a copy: dh_install uses cp -a, which fails replaying
           # ACLs/xattrs onto some CI filesystems.
           mkdir -p /work
-          tar --exclude=.git -cf - pve-plugin | tar -C /work -xf -
-          cd /work/pve-plugin
+          tar --exclude=.git -cf - pve-plugin Makefile | tar -C /work -xf -
+          # Through the documented entry point, so the target itself is
+          # covered rather than just dpkg-buildpackage.
+          cd /work && make package-plugin
+          lintian --fail-on error /work/out/libpve-storage-nonraid-perl_*.deb
+          dpkg-deb -c /work/out/libpve-storage-nonraid-perl_*.deb
+
+  package-lifecycle:
+    name: Install, trigger, remove, purge (Debian 13 + PVE 9)
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Proxmox no-subscription repository
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends wget ca-certificates
+          wget -q https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
+            -O /usr/share/keyrings/proxmox-archive-keyring.gpg
+          echo "136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45  /usr/share/keyrings/proxmox-archive-keyring.gpg" \
+            | sha256sum -c -
+          cat > /etc/apt/sources.list.d/proxmox.sources <<'EOF'
+          Types: deb
+          URIs: http://download.proxmox.com/debian/pve
+          Suites: trixie
+          Components: pve-no-subscription
+          Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+          EOF
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt-get update -qq
+
+      - name: Build the package
+        run: |
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper fakeroot make
+          mkdir -p /work
+          tar --exclude=.git -cf - pve-plugin tools Makefile | tar -C /work -xf -
+          cd /work && make package-plugin
+
+      - name: Build nonraid-tools, which the plugin depends on
+        # nonraid-tools is not in any apt archive - upstream publishes it as a
+        # GitHub release artifact - so the dependency can only be satisfied
+        # here by building it from this tree. That is the point: it proves the
+        # plugin's Depends is satisfiable by the package this repo produces,
+        # which a version bound written against nmdctl's own VERSION string
+        # (1.23.0) rather than the package version (1.0.0-1) was not.
+        #
+        # The synthesis below is what the release workflow used to do before it
+        # was removed; debhelper looks for these names under tools/debian/.
+        run: |
+          cd /work/tools
+          cp systemd/nonraid.service debian/nonraid-tools.nonraid.service
+          cp systemd/nonraid.default debian/nonraid-tools.nonraid.default
+          cp systemd/nonraid-parity-check.service debian/nonraid-tools.nonraid-parity-check.service
+          cp systemd/nonraid-parity-check.timer debian/nonraid-tools.nonraid-parity-check.timer
+          cp systemd/nonraid-notify.service debian/nonraid-tools.nonraid-notify.service
+          cp systemd/nonraid-notify.timer debian/nonraid-tools.nonraid-notify.timer
+          cp udev/nonraid.udev debian/nonraid-tools.nonraid.udev
           dpkg-buildpackage -b -us -uc
-          lintian --fail-on error /work/libpve-storage-nonraid-perl_*.deb
-          dpkg-deb -c /work/libpve-storage-nonraid-perl_*.deb
+          apt-get install -y /work/nonraid-tools_*.deb
+          nmdctl --version
+
+      - name: Install through apt, resolving Depends
+        # The version-bound bug this catches was invisible to a build-and-lint
+        # job: nothing there resolves Depends against anything.
+        #
+        # A stand-in for pve-manager's template: its own postinst needs a
+        # running pmxcfs and cannot complete in a container, but our maintainer
+        # scripts only care that the file exists at that path. The real
+        # pve-manager upgrade path is covered by the on-node drills.
+        run: |
+          install -D -m 0644 pve-plugin/t/fixtures/index.html.tpl.fixture \
+            /usr/share/pve-manager/index.html.tpl
+          apt-get install -y --no-install-recommends \
+            /work/out/libpve-storage-nonraid-perl_*.deb
+          test -f /usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
+          test -x /usr/share/pve-nonraid/pve-nonraid-teardown
+          /usr/share/pve-nonraid/pve-nonraid-gui status | grep -q "^tpl: applied"
+          # pveproxy reads this as www-data; postinst must not have narrowed it.
+          test "$(stat -c '%a' /usr/share/pve-manager/index.html.tpl)" = 644
+
+      - name: The dpkg trigger re-applies the block
+        # What a pve-manager upgrade does to us: the template is replaced and
+        # the file trigger fires. Driving the trigger directly tests our side
+        # of that contract without needing pve-manager's postinst to run.
+        run: |
+          install -m 0644 pve-plugin/t/fixtures/index.html.tpl.fixture \
+            /usr/share/pve-manager/index.html.tpl
+          /usr/share/pve-nonraid/pve-nonraid-gui status | grep -q "^tpl: absent"
+          dpkg-trigger --by-package=libpve-storage-nonraid-perl \
+            /usr/share/pve-manager/index.html.tpl
+          dpkg --triggers-only libpve-storage-nonraid-perl
+          /usr/share/pve-nonraid/pve-nonraid-gui status | grep -q "^tpl: applied"
+          grep -q 'BEGIN pve-nonraid-gui' /usr/share/pve-manager/index.html.tpl
+
+      - name: Remove sweeps the injected block
+        run: |
+          apt-get remove -y libpve-storage-nonraid-perl
+          if grep -q 'pve-nonraid-gui' /usr/share/pve-manager/index.html.tpl; then
+            echo "removal left the script tag behind" >&2
+            exit 1
+          fi
+
+      - name: Purge leaves nothing of ours behind
+        run: |
+          apt-get purge -y libpve-storage-nonraid-perl
+          for f in /usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm \
+                   /usr/share/pve-manager/js/pve-nonraid-storage.js \
+                   /usr/share/pve-manager/index.html.tpl.pve-nonraid.bak \
+                   /usr/lib/systemd/system/pve-nonraid.service; do
+            if [ -e "$f" ]; then echo "purge left $f" >&2; exit 1; fi
+          done
+          dpkg --audit
