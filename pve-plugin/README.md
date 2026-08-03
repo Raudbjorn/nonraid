@@ -14,10 +14,16 @@ have to be built:
 
 ```sh
 apt install build-essential debhelper fakeroot   # build-time only
-( cd tools && dpkg-buildpackage -b -us -uc )     # nonraid-tools
-make package-plugin                              # from the repo root, on Debian
-apt install ./nonraid-tools_*.deb ./libpve-storage-nonraid-perl_*.deb
+( cd tools && dpkg-buildpackage -b -us -uc )     # nonraid-tools -> ../
+make package-plugin                              # from the repo root -> out/
+apt install ./nonraid-tools_*.deb out/libpve-storage-nonraid-perl_*.deb
 ```
+
+`make package-plugin` and `make package-native` collect their artifacts into
+`out/` (gitignored) rather than the parent of the checkout, which is where
+`dpkg-buildpackage` writes by convention — and which, for a tree checked out
+directly under `/`, is the filesystem root. `nonraid-tools` is still built
+directly, so its `.deb` lands in the parent as usual.
 
 No synthesis step any more: the systemd/udev copies debhelper expects are
 committed under `tools/debian/`, guarded byte-wise against their sources by
