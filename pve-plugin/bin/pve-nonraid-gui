@@ -1,0 +1,351 @@
+#!/bin/sh
+# Manage the <script> tag that loads the NonRAID storage GUI into the
+# Proxmox VE web interface.
+#
+# index.html.tpl is not a dpkg conffile: every pve-manager upgrade silently
+# replaces it. A dpkg file trigger on the path re-runs `apply` (see
+# debian/triggers). The GUI is cosmetic - callers in maintainer scripts use
+# `|| true` so a failure here never breaks a dpkg run; the plugin stays fully
+# usable via pvesm and the API.
+#
+# Usage: pve-nonraid-gui apply|remove|status
+set -eu
+
+# pveproxy serves this template as www-data. Rewrites below preserve the
+# original file's mode by writing through a copy of it, but a defensive umask
+# covers the paths that create a file from scratch - an operator running this
+# by hand under a restrictive umask must not end up with a template pveproxy
+# cannot read, which would blank the whole web interface rather than just the
+# Add-menu entry.
+umask 022
+
+TPL="${PVE_NONRAID_TPL:-/usr/share/pve-manager/index.html.tpl}"
+JS_URL="/pve2/js/pve-nonraid-storage.js"
+JS_FILE="/usr/share/pve-manager/js/pve-nonraid-storage.js"
+ANCHOR='src="/pve2/js/pvemanagerlib.js'
+MARK="pve-nonraid-gui"
+BAK="$TPL.pve-nonraid.bak"
+
+VER="${PVE_NONRAID_VER:-$(dpkg-query -W -f '${Version}' libpve-storage-nonraid-perl 2>/dev/null || echo dev)}"
+
+tmp=""
+# Must end successfully: the exit trap's status becomes the script's, so a
+# bare test that happens to be false would turn every clean run into a failure.
+cleanup() {
+    [ -n "$tmp" ] && rm -f "$tmp"
+    return 0
+}
+trap cleanup EXIT HUP INT TERM
+
+# Rewrites go through a copy of the original so mode, owner and ACLs survive;
+# truncating that copy keeps its inode metadata, and the rename is atomic.
+#
+# Producing into the temporary file directly, rather than piping a generator
+# into a writer, is deliberate: a shell pipeline reports only its LAST
+# command's status, so a generator that emitted half a template and then died
+# would still be renamed over the live file by a writer that succeeded.
+new_tmp() {
+    # A symlinked template is refused rather than handled. 'cp -a' preserves a
+    # symlink, so $tmp would become a second link to the SAME target, and the
+    # truncation below would then empty the live template before a single
+    # validation had run - an empty index.html.tpl blanks the entire web
+    # interface.
+    if [ -L "$TPL" ]; then
+        echo "pve-nonraid-gui: $TPL is a symlink; refusing to rewrite it." >&2
+        echo "  Point PVE_NONRAID_TPL at the real file if this is deliberate." >&2
+        return 1
+    fi
+    tmp="$TPL.tmp.$$"
+    # Fail if it already exists, so a pre-planted path cannot be followed.
+    ( set -o noclobber 2>/dev/null; : > "$tmp" ) 2>/dev/null || {
+        echo "pve-nonraid-gui: $tmp already exists; refusing to overwrite it" >&2
+        tmp=""
+        return 1
+    }
+    # Mode/owner/ACLs from the original, content still empty.
+    cp -a --attributes-only "$TPL" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+}
+
+commit_tmp() {
+    mv "$tmp" "$TPL" || return 1
+    tmp=""
+}
+
+# One parser for status, apply and remove. Three different notions of "is the
+# block there" is how a template ends up with two blocks, or with a block whose
+# END precedes its BEGIN, or with a version marker and no loader behind it.
+#
+# Prints exactly one line:
+#   none
+#   ok <version> <first-line> <last-line>
+#   bad <reason>
+#
+# Counting is by marker OCCURRENCE, not by matching line: two markers on one
+# line are two markers.
+parse_block() {
+    awk -v mark="$MARK" -v url="$JS_URL" '
+        # The un-commented part of a line. parse_block has to be as
+        # comment-aware as anchor_line: a COMPLETE script element inside an
+        # HTML comment satisfied every substring test here and reported the
+        # GUI as applied while the browser executed nothing. Markers are
+        # matched against the raw line (they ARE comments); the payload is
+        # matched against this.
+        function uncommented(line,   out, p, seg) {
+            out = ""
+            while (length(line) > 0) {
+                if (incomment) {
+                    p = index(line, "-->")
+                    if (p == 0) { line = "" }
+                    else { line = substr(line, p + 3); incomment = 0 }
+                } else {
+                    p = index(line, "<!--")
+                    if (p == 0) { seg = line; line = "" }
+                    else { seg = substr(line, 1, p - 1); line = substr(line, p + 4); incomment = 1 }
+                    out = out seg
+                }
+            }
+            return out
+        }
+        function countstr(s, t,   n, p) {
+            n = 0
+            p = index(s, t)
+            while (p > 0) { n++; s = substr(s, p + length(t)); p = index(s, t) }
+            return n
+        }
+        BEGIN {
+            bmark = "<!-- BEGIN " mark
+            emark = "<!-- END " mark " -->"
+        }
+        {
+            nb += countstr($0, bmark)
+            ne += countstr($0, emark)
+
+            if (bline == 0 && index($0, bmark) > 0) {
+                bline = NR
+                # Strict shape, so a stray trailing space cannot yield a block
+                # that looks present but versionless - which read as "not
+                # applied" and injected a second one.
+                pre = bmark " "
+                p = index($0, pre)
+                if (substr($0, 1, p - 1) ~ /^[ \t]*$/) {
+                    rest = substr($0, p + length(pre))
+                    q = index(rest, " -->")
+                    if (q > 1 && substr(rest, q + 4) ~ /^[ \t]*$/) {
+                        cand = substr(rest, 1, q - 1)
+                        if (cand !~ /[ \t]/) { ver = cand }
+                    }
+                }
+            }
+            if (eline == 0 && index($0, emark) > 0) {
+                eline = NR
+                # Same strictness as BEGIN: the marker must be the whole line.
+                # A substring match on an unrelated line would make the removal
+                # below delete that line, content and all.
+                if (substr($0, 1, index($0, emark) - 1) !~ /^[ \t]*$/ ||
+                    substr($0, index($0, emark) + length(emark)) !~ /^[ \t]*$/) {
+                    badend = 1
+                }
+            }
+            # The payload is the exact loader at the version the BEGIN marker
+            # names - not any line mentioning the URL. A comment containing the
+            # path, or a tag left at the previous cache-busting version, is not
+            # an applied GUI.
+            # Comment state is advanced for EVERY line, in order, so a
+            # comment opened before the block is still open inside it.
+            live = uncommented($0)
+
+            if (bline > 0 && NR > bline && eline == 0) {
+                # A structurally valid element that is actually live, not just
+                # the string. A commented-out element - complete or not - is
+                # not an applied GUI, and accepting one leaves the block
+                # "applied" forever with nothing loading.
+                src = index(live, "src=\"" url "?ver=" ver "\"")
+                if (src > 0 && index(substr(live, 1, src), "<script") > 0 &&
+                    index(substr(live, src), "</script>") > 0) { payload = 1 }
+            }
+        }
+        END {
+            if (nb == 0 && ne == 0) { print "none"; exit 0 }
+            if (nb != 1 || ne != 1) {
+                printf "bad %d BEGIN / %d END marker(s)\n", nb, ne; exit 0
+            }
+            if (eline < bline) { print "bad END marker precedes BEGIN"; exit 0 }
+            if (badend) { print "bad malformed END marker"; exit 0 }
+            if (ver == "") { print "bad malformed BEGIN marker"; exit 0 }
+            if (!payload) { print "bad block does not load " url; exit 0 }
+            printf "ok %s %d %d\n", ver, bline, eline
+        }
+    ' "$1"
+}
+
+# First line carrying the anchor OUTSIDE an HTML comment, or 0. A plain
+# substring search matches a commented-out loader just as happily as the live
+# one, and injecting after that puts the GUI script before pvemanagerlib.js,
+# where its own guard makes it do nothing - installed, and silently inert.
+anchor_line() {
+    awk -v anchor="$ANCHOR" '
+        {
+            s = $0
+            while (length(s) > 0) {
+                if (incomment) {
+                    p = index(s, "-->")
+                    if (p == 0) { s = "" } else { s = substr(s, p + 3); incomment = 0 }
+                } else {
+                    p = index(s, "<!--")
+                    if (p == 0) { seg = s; s = "" }
+                    else { seg = substr(s, 1, p - 1); s = substr(s, p + 4); incomment = 1 }
+                    # A COMPLETE element on this line, not merely the URL: the
+                    # block is injected after this line, so a loader whose tag
+                    # spans lines would receive it between "<script" and its
+                    # own ">" and corrupt the template. Requiring the closing
+                    # tag here means a multiline loader finds no anchor at all
+                    # and takes the fail-safe skip below.
+                    a = index(seg, anchor)
+                    if (found == 0 && a > 0) {
+                        open_tag = index(substr(seg, 1, a), "<script")
+                        if (open_tag > 0 && index(substr(seg, a), "</script>") > 0) {
+                            found = NR
+                        }
+                    }
+                }
+            }
+        }
+        END { print found + 0 }
+    ' "$1"
+}
+
+refuse_malformed() {
+    echo "pve-nonraid-gui: $TPL has a malformed marker block ($1);" \
+        "refusing to touch it." >&2
+    echo "  Restore $BAK or reinstall pve-manager, then re-run apply." >&2
+    return 1
+}
+
+apply() {
+    [ -f "$TPL" ] || { echo "pve-nonraid-gui: $TPL does not exist" >&2; return 1; }
+    [ -w "$TPL" ] || { echo "pve-nonraid-gui: $TPL is not writable" >&2; return 1; }
+
+    state=$(parse_block "$TPL")
+    cur=""
+    bline=0
+    eline=0
+    case "$state" in
+        none) ;;
+        ok\ *)
+            cur=$(echo "$state" | cut -d" " -f2)
+            bline=$(echo "$state" | cut -d" " -f3)
+            eline=$(echo "$state" | cut -d" " -f4)
+            ;;
+        *) refuse_malformed "${state#bad }" || return 1 ;;
+    esac
+
+    [ "$cur" = "$VER" ] && return 0
+
+    aline=$(anchor_line "$TPL")
+    if [ "$aline" -eq 0 ]; then
+        echo "pve-nonraid-gui: no active <script> loading $ANCHOR in $TPL;" >&2
+        echo "  pve-manager changed its template - GUI integration skipped." >&2
+        echo "  The nonraid storage type still works via pvesm and the API." >&2
+        return 1
+    fi
+
+    # Only a template with NO block of ours becomes the backup, so $BAK is
+    # always a pristine pve-manager file - which is what refuse_malformed
+    # tells the operator to restore. Backing up on every apply meant a version
+    # bump saved an already-injected template over the pristine one. A
+    # pve-manager upgrade replaces the template outright, which parses as
+    # "none" and refreshes the backup, so it does not go stale.
+    [ -n "$cur" ] || cp -a "$TPL" "$BAK"
+
+    new_tmp || return 1
+    # Strip the old block (by line number, so nothing else can be caught) and
+    # inject after the anchor, in one pass over the original.
+    awk -v b="$bline" -v e="$eline" -v a="$aline" -v mark="$MARK" \
+        -v ver="$VER" -v url="$JS_URL" '
+        b > 0 && NR >= b && NR <= e { next }
+        { print }
+        NR == a {
+            print "    <!-- BEGIN " mark " " ver " -->"
+            print "    <script type=\"text/javascript\" src=\"" url "?ver=" ver "\"></script>"
+            print "    <!-- END " mark " -->"
+        }
+    ' "$TPL" > "$tmp" || {
+        echo "pve-nonraid-gui: generating the new template failed" >&2
+        return 1
+    }
+
+    # Verify the candidate before it goes live, with the same parser: the file
+    # about to be published must contain exactly one well-formed block at this
+    # version, and must still have its anchor.
+    check=$(parse_block "$tmp")
+    case "$check" in
+        "ok $VER "*) ;;
+        *)
+            echo "pve-nonraid-gui: refusing to publish a template that does not" \
+                "verify ($check)" >&2
+            return 1
+            ;;
+    esac
+    [ "$(anchor_line "$tmp")" -gt 0 ] || {
+        echo "pve-nonraid-gui: refusing to publish a template with no anchor" >&2
+        return 1
+    }
+
+    commit_tmp || return 1
+    echo "pve-nonraid-gui: applied ($VER)"
+}
+
+remove() {
+    [ -f "$TPL" ] || return 0
+    [ -w "$TPL" ] || { echo "pve-nonraid-gui: $TPL is not writable" >&2; return 1; }
+
+    state=$(parse_block "$TPL")
+    case "$state" in
+        none) return 0 ;;
+        ok\ *) ;;
+        *) refuse_malformed "${state#bad }" || return 1 ;;
+    esac
+
+    bline=$(echo "$state" | cut -d" " -f3)
+    eline=$(echo "$state" | cut -d" " -f4)
+
+    new_tmp || return 1
+    awk -v b="$bline" -v e="$eline" 'NR < b || NR > e' "$TPL" > "$tmp" || {
+        echo "pve-nonraid-gui: generating the new template failed" >&2
+        return 1
+    }
+    [ "$(parse_block "$tmp")" = "none" ] || {
+        echo "pve-nonraid-gui: refusing to publish, the block is still present" >&2
+        return 1
+    }
+
+    commit_tmp || return 1
+    echo "pve-nonraid-gui: removed"
+}
+
+status() {
+    if [ ! -f "$TPL" ]; then
+        echo "tpl: MISSING ($TPL)"
+    else
+        state=$(parse_block "$TPL")
+        case "$state" in
+            none) echo "tpl: absent" ;;
+            "ok $VER "*) echo "tpl: applied ($VER)" ;;
+            ok\ *) echo "tpl: stale (applied $(echo "$state" | cut -d" " -f2), package $VER)" ;;
+            *) echo "tpl: MALFORMED (${state#bad })" ;;
+        esac
+        [ "$(anchor_line "$TPL")" -gt 0 ] || echo "tpl: anchor MISSING ($ANCHOR)"
+    fi
+    if [ -f "$JS_FILE" ]; then
+        echo "js: present"
+    else
+        echo "js: MISSING ($JS_FILE)"
+    fi
+}
+
+case "${1:-}" in
+    apply) apply ;;
+    remove) remove ;;
+    status) status ;;
+    *) echo "Usage: pve-nonraid-gui apply|remove|status" >&2; exit 2 ;;
+esac

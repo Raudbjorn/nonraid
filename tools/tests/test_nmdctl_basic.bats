@@ -1139,7 +1139,32 @@ mock_import_with_status() {
     local multibyte_id
     multibyte_id=$(printf 'ä%.0s' $(seq 1 40))
 
-    LC_ALL=en_US.UTF-8 run validate_disk_id "$multibyte_id"
+    # The locale has to actually exist, or LC_ALL falls back to C, ${#var}
+    # counts bytes anyway, and this passes without having tested the multibyte
+    # case at all. C.UTF-8 is present on minimal Debian/Ubuntu images where
+    # en_US.UTF-8 usually is not.
+    # Match on the normalized name rather than two literal spellings: glibc
+    # reports both 'C.UTF-8' and 'C.utf8' depending on the system, and a
+    # literal list skips the test on hosts that do have a usable locale.
+    local utf8_locale=""
+    local cand norm
+    while IFS= read -r cand; do
+        norm=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]' | tr -d -- '-_')
+        case "$norm" in
+            *utf8)
+                # C.UTF-8 for preference - it is on minimal Debian/Ubuntu
+                # images where en_US.UTF-8 usually is not - else the first.
+                if [ "$norm" = "c.utf8" ]; then
+                    utf8_locale="$cand"
+                    break
+                fi
+                [ -n "$utf8_locale" ] || utf8_locale="$cand"
+                ;;
+        esac
+    done < <(locale -a 2>/dev/null)
+    [ -n "$utf8_locale" ] || skip "no UTF-8 locale available to test byte-vs-character length"
+
+    LC_ALL="$utf8_locale" run validate_disk_id "$multibyte_id"
 
     [ "$status" -ne 0 ]
     [[ "$output" =~ "80 bytes" ]]
@@ -1186,11 +1211,36 @@ mock_import_with_status() {
 @test "resync_elapsed_file - state is persistent, not tmpfs" {
     # A paused check survives a reboot because its position lives in the
     # superblock, so the elapsed snapshot has to survive one too.
-    NMDSTAT_VALUES[sbName]="/nonraid.dat"
+    #
+    # Read the default nmdctl itself declares. Asserting on a value the test
+    # just assigned - or on setup()'s BATS_TMPDIR override - would pass no
+    # matter where nmdctl actually puts this.
     local dir
-    dir=$(RESYNC_ELAPSED_DIR="${STATE_DIRECTORY:-/var/lib/nonraid}" bash -c 'echo "$RESYNC_ELAPSED_DIR"')
-    [[ "$dir" != /run/* ]]
-    [[ "$(dirname "$(resync_elapsed_file)")" != /run/* ]]
+    dir=$(unset RESYNC_ELAPSED_DIR STATE_DIRECTORY
+          source "$BATS_TEST_DIRNAME/../nmdctl"
+          echo "$RESYNC_ELAPSED_DIR")
+
+    # And the path the helper actually returns, not only the variable it is
+    # built from: resync_elapsed_file could be changed to ignore
+    # RESYNC_ELAPSED_DIR entirely and this test would have stayed green.
+    local helper_dir
+    helper_dir=$(unset RESYNC_ELAPSED_DIR STATE_DIRECTORY
+                 source "$BATS_TEST_DIRNAME/../nmdctl"
+                 NMDSTAT_VALUES=([sbName]=/test.dat)
+                 dirname "$(resync_elapsed_file)")
+
+    local d
+    for d in "$dir" "$helper_dir"; do
+        [ -n "$d" ]
+        # The mount points themselves, not only paths below them: a default of
+        # exactly /run or /tmp is just as volatile and matches neither /run/*
+        # nor /tmp/*.
+        [ "$d" != /run ] && [ "$d" != /tmp ] && [ "$d" != /var/run ]
+        [[ "$d" != /run/* ]]
+        [[ "$d" != /tmp/* ]]
+        [[ "$d" != /var/run/* ]]
+        [[ "$d" != /dev/shm/* ]]
+    done
 }
 
 # Seed the state handle_check reads for a running check, so it skips
@@ -1284,14 +1334,41 @@ seed_running_check() {
     mkdir -p "$RESYNC_ELAPSED_DIR"
     local elapsed_file
     elapsed_file=$(resync_elapsed_file)
-    echo 60 > "$elapsed_file"
+    # Same two-line shape the pause path writes: action, then seconds. Seeding
+    # a bare number would test the survival of a file no producer can create.
+    printf 'check P\n60\n' > "$elapsed_file"
 
     run handle_check CANCEL
     [ "$status" -ne 0 ]
 
     # The run the driver refused to stop still needs its carried time.
     [ -f "$elapsed_file" ]
-    [ "$(cat "$elapsed_file")" -eq 60 ]
+    local saved_action saved
+    { read -r saved_action; read -r saved; } < "$elapsed_file"
+    [ "$saved_action" = "check P" ]
+    [ "$saved" -eq 60 ]
 
     rm -rf "$RESYNC_ELAPSED_DIR"
+}
+
+@test "save_disk_offset - concurrent writers do not lose entries" {
+    # The atomic rename makes each writer's own result self-consistent, but not
+    # correct: without a lock every writer reads the same original, writes a
+    # full file from it, and the last rename discards the rest - after they
+    # were all reported as recorded. A lost offset re-imports that disk at
+    # sector 0. Before the flock this left 1 of 25 entries.
+    local offsets="$BATS_TEST_TMPDIR/offsets"
+    DISK_OFFSETS_FILE="$offsets"
+
+    local i
+    for i in $(seq 1 25); do
+        ( save_disk_offset "concurrent-disk-$i" "$((1000 + i))" >/dev/null 2>&1 ) &
+    done
+    wait
+
+    [ "$(wc -l < "$offsets")" -eq 25 ]
+    # And every one of them is findable, not just the right number of lines.
+    for i in $(seq 1 25); do
+        grep -qx "concurrent-disk-$i $((1000 + i))" "$offsets"
+    done
 }

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+# An offline-root operation (debootstrap, image builds) sets DPKG_ROOT to the
+# target tree. Our own actions here touch THIS host - the live PVE template and
+# this host's services - so they are skipped in that case; nothing they do is
+# essential to the package, and doing them would be actively wrong. The
+# debhelper-generated snippets below still run: they are DPKG_ROOT-aware
+# themselves. (Do not write the debhelper token in a comment - it is
+# substituted wherever it appears, and the rest of the sentence becomes code.)
+host_actions() {
+    [ -z "${DPKG_ROOT:-}" ]
+}
+
+case "$1" in
+    remove)
+        # if-form, not 'host_actions && ...': an && list that ends false takes
+        # the script's exit status with it when nothing follows, and dpkg reads
+        # a non-zero prerm as a failed removal.
+        PVE_NONRAID_TPL="${DPKG_ROOT:-}/usr/share/pve-manager/index.html.tpl" \
+            "${DPKG_ROOT:-}/usr/share/pve-nonraid/pve-nonraid-gui" remove || true
+        ;;
+esac
+
+#DEBHELPER#

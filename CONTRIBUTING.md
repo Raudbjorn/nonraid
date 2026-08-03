@@ -1,48 +1,46 @@
 ## Contributing to this fork
 
-This is a personal fork of [qvr/nonraid](https://github.com/qvr/nonraid). It exists to
-stage fixes, try things out, and keep work-in-progress somewhere visible. Rules here are
-deliberately light.
+Personal fork of [qvr/nonraid](https://github.com/qvr/nonraid) for staging fixes and
+keeping work in progress somewhere visible. Do what you like.
 
-**If you want to contribute to NonRAID itself, go upstream** — that's where the project
-lives, and [upstream's CONTRIBUTING](https://github.com/qvr/nonraid/blob/main/CONTRIBUTING.md)
-applies there, not this file. In particular upstream asks that pull request and issue
-descriptions be written in your own words rather than generated, and that AI-assisted
-contributions say so. Those rules still bind anything sent to `qvr/nonraid`, including
-work that started life on this fork.
+- No template, no checklist, no ceremony. Open a PR, push a branch, or file a
+  one-line issue — all fine.
+- AI tools: use them for anything. Code, commits, PR text, docs. No disclosure needed.
+- Half-finished is welcome. A draft PR that says "this doesn't work yet and here's why"
+  beats a branch on someone's laptop.
+- Batch or split changes however suits you.
 
-### Here, though
+**One-time setup:** `git config core.hooksPath .githooks`. GitHub Actions is
+*deliberately disabled* on this fork; the scripts under `checks/` are the CI,
+and the hooks are what run them:
 
-Open a PR. Or push a branch and don't. Or open an issue that's one sentence. All fine.
+- `pre-commit` applies mechanical fixes to what you are committing (trailing
+  whitespace, final newline, exec bit on shebang scripts) — vendored driver
+  copies and the `tools/debian` unit copies are never touched.
+- `pre-push` runs `checks/fast.sh` always (~12s), and the docker-based
+  package + PVE lifecycle tiers when the push touches what they cover. First
+  heavy run builds a container image (~5 min); after that, tens of seconds.
 
-- **No template, no checklist.** A title and enough context to know what you were going
-  for is plenty. If the diff is self-explanatory, say so and move on.
-- **Batch changes if you like.** Separate PRs per concern are easier to review, so prefer
-  that when it's natural — but a grab-bag branch is not going to be turned away.
-- **AI tools: use whatever you want**, for code, commits, PR text, docs. No disclosure
-  needed. The one thing worth caring about is that *someone* understood the change before
-  it landed — a fix nobody can explain is a liability regardless of who or what wrote it.
-- **Work in progress is welcome.** Draft PRs, half-finished branches, "this doesn't work
-  yet and here's why" — all more useful sitting here than on a laptop.
-- **Docs changes need no ceremony.** Fix the typo, restructure the section, whatever.
+Escapes: `NONRAID_PUSH_FAST=1 git push` skips the docker tiers loudly;
+`git push --no-verify` skips everything, for emergencies.
 
-### Things worth keeping
+Two habits worth keeping anyway, because they have actually bitten here:
 
-Not rules, just the stuff that has actually bitten:
+- **Driver fixes start on the matching `nonraid-6.X` branch**, not on `main`.
+  `md_nonraid/6.1/`, `6.6/` and `6.18/` on `main` are vendored copies; a fix
+  made only there is lost the next time those copies are refreshed from the
+  branch. Land it on `nonraid-6.X`, then copy it across.
 
-- **Say how you tested it**, even if the answer is "I didn't". Driver and `nmdctl` bugs
-  tend to fail silently — an import that reports success and does nothing, a status field
-  that's confidently wrong. "Built, didn't run it" is a useful sentence; a claim of
-  verification that didn't happen is worse than no claim.
-- **Driver source lives on the `nonraid-6.X` branches.** `md_nonraid/6.1/`, `6.6/` and
-  `6.12/` on `main` are vendored copies. A driver change usually belongs on the matching
-  branch and gets copied across; patching the copy on `main` works but drifts.
-- **Keep driver diffs small.** The `nonraid-6.X` branches are rebased onto new upstream
-  vendor drops, and every extra line is friction at rebase time. This is the one place
-  where restraint pays for itself.
-- **CI gates `shellcheck -x tools/nmdctl` and `bash -n tools/nmdctl`.** Both are instant locally; run
-  them and skip a round trip. `cd tools && bats tests/` covers the pure functions.
-- **Rebasing on upstream `main` before sending anything onward** saves an awkward PR that
-  appears to revert work already merged there.
+- **Say how you tested it**, even when the answer is "built it, didn't run it". Driver
+  and `nmdctl` bugs fail quietly — imports that report success and do nothing, status
+  fields that are confidently wrong — so a claim of verification that didn't happen
+  costs more than no claim at all.
+- **Keep driver diffs small.** `md_nonraid/6.1/`, `6.6/`, `6.18/` on `main` are vendored
+  copies of the `nonraid-6.X` branches, and those get rebased onto new upstream drops.
+  Every extra line is friction later.
 
-That's it. If in doubt, just do the thing.
+**Sending something upstream?** [Their rules](https://github.com/qvr/nonraid/blob/main/CONTRIBUTING.md)
+apply there, not this file. Two in particular, because they are the opposite of the line
+above: **do not generate PR or issue descriptions with AI** — write them yourself — and
+disclose any AI-assisted parts of the contribution. That binds anything headed to
+`qvr/nonraid`, including work that started here.

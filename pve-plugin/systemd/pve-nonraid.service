@@ -1,0 +1,55 @@
+[Unit]
+Description=NonRAID array activation/teardown ordering for Proxmox VE storage
+Documentation=https://github.com/Raudbjorn/nonraid
+# Started by the NonRAID storage plugin on first activation. The unit exists
+# so node shutdown tears the stack down in order (guests -> mergerfs pools ->
+# member mounts -> array). Left disabled by default; ENABLE it when guests on
+# a nonraid storage use onboot: qemu-server's cloud-init regeneration stats
+# the cloudinit volume before anything has activated the storage, and on a
+# cold boot that makes "qm start" fail once with "disk image already exists".
+# When enabled, ExecStart activates the enabled storages (starting the array
+# and mounting the pool) before pve-guests runs.
+# Requires= is load-bearing (failure propagation); After= is not, and is
+# dropped deliberately. A service with DefaultDependencies=yes already orders
+# after basic.target -> sysinit.target -> local-fs.target, which is the
+# argument the fork used when removing both from nonraid.service in #6/#7.
+# Requires= is kept because unlike that unit this one has a pool to tear down,
+# and the removal there was about a unit that mounts nothing of its own.
+# Recorded here so this stops being re-raised each round.
+Requires=local-fs.target
+After=pve-cluster.service pve-storage.target
+Before=pve-guests.service
+# Before=pvestatd too, which is about SHUTDOWN rather than boot: systemd stops
+# units in reverse order, so ordering ahead of pvestatd at start means pvestatd
+# is already stopped when our ExecStop runs. Without it pvestatd keeps polling
+# through the teardown and re-activates the storage - starting the array again
+# behind the script that is trying to stop it.
+Before=pvestatd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 'pvesm status' is the canonical "activate the enabled storages" call - the
+# same work pvestatd's first cycle would do, just early enough to precede
+# pve-guests. '-': an activation failure (degraded array with autostart off,
+# a missing module) must not mark the unit failed, or its ExecStop teardown
+# would never run.
+#
+# The bound is 'timeout', not TimeoutStartSec alone, and that distinction is
+# the point: '-' turns a non-zero EXIT into success, but it does not turn a
+# systemd start-timeout into success. A pvesm blocked on some unrelated
+# unreachable storage would fail the unit, and a failed unit does not run
+# ExecStop - so an array mounted moments earlier would lose its ordered
+# teardown for the rest of the boot. Bounding it in user space means ExecStart
+# always exits, always as success, and the unit always reaches active.
+# TimeoutStartSec stays as a backstop for a 'timeout' that itself wedges.
+ExecStart=-/usr/bin/timeout -k 10 100 /usr/sbin/pvesm status
+TimeoutStartSec=120
+
+# Pools, then member mounts, then the array. The script attempts every step
+# even after a failure and keeps the unclean-shutdown marker unless all of
+# them succeeded; it always exits 0, so a busy pool cannot fail the job.
+ExecStop=/usr/share/pve-nonraid/pve-nonraid-teardown
+
+[Install]
+WantedBy=multi-user.target

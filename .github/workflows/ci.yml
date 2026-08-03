@@ -1,5 +1,10 @@
 name: CI
 
+# NOTE: GitHub Actions is DELIBERATELY DISABLED on this fork. This workflow is
+# kept for parity (and in case Actions is ever enabled), but the ENFORCED
+# version of these checks lives in checks/ and runs from .githooks/pre-push on
+# every push. If you change a job here, change the matching checks/ script.
+
 # Trimmed from upstream's five workflows, but not to the point of proving
 # nothing. Upstream's release/publishing jobs are gone (this fork ships no
 # releases); the module build and an end-to-end array lifecycle are kept,
@@ -10,6 +15,11 @@ on:
   pull_request:
   push:
     branches: [ main ]
+  # Upstream runs its build and integration tests weekly too: the runner
+  # kernel moves underneath the module, and a scheduled run catches that
+  # drift without waiting for the next code change to trip over it.
+  schedule:
+    - cron: '0 3 * * 0'
 
 jobs:
   nmdctl:

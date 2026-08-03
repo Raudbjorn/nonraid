@@ -58,23 +58,64 @@ On ≥ 7.1 the module gains a runtime dependency on `xor` (builtin before, modul
 `modules.dep` and `modprobe` reads it to load `xor` before the module, so the normal load
 path — and DKMS, which runs `depmod` on install — is unaffected.
 
-### `make package` works off Debian
-
-`debian/control` build-depends on `dh-sequence-dkms`, which only Debian's `dh-dkms` ships,
-so a native `.deb` build cannot run elsewhere. `make package` now selects the native path
-only when the whole toolchain is present (checked with `dpkg-checkbuilddeps`), and otherwise
-builds in a container:
+### Building with the Makefile
 
 ```bash
-make package                 # native where the full toolchain is present, container otherwise
+make modules                 # build the two .ko against the running kernel
+make clean
+
+make package                 # nonraid-dkms: native if possible, container otherwise
 make package-native          # force the native path
 make package-docker          # force the container path
+make package-plugin          # libpve-storage-nonraid-perl (the PVE storage plugin)
 make package DOCKER=podman   # podman instead of docker
 ```
 
-The native path is chosen whenever `dpkg-checkbuilddeps` is satisfied and `dh`/`fakeroot`
-are present — that includes Ubuntu and any Debian derivative with the build dependencies
-installed, not only Debian.
+**Artifacts land in `out/`.** `dpkg-buildpackage` writes to the *parent* of the source
+tree by convention — which drops files outside the checkout where nothing tracks or
+ignores them, and for a tree checked out directly under `/`, into the filesystem root.
+`package-native` and `package-plugin` move their `.deb`, `.changes` and `.buildinfo` there
+afterwards; `package-docker` does the same via a temporary directory - it bind-mounts a
+`mktemp -d` directory into the container as `/out` (never `OUTDIR` itself, so the container
+never gets write access to the real output location) and moves the built artifacts into
+`OUTDIR` once the container exits. `out/` is gitignored. Override with `OUTDIR=/somewhere`.
+
+They cannot simply be redirected at build time: `dpkg-genbuildinfo` and `dpkg-genchanges`
+read the just-built `.deb` from `..` by the name `debian/files` records, so
+`dh_builddeb --destdir` makes the build die with `cannot fstat file`.
+
+`nonraid-tools` has **no make target** — build it directly, and its `.deb` lands in the
+parent as usual:
+
+```bash
+cd tools && dpkg-buildpackage -b -us -uc
+```
+
+That is deliberate: its `debian/rules` runs `check-package-manifest` against `../`, and
+refuses to build at all when `debian/changelog` disagrees with `VERSION=` in `tools/nmdctl`:
+
+```
+debian/rules:13: *** debian/changelog says 9.9.9 but tools/nmdctl VERSION= says 1.23.0;
+run: dch -v 1.23.0-1.  Stop.
+```
+
+That mismatch is not hypothetical — a `1.0.0-1` changelog against a `1.23.0` tool is how
+the plugin's dependency became unsatisfiable by the package built from its own tree. The systemd and udev copies debhelper expects
+are committed under `tools/debian/`, so no synthesis step is needed — `checks/fast.sh`
+guards them byte-wise against `tools/systemd` and `tools/udev`.
+
+**Why `package` picks a path.** `debian/control` build-depends on `dh-sequence-dkms`, which
+only Debian's `dh-dkms` ships, so a native `.deb` build cannot run elsewhere. `make package`
+selects the native path only when the whole toolchain is present (checked with
+`dpkg-checkbuilddeps`) and otherwise builds in a container. The native path is chosen
+whenever `dpkg-checkbuilddeps` is satisfied and `dh`/`fakeroot` are present — that includes
+Ubuntu and any Debian derivative with the build dependencies installed, not only Debian.
+`package-native` and `package-docker` stay individually reachable either way, so forcing the
+container path on a native-capable host works.
+
+The packaging variables are probed only when a packaging goal was actually requested. This
+file is installed into `/usr/src` and re-parsed on every DKMS build, so an unconditional
+`dpkg-checkbuilddeps` would run on every module rebuild on hosts that have no dpkg at all.
 
 The container image is defined in `packaging/docker/`, so the toolchain is a cached layer —
 a repeat build is about a second rather than reinstalling every dependency.
@@ -86,14 +127,36 @@ need a snapshot repository or an explicit version list in `DEB_BUILD_DEPS`.
 
 ## Testing
 
+**GitHub Actions is deliberately disabled on this fork.** The scripts under `checks/` are
+the CI, and the git hooks are what run them:
+
+```bash
+git config core.hooksPath .githooks   # once per clone
+
+sh checks/fast.sh       # lint + every unit suite, ~12s, no containers
+sh checks/debs.sh       # build all three packages in a container
+sh checks/pve-load.sh   # apt install, plugin load, dpkg trigger/remove/purge
+```
+
+`pre-push` runs `fast.sh` always and the two container tiers when the push touches what
+they cover; the first container run builds an image (~5 min), later ones take tens of
+seconds. `NONRAID_PUSH_FAST=1 git push` skips the heavy tiers loudly, `--no-verify` skips
+everything. `pre-commit` applies mechanical fixes (trailing whitespace, final newline,
+exec bit on shebang scripts) and never touches the vendored driver copies.
+
+The individual suites, if you want them directly:
+
 ```bash
 shellcheck -x tools/nmdctl
 cd tools && bats tests/
+prove pve-plugin/t/
 ```
 
-`.github/workflows/ci.yml` runs both, plus a guard that packaging variables stay out of
-`make modules`. Upstream's heavier DKMS build matrix, integration lifecycle and
-package-publishing workflows are not carried here — see upstream if you need them.
+The workflow files under `.github/workflows/` are kept for parity and in case Actions is
+ever enabled; each is stamped with a note saying the `checks/` script is the enforced
+version. They cover the same ground plus what a push hook cannot: a DKMS module build on
+Debian 12/13 and Ubuntu 24.04, and a loop-device array lifecycle (create, sync, write,
+fail a disk, rebuild, verify) — both need kernel headers and root loop devices.
 
 ## Contributing
 

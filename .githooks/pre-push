@@ -1,0 +1,132 @@
+#!/bin/sh
+# The gate every push passes through. GitHub Actions is DELIBERATELY DISABLED
+# on this fork, so the checks under checks/ are the CI, and this hook is what
+# runs them. Tiered the way the workflows' paths were: filters were:
+#
+#   fast tier    always                      (~12s: lint + unit suites)
+#   package tier pve-plugin/** or tools/**  (docker: build all three debs)
+#   PVE tier     pve-plugin/** or tools/**  (docker: apt install + load + lifecycle)
+#
+# The heavy tiers run in a prebuilt image (first run builds it, ~5 min; after
+# that tens of seconds). Escapes, in order of preference:
+#   NONRAID_PUSH_FAST=1 git push   - fast tier only, says so loudly
+#   git push --no-verify           - no gate at all, for emergencies
+#
+# Install (once per clone): git config core.hooksPath .githooks
+set -u
+
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+
+# git invokes this hook with GIT_DIR (and friends) pointed at ITS OWN
+# checkout. Left set, 'git rev-parse --show-toplevel' inside a worktree for a
+# DIFFERENT commit still resolves back to $root - so checks/lib.sh's $ROOT
+# would silently point at this dirty tree, and every tier below would gate
+# the pushed commit's SHA while actually testing whatever happens to be sitting
+# uncommitted here. Unsetting these is what makes "materialize the pushed
+# commit" real instead of decorative.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
+zero=0000000000000000000000000000000000000000
+seen=""
+worktrees=""
+
+# shellcheck disable=SC2329  # invoked indirectly, via the trap below
+cleanup() {
+    for wt in $worktrees; do
+        git worktree remove --force "$wt" >/dev/null 2>&1
+    done
+    git worktree prune >/dev/null 2>&1
+}
+trap cleanup EXIT INT TERM
+
+# pre-push gets "<local ref> <local sha> <remote ref> <remote sha>" per ref on
+# stdin. A deleted remote ref contributes nothing; an up-to-date one is caught
+# by git itself before this hook runs.
+while read -r _ local_sha _ remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue    # deleting a remote ref
+
+    # The same commit pushed to two refs in one go (or already gated by an
+    # earlier ref in this loop) is gated once, not twice.
+    case " $seen " in
+        *" $local_sha "*) continue ;;
+    esac
+    seen="$seen $local_sha"
+
+    if [ "$remote_sha" = "$zero" ]; then
+        # New remote branch: diff against where it forked from main, falling
+        # back to everything reachable if there is no main to compare with.
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null \
+            || git merge-base "$local_sha" fork/main 2>/dev/null) || base=""
+    else
+        base="$remote_sha"
+    fi
+
+    if [ -n "$base" ]; then
+        changed=$(git diff --name-only "$base" "$local_sha" 2>/dev/null)
+        run_all=0
+    else
+        changed=""
+        run_all=1
+    fi
+
+    touches() {
+        [ "$run_all" = 1 ] && return 0
+        printf '%s\n' "$changed" | grep -qE "$1"
+    }
+
+    # A pristine checkout of exactly $local_sha - no untracked files, no
+    # uncommitted edits, nothing the index hasn't recorded - not a copy of
+    # the working tree. This is the actual fix: previously the gate ran
+    # checks/fast.sh and the docker tiers' tar-of-the-worktree against
+    # whatever was sitting in $root, so an uncommitted fix (or an ignored
+    # build artifact) could pass the gate for a broken commit.
+    wt=$(mktemp -d "${TMPDIR:-/tmp}/nonraid-push-gate.XXXXXX") || exit 1
+    worktrees="$worktrees $wt"
+    if ! git worktree add --detach --quiet "$wt" "$local_sha" >/dev/null 2>&1; then
+        echo "pre-push: could not materialize $local_sha as a worktree; nothing was pushed." >&2
+        exit 1
+    fi
+
+    echo "pre-push: gating $local_sha (worktree, not the working tree)"
+
+    (
+        cd "$wt" || exit 1
+
+        # The outer 'while read' loop above is still reading ref lines from
+        # this hook's own stdin. Anything a tier script (or something it
+        # execs) reads from its inherited stdin would silently steal a line
+        # meant for the next ref in a multi-ref push, so each tier gets its
+        # own /dev/null rather than sharing the loop's.
+        echo "pre-push: fast tier"
+        sh checks/fast.sh </dev/null || {
+            echo "pre-push: the fast tier failed for $local_sha; nothing was pushed." >&2
+            exit 1
+        }
+
+        if [ "${NONRAID_PUSH_FAST:-0}" = 1 ]; then
+            echo "pre-push: NONRAID_PUSH_FAST=1 - SKIPPING the package and PVE tiers." >&2
+            echo "  This push is gated by lint and unit tests only." >&2
+            exit 0
+        fi
+
+        if touches '^(pve-plugin/|tools/|debian/|dkms\.conf|Makefile)'; then
+            echo "pre-push: package tier (docker)"
+            sh checks/debs.sh </dev/null || {
+                echo "pre-push: the package tier failed for $local_sha; nothing was pushed." >&2
+                exit 1
+            }
+        fi
+
+        if touches '^(pve-plugin/|tools/)'; then
+            echo "pre-push: PVE tier (docker)"
+            sh checks/pve-load.sh </dev/null || {
+                echo "pre-push: the PVE tier failed for $local_sha; nothing was pushed." >&2
+                exit 1
+            }
+        fi
+    ) || exit 1
+done
+
+echo "pre-push: gate passed"
+exit 0

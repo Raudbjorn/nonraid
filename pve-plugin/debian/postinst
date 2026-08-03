@@ -1,0 +1,51 @@
+#!/bin/sh
+set -e
+
+# An offline-root operation (debootstrap, image builds) sets DPKG_ROOT to the
+# target tree. Our own actions here touch THIS host - the live PVE template and
+# this host's services - so they are skipped in that case; nothing they do is
+# essential to the package, and doing them would be actively wrong. The
+# debhelper-generated snippets below still run: they are DPKG_ROOT-aware
+# themselves. (Do not write the debhelper token in a comment - it is
+# substituted wherever it appears, and the rest of the sentence becomes code.)
+host_actions() {
+    [ -z "${DPKG_ROOT:-}" ]
+}
+
+# The template lives in the tree being built, not necessarily this host's.
+# Skipping the injection entirely under DPKG_ROOT left the produced image
+# permanently without the GUI integration it advertises; pointing the tool at
+# the target does the filesystem half correctly while the service restarts
+# below stay guarded.
+gui() {
+    PVE_NONRAID_TPL="${DPKG_ROOT:-}/usr/share/pve-manager/index.html.tpl" \
+        "${DPKG_ROOT:-}/usr/share/pve-nonraid/pve-nonraid-gui" "$@"
+}
+
+# configure: fresh install/upgrade of this package.
+# triggered: another package (pve-manager) replaced index.html.tpl.
+# The GUI injection is cosmetic - never fail the dpkg run over it.
+case "$1" in
+    configure)
+        gui apply || true
+        # Hand-written because dh_installsystemd's own reload autoscript
+        # guards on [ -d /run/systemd/system ] with no DPKG_ROOT test - it
+        # would reload the BUILD HOST's systemd during an offline-root
+        # install. See the comment in debian/rules.
+        if host_actions && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        if host_actions; then
+            # invoke-rc.d, not systemctl: it honours policy-rc.d, which is how
+            # a chroot or an image build says "do not start services here".
+            for s in pvedaemon pvestatd pveproxy pvescheduler; do
+                invoke-rc.d --quiet "$s" try-restart >/dev/null 2>&1 || true
+            done
+        fi
+        ;;
+    triggered)
+        gui apply || true
+        ;;
+esac
+
+#DEBHELPER#

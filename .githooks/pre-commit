@@ -1,0 +1,64 @@
+#!/bin/sh
+# Small, mechanical fixes applied to what is being committed - the class of
+# thing a formatter would do, kept deliberately conservative:
+#
+#   - strip trailing whitespace
+#   - ensure a final newline
+#   - set the executable bit on scripts that declare a shebang
+#
+# Fixes both the file and the index, then re-stages. Files with UNSTAGED
+# changes are left alone entirely: rewriting the worktree would fold hunks
+# into the commit that the author chose not to stage.
+#
+# Never touched, whatever their state:
+#   - md_nonraid/ raid6/ vendor/   (byte-identical to upstream by contract)
+#   - tools/debian/nonraid-tools.* (committed copies; the drift guard in
+#     checks/fast.sh compares them byte-wise against tools/systemd)
+#   - binaries and images
+set -u
+
+fixed=""
+
+staged=$(git diff --cached --name-only --diff-filter=ACM) || exit 0
+[ -n "$staged" ] || exit 0
+
+for f in $staged; do
+    [ -f "$f" ] || continue
+    case "$f" in
+        md_nonraid/*|raid6/*|vendor/*|tools/debian/nonraid-tools.*) continue ;;
+        *.png|*.jpg|*.gif|*.gz|*.deb) continue ;;
+    esac
+    # Binary content check beyond the extension list.
+    if ! git grep -qI --cached -e '' -- "$f" 2>/dev/null; then
+        continue
+    fi
+    # Partially staged? Hands off.
+    if ! git diff --quiet -- "$f" 2>/dev/null; then
+        continue
+    fi
+
+    changed=0
+    if grep -qE '[ 	]+$' "$f"; then
+        sed -i 's/[ \t]*$//' "$f"
+        changed=1
+    fi
+    if [ -s "$f" ] && [ "$(tail -c1 "$f" | wc -l)" -eq 0 ]; then
+        printf '\n' >> "$f"
+        changed=1
+    fi
+    if head -c2 "$f" 2>/dev/null | grep -q '^#!' && [ ! -x "$f" ]; then
+        chmod +x "$f"
+        git update-index --chmod=+x "$f"
+        changed=1
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        git add -- "$f"
+        fixed="$fixed $f"
+    fi
+done
+
+if [ -n "$fixed" ]; then
+    echo "pre-commit: auto-fixed:$fixed"
+fi
+exit 0

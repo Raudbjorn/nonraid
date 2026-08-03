@@ -1,0 +1,1645 @@
+package PVE::Storage::Custom::NonRAIDPlugin;
+
+# Proxmox VE storage plugin: exposes a NonRAID array as directory-backed
+# storage. On activation it starts the array (nmdctl), mounts the member
+# disks and unions them into a mergerfs pool at the configured path.
+#
+# All array state is read from /proc/nmdstat directly (see docs/nmdstat.5);
+# nmdctl output is never parsed, only its exit codes are used.
+
+use strict;
+use warnings;
+
+use Cwd;
+use File::Basename ();
+use File::Path qw(make_path);
+use File::Spec;
+use IO::Handle;
+use JSON::PP;
+
+use PVE::INotify;
+use PVE::ProcFSTools;
+use PVE::RPCEnvironment;
+use PVE::SafeSyslog;
+use PVE::Tools qw(run_command);
+
+# The parent must not be use'd: PVE::Storage loads every base plugin before
+# scanning Custom/, and pulling DirPlugin in here creates a compile cycle
+# through PVE::GuestImport::OVF. Because of this, `perl -c` on this file is a
+# false negative; the real check is loading it through PVE::Storage.
+use parent -norequire, 'PVE::Storage::DirPlugin';
+
+our $VERSION = '0.1.0';
+
+my $NMDCTL = '/usr/bin/nmdctl';
+my $MERGERFS = '/usr/bin/mergerfs';
+my $HEALTH_DIR = '/run/pve-nonraid';
+
+# Both are overridable by environment for the same reason PROC_NMDSTAT is: the
+# unit tests have to be able to observe what these write without being root and
+# without touching the host's real state.
+sub _marker_file {
+    return $ENV{PVE_NONRAID_MARKER} // '/var/lib/nonraid/array.running';
+}
+
+# Per-boot state. Under /run so it is empty again after a reboot, which is
+# exactly when the unit has to be registered afresh.
+sub _run_dir {
+    return $ENV{PVE_NONRAID_RUN_DIR} // '/run/pve-nonraid';
+}
+
+# systemd's per-unit invocation records. Overridable for the same reason as
+# the two above: the tests need to say "the unit is/is not running".
+sub _systemd_units_dir {
+    return $ENV{PVE_NONRAID_SYSTEMD_UNITS} // '/run/systemd/units';
+}
+
+my $DEFAULT_SUPER = '/nonraid.dat';
+my $DEFAULT_DISK_PREFIX = '/mnt/disk';
+
+# Configuration
+
+# PVE only loads a Custom plugin whose api() is within [APIVER-APIAGE, APIVER].
+# 15 is what this was written and tested against (PVE 9.2). A newer PVE that
+# still supports 15 gets 15; a newer PVE that has aged 15 out gets a value
+# deliberately outside its window, so the plugin is refused at load time rather
+# than running against a storage API it has never seen. 12 is simply such a
+# value - any number below the oldest window PVE will ever offer would do.
+sub api {
+    my $tested = 15;
+
+    # 13 is a hard floor, not a preference. PVE::API2::Storage::Config
+    # dispatches on_update_hook_full only for api() >= 13 and plain
+    # on_update_hook below it - and the write-only disk-action properties are
+    # deleted inside the _full hook, so on an older PVE they would be handed
+    # straight through to storage.cfg and persist. Reporting a version such a
+    # PVE cannot accept makes it decline to load us (with a warning, inside its
+    # own eval - it does not break PVE::Storage), which is the safe answer.
+    my $needs = 13;
+
+    my ($apiver, $apiage) = eval { (PVE::Storage::APIVER(), PVE::Storage::APIAGE()) };
+    return $tested if !defined($apiver); # standalone (unit tests)
+    return $tested if $apiver < $needs;
+    return $apiver if $apiver <= $tested;
+    return $tested if $apiver - $apiage <= $tested;
+    return 12;
+}
+
+sub type {
+    return 'nonraid';
+}
+
+sub plugindata {
+    return {
+        content => [
+            {
+                images => 1,
+                rootdir => 1,
+                vztmpl => 1,
+                iso => 1,
+                backup => 1,
+                snippets => 1,
+                none => 1,
+                import => 1,
+            },
+            { images => 1, rootdir => 1 },
+        ],
+        # qcow2 default: the array has no snapshot layer of its own, so qcow2
+        # is the only way to get VM snapshots.
+        format => [{ raw => 1, qcow2 => 1, vmdk => 1 }, 'qcow2'],
+        'sensitive-properties' => {},
+    };
+}
+
+sub properties {
+    return {
+        'nonraid-super' => {
+            description => "NonRAID superblock file (passed to nmdctl -s).",
+            type => 'string',
+            format => 'pve-storage-path',
+            default => $DEFAULT_SUPER,
+        },
+        'nonraid-disk-prefix' => {
+            description => "Mount prefix for array member disks;"
+                . " data slot N is mounted at <prefix>N.",
+            type => 'string',
+            format => 'pve-storage-path',
+            default => $DEFAULT_DISK_PREFIX,
+        },
+        'nonraid-degraded-autostart' => {
+            description => "Start the array even when it is degraded"
+                . " (a disk is disabled or being reconstructed).",
+            type => 'boolean',
+            default => 1,
+        },
+        'nonraid-mergerfs-opts' => {
+            description => "Override the mergerfs mount options for the pool.",
+            type => 'string',
+        },
+        # Write-only actions, not state. PVE has no extension point for
+        # per-plugin node actions, so these ride in on the storage create/update
+        # hooks and are deleted before the config is written - they never
+        # persist. Named 'create' because that is what they do to the disks.
+        'nonraid-create-parity' => {
+            description => "Build a NEW array on storage creation, using these"
+                . " whole disks as parity (P, then Q). DESTROYS their contents."
+                . " Refused if an array already exists.",
+            type => 'string',
+            format => 'string-list',
+        },
+        'nonraid-create-data' => {
+            description => "Data disks for the array built by"
+                . " nonraid-create-parity. DESTROYS their contents.",
+            type => 'string',
+            format => 'string-list',
+        },
+        'nonraid-wipe-disks' => {
+            description => "Erase all filesystem and partition signatures on"
+                . " these block devices. DESTROYS their contents. Refuses"
+                . " members of the running array, mounted disks, and anything"
+                . " held by LVM, ZFS, MD or Ceph.",
+            type => 'string',
+            format => 'string-list',
+        },
+        'nonraid-unmount-disks' => {
+            description => "Unmount these block devices, so they can be wiped"
+                . " and assigned. Refuses anything held by LVM, ZFS, MD or"
+                . " Ceph, and any member of the running array.",
+            type => 'string',
+            format => 'string-list',
+        },
+    };
+}
+
+sub options {
+    return {
+        path => { fixed => 1 },
+        'nonraid-super' => { optional => 1 },
+        'nonraid-disk-prefix' => { optional => 1 },
+        'nonraid-degraded-autostart' => { optional => 1 },
+        'nonraid-mergerfs-opts' => { optional => 1 },
+        'nonraid-create-parity' => { optional => 1 },
+        'nonraid-create-data' => { optional => 1 },
+        'nonraid-wipe-disks' => { optional => 1 },
+        'nonraid-unmount-disks' => { optional => 1 },
+        nodes => { optional => 1 },
+        disable => { optional => 1 },
+        content => { optional => 1 },
+        'content-dirs' => { optional => 1 },
+        format => { optional => 1 },
+        'create-subdirs' => { optional => 1 },
+        'prune-backups' => { optional => 1 },
+        'max-protected-backups' => { optional => 1 },
+        bwlimit => { optional => 1 },
+        preallocation => { optional => 1 },
+        'snapshot-as-volume-chain' => { optional => 1, fixed => 1 },
+    };
+}
+
+sub check_config {
+    my ($self, $sectionId, $config, $create, $skipSchemaCheck) = @_;
+
+    $config->{path} = "/mnt/pve/$sectionId" if $create && !$config->{path};
+
+    my $opts = $self->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+
+    # Validated on update too: a prefix accepted by 'pvesm set' but rejected by
+    # 'pvesm add' would only surface later, as a mount failure during
+    # activation.
+    my $prefix = $opts->{'nonraid-disk-prefix'};
+    die "nonraid-disk-prefix must be an absolute path without a trailing slash\n"
+        if defined($prefix) && $prefix !~ m|^/.*[^/]$|;
+
+    # 'nodes' is optional in PVE's schema and mandatory here. storage.cfg is
+    # cluster-wide, but the driver holds ONE array per node and the superblock
+    # is a module parameter, so an unrestricted nonraid storage means every
+    # node in the cluster contends for the same node-global array and the same
+    # lock. Exactly one node, because two nodes cannot share it either.
+    #
+    # Enforced on create, and on update only when 'nodes' is being set: an
+    # existing storage that predates this rule must stay editable rather than
+    # becoming unparseable.
+    my $nodes = $opts->{nodes};
+    if ($create || defined($nodes)) {
+        my $count = ref($nodes) eq 'HASH' ? scalar(keys %$nodes) : 0;
+        die "a NonRAID array is one node's hardware: set --nodes to the node"
+            . " that has it\n" if !$count;
+        die "a NonRAID storage may name exactly one node (got: "
+            . join(',', sort keys %$nodes) . "); the driver holds one array"
+            . " per node, so two nodes cannot share this storage\n"
+            if $count > 1;
+    }
+
+    return $opts;
+}
+
+# Pure helpers (unit-tested; no PVE dependencies in their bodies)
+
+sub parse_nmdstat_text {
+    my ($text) = @_;
+    my $st = {};
+    for my $line (split(/\n/, $text // '')) {
+        $st->{$1} = $2 if $line =~ /^([^=]+)=(.*)$/;
+    }
+    return $st;
+}
+
+# PROC_NMDSTAT is the same override seam nmdctl and its test suite use.
+sub read_nmdstat {
+    my $path = $ENV{PROC_NMDSTAT} // '/proc/nmdstat';
+    open(my $fh, '<', $path) or return undef;
+    my $text = do { local $/; <$fh> };
+    close($fh);
+    return parse_nmdstat_text($text);
+}
+
+# Data slots only: 0 is P and 29 is Q, neither carries a filesystem.
+sub data_slots {
+    my ($st) = @_;
+    my @slots;
+    for my $key (keys %$st) {
+        next if $key !~ /^diskName\.(\d+)$/;
+        my $slot = $1;
+        next if $slot == 0 || $slot == 29;
+        next if ($st->{$key} // '') eq '';
+        next if nmdstat_num($st->{"diskSize.$slot"}) <= 0;
+        push @slots, $slot;
+    }
+    my @sorted = sort { $a <=> $b } @slots;
+    return @sorted;
+}
+
+sub mergerfs_branches {
+    my ($st, $prefix) = @_;
+    return map { $prefix . $_ } data_slots($st);
+}
+
+# cache.files=off keeps O_DIRECT working so qemu cache=none is usable;
+# category.create=mfs keeps each image whole on one branch; moveonenospc
+# migrates a growing image instead of failing the guest with ENOSPC.
+# minfreespace must stay below the smallest branch or every create fails
+# with ENOSPC (mergerfs's own 4G default bricks arrays of small disks);
+# 1G is enough because images grow after creation and moveonenospc covers
+# growth, not minfreespace.
+sub default_mergerfs_opts {
+    my ($storeid) = @_;
+    return "cache.files=off,category.create=mfs,moveonenospc=true,"
+        . "minfreespace=1G,fsname=nonraid-$storeid";
+}
+
+# Health signals for logging only. mdNumInvalid/mdNumDisabled are known to be
+# bogus right after array creation until the module is reloaded, so nothing
+# gates online/offline on them - that decision uses mdState alone.
+# /proc/nmdstat can carry a key with an empty value ('mdNumDisabled='), which
+# is defined - so '//' does not catch it and every numeric comparison warns,
+# once per pvestatd cycle. data_slots guards for the same reason.
+sub nmdstat_num {
+    my ($v) = @_;
+    return ($v // '') =~ /^\d+$/ ? $v + 0 : 0;
+}
+
+sub nmdstat_health {
+    my ($st) = @_;
+    my $state = $st->{mdState} // 'UNKNOWN';
+    $state = 'UNKNOWN' if $state eq '';
+    my $disabled = nmdstat_num($st->{mdNumDisabled});
+    my $invalid = nmdstat_num($st->{mdNumInvalid});
+    my $missing = nmdstat_num($st->{mdNumMissing});
+    my $degraded = ($disabled > 0 || $invalid > 0 || $missing > 0) ? 1 : 0;
+    my $rebuilding = nmdstat_num($st->{mdResync}) > 0 ? 1 : 0;
+
+    my $pct;
+    my $resync_size = nmdstat_num($st->{mdResyncSize});
+    if ($rebuilding && $resync_size > 0) {
+        $pct = sprintf("%.1f", 100 * nmdstat_num($st->{mdResyncPos}) / $resync_size);
+    }
+
+    # The summary must stay stable while a resync makes progress - it is the
+    # transition-detection key, and including the percentage would produce a
+    # syslog line every pvestatd cycle.
+    my $summary = $state;
+    $summary .= " DEGRADED(disabled=$disabled invalid=$invalid missing=$missing)"
+        if $degraded;
+    $summary .= " RESYNC:" . ($st->{mdResyncAction} // '?') if $rebuilding;
+
+    return {
+        state => $state,
+        degraded => $degraded,
+        rebuilding => $rebuilding,
+        resync_pct => $pct,
+        summary => $summary,
+    };
+}
+
+# $degraded comes from nmdstat_health() AFTER the members are imported.
+# It matters because a degraded array that was stopped reports plain STOPPED,
+# not DISABLE_DISK - mdState alone cannot carry the fail-stop decision.
+# Mountpoints this must never unmount, whatever the operator asked for. The
+# kernel refuses '/' because it is busy, but that is luck, not a guarantee: a
+# quiet /boot/efi or /var would unmount cleanly and take the system with it.
+sub system_mountpoint {
+    my ($mp) = @_;
+    return 0 if !defined($mp) || $mp eq '';
+    return 1 if $mp eq '/';
+    for my $dir (qw(/boot /usr /var /etc /proc /sys /dev /run /lib /bin /sbin)) {
+        return 1 if $mp eq $dir || index($mp, "$dir/") == 0;
+    }
+    return 0;
+}
+
+# Disk assignment gate
+#
+# A disk may only be handed to 'nmdctl create'/'add' once nothing else claims
+# it, because both commands write to it immediately. The rules are deliberately
+# strict and stated as reasons rather than a boolean: the UI shows the reason,
+# and the operator needs to know whether the answer is "unmount it", "wipe it"
+# or "that is already in this array".
+#
+# Split pure/impure so the rules are testable against fixtures: this half takes
+# a parsed lsblk entry plus /proc/nmdstat and returns why not, if not.
+# Filesystem signatures split in two, and the split is what makes the
+# unmount -> wipe -> assign funnel finish.
+#
+# An ordinary filesystem is exactly what 'wipefs -a' exists to remove, so
+# reporting it must not be fatal to a wipe - otherwise a disk formatted
+# directly, with no partition table, is refused by wipe AND by assign, and the
+# operator has to leave the UI and run wipefs by hand.
+#
+# A holder signature is different: it means some subsystem owns this device
+# even though nothing is assembled from it at this moment. An exported ZFS
+# pool, a deactivated VG, an inactive MD member and a closed LUKS container all
+# present as a bare signature with no children and no mountpoint. Erasing one
+# destroys the pool/array/volume it belongs to.
+my %HOLDER_FSTYPES = map { $_ => 1 } qw(
+    LVM2_member zfs_member linux_raid_member crypto_LUKS
+    ceph_bluestore bcache DDF_raid_member isw_raid_member
+    swsuspend
+);
+
+sub _fstype_blocker {
+    my ($node, $is_child) = @_;
+    my $fstype = $node->{fstype} // '';
+    return undef if $fstype eq '';
+    my $name = $node->{name} // 'it';
+    return "$name carries a $fstype signature" if $HOLDER_FSTYPES{$fstype};
+    # Name the child, so "2 partition(s)" plus two filesystems reads as which
+    # ones rather than as the same sentence twice.
+    return $is_child ? "$name holds a $fstype filesystem"
+                     : "holds a $fstype filesystem";
+}
+
+sub disk_blockers {
+    my ($entry, $st) = @_;
+    my @blockers;
+
+    return ['device not found'] if !$entry;
+
+    my $name = $entry->{name} // '';
+
+    # Already a member of this array - the most important case to name
+    # explicitly, or an operator could "wipe" a live member. Slot 0 is P and
+    # 29 is Q; rdevName is the physical partition, so compare on its disk.
+    if ($st) {
+        for my $key (keys %$st) {
+            next if $key !~ /^rdevName\.(\d+)$/;
+            my $slot = $1;
+            my $rdev = $st->{$key} // '';
+            next if $rdev eq '';
+            # rdevName is e.g. 'vde1'; strip the partition to get the disk.
+            # Anchored on the two real partition-naming forms, because a blind
+            # s/p?\d+$// also eats the trailing digits of whole-device names -
+            # 'nvme0n1' would become 'nvme0n', and 'mmcblk0' 'mmcblk'.
+            my $disk = $rdev;
+            if ($disk =~ /^(?:nvme\d+n\d+|mmcblk\d+|loop\d+|md\d+)$/) {
+                # Already a whole device whose name simply ends in a digit.
+            } elsif ($disk =~ /^(.*\d)p\d+$/) {
+                $disk = $1; # nvme0n1p3, mmcblk0p1, loop0p1
+            } else {
+                $disk =~ s/(?<=[a-zA-Z])\d+$//; # sda1, vde2, hdb3
+            }
+            if ($disk eq $name || $rdev eq $name) {
+                my $role = $slot == 0 ? 'parity P'
+                    : $slot == 29 ? 'parity Q'
+                    : "data slot $slot";
+                push @blockers, "already in this array as $role";
+                last;
+            }
+        }
+    }
+
+    push @blockers, "mounted at $entry->{mountpoint}"
+        if defined($entry->{mountpoint}) && $entry->{mountpoint} ne '';
+    push @blockers, _fstype_blocker($entry) // ()
+        if defined($entry->{fstype}) && $entry->{fstype} ne '';
+
+    # The WHOLE subtree, not just the direct children. lsblk nests, and the
+    # usual layout puts the thing that matters two levels down: disk -> part ->
+    # LVM/dm-crypt/MD. Looking only one level deep saw a bare 'part' and
+    # reported "1 partition(s)" - and since wipe_disks drops exactly that
+    # blocker as the reason one wipes, a disk whose partition carried a mounted
+    # root LV came out with no blockers at all and went to wipefs.
+    my @children = @{ $entry->{children} // [] };
+    my @queue = @children;
+    while (my $child = shift @queue) {
+        my $ctype = $child->{type} // '';
+        if (defined($child->{mountpoint}) && $child->{mountpoint} ne '') {
+            push @blockers, "$child->{name} is mounted at $child->{mountpoint}";
+        } elsif ($ctype ne 'part') {
+            # A non-partition descendant is a holder: LVM, dm-crypt, MD, a Ceph
+            # OSD. Undoing those is the business of the tool that made them.
+            push @blockers, "$child->{name} ($ctype) holds it";
+        }
+        # A descendant's SIGNATURE matters even when nothing is assembled from
+        # it right now. A ZFS vdev is the case that gets past everything else:
+        # 'sdb1' is type 'part' with fstype 'zfs_member' and, with the pool
+        # exported, no children at all - so it looked exactly like a spare
+        # carrying a partition table, which is the one blocker wipe drops.
+        push @blockers, _fstype_blocker($child, 1) // ()
+            if defined($child->{fstype}) && $child->{fstype} ne '';
+        push @queue, @{ $child->{children} // [] };
+    }
+    # Counted at the top level only: "3 partition(s)" describes the partition
+    # table, which is what is about to be erased.
+    my @parts = grep { ($_->{type} // '') eq 'part' } @children;
+    push @blockers, scalar(@parts) . " partition(s)" if @parts;
+
+    return \@blockers;
+}
+
+# 'nmdctl create'/'add' take slot:device:id. Build that from a validated set,
+# so the argv is testable without touching a disk.
+sub build_assign_specs {
+    my ($parity, $data, $first_slot) = @_;
+    my @specs;
+    my @p = @{ $parity // [] };
+    die "at most two parity disks (P and Q)\n" if scalar(@p) > 2;
+    push @specs, "P:$p[0]" if defined $p[0];
+    push @specs, "Q:$p[1]" if defined $p[1];
+    my $slot = $first_slot // 1;
+    for my $dev (@{ $data // [] }) {
+        die "no free data slot left (1..28)\n" if $slot > 28;
+        push @specs, "$slot:$dev";
+        $slot++;
+    }
+    return @specs;
+}
+
+# Lowest unused data slot, so 'add' extends an array rather than overwriting.
+sub next_free_slot {
+    my ($st) = @_;
+    my %used = map { $_ => 1 } data_slots($st);
+    for my $slot (1 .. 28) {
+        return $slot if !$used{$slot};
+    }
+    return undef;
+}
+
+sub decide_start_action {
+    my ($state, $autostart, $degraded) = @_;
+    $state //= '';
+
+    return { action => 'none' } if $state eq 'STARTED';
+
+    if ($state eq 'DISABLE_DISK' || $state eq 'RECON_DISK') {
+        return { action => 'start-degraded', assert => $state } if $autostart;
+        return {
+            action => 'die',
+            msg => "array is in state $state and nonraid-degraded-autostart is disabled;"
+                . " inspect with 'nmdctl status' and start manually with"
+                . " 'nmdctl start " . lc($state) . "'\n",
+        };
+    }
+
+    if ($state eq '' || $state eq 'STOPPED') {
+        return { action => 'start' } if !$degraded;
+        return { action => 'start-degraded' } if $autostart;
+        return {
+            action => 'die',
+            msg => "array is degraded and nonraid-degraded-autostart is disabled;"
+                . " inspect with 'nmdctl status' and start manually with 'nmdctl start'\n",
+        };
+    }
+
+    # NEW_ARRAY, SWAP_DSBL, ERROR:* - all require an operator ceremony that a
+    # storage plugin must never perform on its own.
+    return {
+        action => 'die',
+        msg => "array state '$state' requires operator action;"
+            . " see 'nmdctl status' and the NonRAID manual-management docs\n",
+    };
+}
+
+# Orchestration
+#
+# These are package subs rather than lexical ones purely so the unit tests can
+# reach them; the leading underscore marks them private. They are the layer
+# that builds argv and issues commands, which is exactly the layer worth
+# asserting on.
+
+sub _scfg_super {
+    my ($scfg) = @_;
+    return $scfg->{'nonraid-super'} // $DEFAULT_SUPER;
+}
+
+sub _scfg_disk_prefix {
+    my ($scfg) = @_;
+    return $scfg->{'nonraid-disk-prefix'} // $DEFAULT_DISK_PREFIX;
+}
+
+sub _pool_fsname {
+    my ($storeid) = @_;
+    return "nonraid-$storeid";
+}
+
+# abs_path returns undef for a path that does not exist yet (a superblock the
+# driver has not created), so fall back to lexical canonicalization.
+sub canon_path {
+    my ($p) = @_;
+    return undef if !defined($p) || $p eq '';
+    my $real = eval { Cwd::abs_path($p) };
+    return $real if defined($real) && $real ne '';
+    return File::Spec->canonpath($p);
+}
+
+# The driver takes its superblock as a module parameter, so exactly one array
+# is loaded per node. A storage configured for a different superblock must
+# refuse rather than serve whichever array happens to be running: the members,
+# and therefore the data, would be someone else's.
+# An empty live sbName is treated as "no claim", not as a mismatch. The driver
+# only populates it once a superblock has been read, so an empty value means
+# nothing has been imported yet - there is no other array to be confused with.
+# A STARTED array always names its superblock; if that ever stops being true,
+# this becomes a hole and the empty case has to start refusing instead.
+sub superblock_matches {
+    my ($st, $super) = @_;
+    my $live = $st->{sbName} // '';
+    return 1 if $live eq '';
+    my $a = canon_path($live) // $live;
+    my $b = canon_path($super) // $super;
+    return $a eq $b ? 1 : 0;
+}
+
+# nmdctl mounts data slot N from /dev/nmd<N>p1, or from a device-mapper node
+# carrying the same name for LUKS members.
+# Slaves of a device-mapper node, by kernel name ('nmd1p1'), or undef when
+# the path is not a dm device. Split out so the tests can inject one.
+sub dm_slaves {
+    my ($source) = @_;
+    my $real = canon_path($source);
+    return undef if !defined($real);
+    my ($dm) = $real =~ m{^/dev/(dm-\d+)$};
+    return undef if !defined($dm);
+    opendir(my $dh, "/sys/block/$dm/slaves") or return [];
+    my @slaves = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+    return \@slaves;
+}
+
+# Is this /proc/mounts source the array's own device for that slot?
+#
+# The driver exposes exactly one partition per slot, and nmdctl names the LUKS
+# mapping after it (diskName.N is 'nmdNp1'), so the only two legitimate forms
+# are /dev/nmdNp1 and a dm node whose slave is /dev/nmdNp1. Matching the mapper
+# by NAME is not good enough in either direction: 'nmd1p1' does not end on a
+# word boundary, so the real LUKS path fails it, while an unrelated mapping
+# that merely contains the string passes. The kernel's slave list is the fact.
+sub member_source_ok {
+    my ($source, $slot, $resolve) = @_;
+    return 0 if !defined($source);
+
+    my $member = "nmd${slot}p1";
+    return 1 if $source eq "/dev/$member";
+
+    $resolve //= \&dm_slaves;
+    my $slaves = $resolve->($source);
+    return 0 if !defined($slaves);
+    return scalar(grep { $_ eq $member } @$slaves) ? 1 : 0;
+}
+
+sub mount_entry_for {
+    my ($mountpoint, $mountdata) = @_;
+    my $real = Cwd::realpath($mountpoint) // $mountpoint;
+    my ($entry) = grep { $_->[1] eq $real || $_->[1] eq $mountpoint } @$mountdata;
+    return $entry;
+}
+
+# "Is the pool at $path the one this storage mounted?" - not merely "is
+# something mounted there". Used by the activation fast path and by status(),
+# so a foreign filesystem at the path can never be served as array content.
+# What the mounted pool is ACTUALLY built from, read out of the running
+# mergerfs process, or undef when that cannot be established.
+#
+# fsname proves whose pool is mounted, not what is in it: a pool mounted before
+# a slot changed keeps its fsname while unioning a stale member set. The
+# earlier attempt at this recorded the branches we INTENDED to mount into a
+# manifest file - which cannot answer the question for a pool we did not mount
+# (a pre-existing stale mount, a deleted manifest, a failed write). Adopting
+# the expected set as the observed set certified a guess as a fact.
+#
+# mergerfs takes its branches as an argv element, so the kernel is holding the
+# real answer the whole time. /proc/<pid>/comm is checked first so this reads
+# one tiny file per process rather than every cmdline on the node.
+sub mounted_pool_branches {
+    my ($storeid, $scfg, $procdir) = @_;
+    $procdir //= $ENV{PVE_NONRAID_PROC} // '/proc';
+
+    my $fsname = _pool_fsname($storeid);
+    my $want_mp = canon_path($scfg->{path}) // $scfg->{path};
+
+    opendir(my $dh, $procdir) or return undef;
+    my @pids = grep { /^\d+$/ } readdir($dh);
+    closedir($dh);
+
+    for my $pid (@pids) {
+        open(my $ch, '<', "$procdir/$pid/comm") or next;
+        my $comm = <$ch> // '';
+        close($ch);
+        chomp($comm);
+        next if $comm ne 'mergerfs';
+
+        open(my $fh, '<', "$procdir/$pid/cmdline") or next;
+        my $raw = do { local $/; <$fh> };
+        close($fh);
+        my @args = grep { defined($_) && $_ ne '' } split(/\0/, $raw // '');
+        next if scalar(@args) < 3;
+
+        # Ours? The fsname rides in the -o option string.
+        next if !grep { index($_, "fsname=$fsname") >= 0 } @args;
+
+        # mergerfs argv ends '<branches> <mountpoint>'.
+        my $mp = $args[-1];
+        next if (canon_path($mp) // $mp) ne $want_mp;
+
+        return [sort grep { $_ ne '' } split(/:/, $args[-2])];
+    }
+    return undef;
+}
+
+sub _expected_branches {
+    my ($scfg, $st) = @_;
+    return () if !$st;
+    my $prefix = _scfg_disk_prefix($scfg);
+    return map { $prefix . $_ } data_slots($st);
+}
+
+# undef = the mount could not be inspected; 1 = branches match the live array;
+# 0 = they do not. Never "assume it is fine".
+sub pool_branches_match {
+    my ($storeid, $scfg, $st) = @_;
+    my $actual = mounted_pool_branches($storeid, $scfg);
+    return undef if !defined($actual);
+    my @want = sort(_expected_branches($scfg, $st));
+    return 0 if scalar(@$actual) != scalar(@want);
+    for my $i (0 .. $#want) {
+        return 0 if $actual->[$i] ne $want[$i];
+    }
+    return 1;
+}
+
+sub pool_is_ours {
+    my ($storeid, $scfg, $mountdata, $st) = @_;
+    my $entry = mount_entry_for($scfg->{path}, $mountdata)
+        or return 0;
+    return 0 if $entry->[2] ne 'fuse.mergerfs';
+    return 0 if $entry->[0] ne _pool_fsname($storeid);
+
+    # Ours by name; ours by content? Fail closed when that cannot be
+    # established - the slow path then reports what is wrong instead of this
+    # returning a cheerful yes about a pool it could not look inside.
+    return pool_branches_match($storeid, $scfg, $st) ? 1 : 0;
+}
+
+# A STOPPED array's degradedness is only knowable after import, so a policy
+# refusal for one costs an import - and the array stays STOPPED, so pvestatd's
+# next cycle would pay it again, every cycle, forever. The refusal is cached
+# for long enough to make that a slow poll instead of a hot loop, and short
+# enough that fixing the array by hand is noticed without a restart.
+my $REFUSAL_TTL = 300;
+
+sub _refusal_stamp {
+    my ($storeid) = @_;
+    return _run_dir() . "/refused-$storeid";
+}
+
+sub _recent_refusal {
+    my ($storeid) = @_;
+    my $file = _refusal_stamp($storeid);
+    my @st = stat($file) or return undef;
+    return undef if (time() - $st[9]) > $REFUSAL_TTL;
+    open(my $fh, '<', $file) or return undef;
+    my $msg = do { local $/; <$fh> };
+    close($fh);
+    return (defined($msg) && $msg ne '') ? $msg : undef;
+}
+
+sub _record_refusal {
+    my ($storeid, $msg) = @_;
+    return if !eval { make_path(_run_dir()); 1 };
+    if (open(my $fh, '>', _refusal_stamp($storeid))) {
+        print {$fh} $msg;
+        close($fh);
+    }
+}
+
+sub _clear_refusal {
+    my ($storeid) = @_;
+    unlink(_refusal_stamp($storeid));
+}
+
+# nmdctl capability, checked at runtime rather than pinned as a package
+# version. The commands below need 1.23 semantics - the expected-state argument
+# to 'start', and '-u' - and the dpkg route to enforcing that does not work:
+# the in-tree tools/debian/changelog says 1.0.0-1, so a locally built
+# nonraid-tools could never satisfy a bound that release artifacts do, and dpkg
+# orders 1.4.0 BELOW 1.23 anyway. Asking the tool what it is avoids both traps.
+my $NMDCTL_MIN = [1, 23];
+
+# Pure, so the parsing is testable without a binary present.
+sub nmdctl_version_ok {
+    my ($output, $min) = @_;
+    $min //= $NMDCTL_MIN;
+    my ($major, $minor) = ($output // '') =~ /version\s+(\d+)\.(\d+)/;
+    return undef if !defined($major); # unparseable - caller decides
+    return 1 if $major > $min->[0];
+    return 0 if $major < $min->[0];
+    return $minor >= $min->[1] ? 1 : 0;
+}
+
+sub _check_nmdctl {
+    my ($storeid) = @_;
+
+    # Once per boot: nmdctl cannot change version under a running system
+    # without the package being replaced, and the slow path is already the
+    # expensive one without adding a fork to it every time.
+    my $stamp = _run_dir() . '/nmdctl-checked';
+    return if -e $stamp;
+
+    my $out = '';
+    eval {
+        run_command([$NMDCTL, '--version'], timeout => 15,
+            outfunc => sub { $out .= shift . "\n" },
+            errfunc => sub { });
+    };
+    die "cannot run $NMDCTL - is nonraid-tools installed? ($@)\n" if $@;
+
+    my $ok = nmdctl_version_ok($out);
+    if (!defined($ok)) {
+        # Unrecognised output is not fatal: a fork of the tool may well be
+        # capable and simply not say so in this format. Say what was assumed.
+        syslog('warning', '%s', "storage $storeid: could not read a version from"
+            . " '$NMDCTL --version'; assuming it supports 1.23 semantics");
+        return;
+    }
+    die "nonraid-tools is too old: $NMDCTL reports \""
+        . (split /\n/, $out)[0] . "\", and this plugin needs"
+        . " $NMDCTL_MIN->[0].$NMDCTL_MIN->[1] semantics (the expected-state"
+        . " argument to 'start', and '-u')\n" if !$ok;
+
+    if (eval { make_path(_run_dir()); 1 } && open(my $fh, '>', $stamp)) {
+        close($fh);
+    }
+    return;
+}
+
+sub _ensure_array_started {
+    my ($storeid, $scfg, $st) = @_;
+
+    my $super = _scfg_super($scfg);
+    my $state = $st ? ($st->{mdState} // '') : '';
+
+    # Before anything is issued: an old nmdctl would take the commands below
+    # and do something subtly different with them.
+    _check_nmdctl($storeid);
+
+    if ($st) {
+        die "a different NonRAID array is loaded (superblock '$st->{sbName}',"
+            . " this storage is configured for '$super'); the driver holds one"
+            . " array per node\n"
+            if !superblock_matches($st, $super);
+    }
+    if ($state eq 'STARTED') {
+        _clear_refusal($storeid);
+        return 0;
+    }
+
+    # Operator-only states are refused before importing anything: import
+    # mutates member state, and the refusal promises that nothing was touched.
+    my $autostart = $scfg->{'nonraid-degraded-autostart'} // 1;
+    if ($state ne '' && $state ne 'STOPPED') {
+        # $degraded is undef ON PURPOSE: pre-import counters are meaningless
+        # (nmdstat_health's own contract is post-import), and the states this
+        # guard admits never consult the flag. Passing the real value here
+        # worked only by that coincidence - anyone adding a degraded check to
+        # the DISABLE_DISK branch would silently start consuming a pre-import
+        # number. undef turns that mistake into a visible warning instead.
+        my $pre = decide_start_action($state, $autostart, undef);
+        die $pre->{msg} if $pre->{action} eq 'die';
+    }
+
+    # Re-raise a still-fresh refusal without importing again.
+    if (my $cached = _recent_refusal($storeid)) {
+        die $cached;
+    }
+
+    # Import loads the module if needed, and only with members imported do the
+    # degraded counters mean anything. Idempotent - imported slots are skipped.
+    run_command(
+        [$NMDCTL, '-u', '-s', $super, 'import'],
+        timeout => 120,
+        errmsg => "NonRAID disk import failed",
+    );
+    $st = read_nmdstat()
+        or die "cannot read /proc/nmdstat after import - module did not load?\n";
+    $state = $st->{mdState} // '';
+
+    die "a different NonRAID array is loaded (superblock '$st->{sbName}',"
+        . " this storage is configured for '$super')\n"
+        if !superblock_matches($st, $super);
+
+    my $health = nmdstat_health($st);
+    my $decision = decide_start_action($state, $autostart, $health->{degraded});
+
+    if ($decision->{action} eq 'none') {
+        _clear_refusal($storeid);
+        return 0;
+    }
+    if ($decision->{action} eq 'die') {
+        _record_refusal($storeid, $decision->{msg});
+        die $decision->{msg};
+    }
+
+    my $cmd = [$NMDCTL, '-u', '-v', '-s', $super, 'start'];
+    if ($decision->{action} eq 'start-degraded') {
+        my $why = $decision->{assert} // "degraded ($health->{summary})";
+        syslog('warning', '%s', "storage $storeid: NonRAID array is $why"
+            . " - starting DEGRADED, redundancy is compromised");
+        warn "WARNING: starting NonRAID array in degraded state\n";
+        push @$cmd, $decision->{assert} if defined($decision->{assert});
+    }
+    # 120s, not more: nmdctl returns as soon as the driver accepts the command
+    # (the parity build runs in the background), so this bound is against a
+    # wedged nmdctl, not normal operation - and it runs under the cluster-wide
+    # storage config lock, which every node's config changes wait on.
+    run_command($cmd, timeout => 120, errmsg => "NonRAID array start failed");
+
+    my $new = read_nmdstat();
+    my $new_state = $new ? ($new->{mdState} // 'unknown') : 'unknown';
+    die "array did not reach STARTED (state: $new_state)\n" if $new_state ne 'STARTED';
+    _clear_refusal($storeid);
+    return 1;
+}
+
+sub _ensure_members_mounted {
+    my ($scfg) = @_;
+    # Idempotent: nmdctl skips mounted slots, creates mountpoints, and handles
+    # LUKS members and /etc/nonraid/fstab option overrides itself.
+    run_command(
+        [$NMDCTL, '-u', 'mount', _scfg_disk_prefix($scfg)],
+        timeout => 120,
+        errmsg => 'mounting NonRAID member disks failed',
+    );
+}
+
+# The fsname is plugin-owned state, not decoration: pool_is_ours() and the
+# teardown in pve-nonraid.service both identify pools by it. Appending it
+# after any operator override means a custom option string cannot silently
+# orphan the pool at shutdown (mergerfs takes the last occurrence).
+sub build_mergerfs_opts {
+    my ($storeid, $scfg) = @_;
+    my $opts = $scfg->{'nonraid-mergerfs-opts'};
+    return default_mergerfs_opts($storeid) if !defined($opts) || $opts eq '';
+    return "$opts,fsname=" . _pool_fsname($storeid);
+}
+
+sub _ensure_pool_mounted {
+    my ($storeid, $scfg) = @_;
+
+    my $path = $scfg->{path};
+    my $mountdata = PVE::ProcFSTools::parse_proc_mounts();
+
+    if (my $entry = mount_entry_for($path, $mountdata)) {
+        die "'$path' is already occupied by a foreign filesystem"
+            . " ($entry->[0], type $entry->[2])\n"
+            if $entry->[2] ne 'fuse.mergerfs';
+        die "'$path' holds a mergerfs pool belonging to another storage"
+            . " ($entry->[0])\n"
+            if $entry->[0] ne _pool_fsname($storeid);
+
+        # Ours, mounted - but built from which branches? Without this the
+        # fast path's refusal would land here and return silently, leaving the
+        # stale pool serving. mergerfs cannot be re-branched in place, so this
+        # needs an operator either way.
+        my $live = read_nmdstat();
+        my $actual = mounted_pool_branches($storeid, $scfg);
+        die "'$path' holds a mergerfs pool this plugin cannot inspect (no"
+            . " mergerfs process found for fsname " . _pool_fsname($storeid)
+            . " at that path), so its member list cannot be verified."
+            . " Unmount it and activate again.\n"
+            if !defined($actual);
+
+        my @want = sort(_expected_branches($scfg, $live));
+        if (join('|', @$actual) ne join('|', @want)) {
+            die "'$path' holds a pool built from a different set of members"
+                . " (mounted: @$actual; array now has: @want). The array"
+                . " changed while the pool stayed up; stop it with"
+                . " 'systemctl stop pve-nonraid.service' (or umount '$path')"
+                . " and activate again.\n";
+        }
+        return;
+    }
+
+    my $st = read_nmdstat()
+        or die "cannot read /proc/nmdstat - is the md-nonraid module loaded?\n";
+
+    # The branch list is derived from the live array, never from a glob: a
+    # glob silently includes foreign directories under the prefix and, worse,
+    # silently omits a member whose mount failed.
+    my $prefix = _scfg_disk_prefix($scfg);
+    my @slots = data_slots($st);
+    die "array reports no data disks\n" if !@slots;
+
+    my (@branches, @missing, @foreign);
+    for my $slot (@slots) {
+        my $branch = $prefix . $slot;
+        push @branches, $branch;
+        my $entry = mount_entry_for($branch, $mountdata);
+        if (!$entry) {
+            push @missing, $branch;
+        } elsif (!member_source_ok($entry->[0], $slot)) {
+            # Something other than the array's own member device is mounted
+            # where slot N belongs - unioning it would take foreign data into
+            # the pool and expose it as array content.
+            push @foreign, "$branch ($entry->[0])";
+        }
+    }
+    die "member disk(s) not mounted: @missing\n" if @missing;
+    die "member mount(s) not backed by the array: @foreign\n" if @foreign;
+
+    make_path($path);
+    run_command(
+        [$MERGERFS, '-o', build_mergerfs_opts($storeid, $scfg), join(':', @branches), $path],
+        timeout => 60,
+        errmsg => 'mergerfs pool mount failed',
+    );
+
+    # Member mounts are not re-checked per status() cycle on purpose: once the
+    # pool is up mergerfs holds every branch busy, so a member cannot be
+    # unmounted from under it, and the check would fork on pvestatd's path.
+}
+
+# The correcting check is owed by the ARRAY, not by the activation that
+# noticed. Tying it to "this invocation moved the array to STARTED" meant an
+# array someone started by hand never got one, and a check that failed to
+# start was never retried - in both cases the marker was rewritten and the
+# reason to correct disappeared with it.
+#
+# Next to the marker rather than under /run: the debt outlives a reboot.
+sub _correction_pending_file {
+    return _marker_file() . '.correct-pending';
+}
+
+# Recording is NOT best-effort, and it has to happen before the array is
+# started or the pool is mounted. If the debt cannot be written after those
+# steps, the caller can only refuse to report activation as successful with
+# the array already up and guests possibly attaching to it - the worse of two
+# bad options. Called before anything is mutated instead, a failure here
+# means nothing has happened yet: the caller dies, nothing is started, and
+# pvestatd retries the whole slow path from a clean state.
+#
+# A false here is not "no debt to record" - that case (no leftover marker, or
+# the pending file already exists) returns true. It means an unclean shutdown
+# WAS detected and the obligation to correct for it could not be made
+# durable: without failing the caller, _ensure_bookkeeping would find no
+# pending file once the array is up, start no check, and report success - the
+# unclean shutdown the marker was reporting would be forgotten.
+sub _record_correction_debt {
+    my ($storeid, $unclean) = @_;
+    return 1 if !$unclean || -e _correction_pending_file();
+
+    my $recorded = 0;
+    if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }) {
+        if (open(my $fh, '>', _correction_pending_file())) {
+            $recorded = 1 if close($fh);
+        }
+    }
+    if (!$recorded) {
+        syslog('warning', '%s', "storage $storeid: unclean shutdown"
+            . " detected but the correcting-check debt could not be"
+            . " recorded at " . _correction_pending_file() . " ($!)");
+        warn "could not record the correcting-check debt: $!\n";
+    }
+    return $recorded;
+}
+
+# Pay the correcting-parity debt if one is outstanding. Called from
+# _ensure_bookkeeping, which means from BOTH paths: a check that could not be
+# started - the driver busy, nmdctl missing - used to be retried only by
+# another slow activation, and once the array was up no slow activation ever
+# came. The debt file outlives reboots, so the retry has to reach it from the
+# path that actually runs.
+sub _ensure_correction {
+    my ($storeid, $scfg) = @_;
+    return 1 if !-e _correction_pending_file();
+
+    syslog('warning', '%s', "storage $storeid: unclean shutdown detected"
+        . " - starting correcting parity check");
+    my $ok = eval {
+        run_command(
+            [$NMDCTL, '-u', '-s', _scfg_super($scfg), 'check', 'correct'],
+            timeout => 60,
+        );
+        1;
+    };
+    if ($ok) {
+        unlink(_correction_pending_file());
+        return 1;
+    }
+    # Left in place on purpose: the next activation tries again.
+    syslog('warning', '%s', "storage $storeid: could not start the"
+        . " correcting parity check ($@) - will retry on the next"
+        . " activation");
+    warn "could not start parity check: $@";
+    return 0;
+}
+
+# The unclean-shutdown marker. Written on every activation, not only the one
+# that started the array: an array brought up by hand still needs it, or a
+# later crash looks like a clean stop and parity is never re-checked.
+#
+# fsync matters here more than it looks: the marker's whole job is to survive
+# a crash, and an unsynced empty file is precisely what a crash loses.
+sub _ensure_marker {
+    my ($storeid) = @_;
+    my $marker = _marker_file();
+    return 1 if -e $marker;
+
+    my $fh;
+    my $err;
+    if (!eval { make_path(File::Basename::dirname($marker)); 1 }) {
+        $err = $@ || 'make_path failed';
+    } elsif (!open($fh, '>', $marker)) {
+        $err = "$!";
+    } else {
+        # flush and sync both have to be checked, and so does the eval: a
+        # marker that never reached the platter is exactly the marker a crash
+        # loses, and accepting it because close() happened to succeed is how
+        # the correcting check silently stops running.
+        my $durable = eval { $fh->flush && $fh->sync };
+        $err = ($@ || "$!") if !$durable;
+        my $closed = close($fh);
+        $err //= "$!" if !$closed;
+        # A marker we cannot vouch for is worse than none: it reads as "the
+        # array came up cleanly" on the next boot.
+        unlink($marker) if defined($err);
+    }
+
+    if (defined($err)) {
+        syslog('warning', '%s', "storage $storeid: cannot write $marker"
+            . " ($err) - an unclean shutdown will not be detected");
+        warn "could not write $marker: $err\n";
+        return 0;
+    }
+    return 1;
+}
+
+# nonraid-tools' own unit (nonraid.service, oneshot + RemainAfterExit) may
+# still own this array on a host upgraded from before the two learned to
+# coexist: its ConditionPathExists only skips a FUTURE start, it does not stop
+# an already-active unit. Its ExecStop tears down mounts and the array, so
+# nothing here may start or mount alongside it - refuse and say how to fix it.
+# Same "invocation:" liveness check as _ensure_unit_registered below, so this
+# stays a stat rather than a fork.
+sub _refuse_if_legacy_unit_active {
+    my ($storeid) = @_;
+    die "refusing to activate storage '$storeid': nonraid.service"
+        . " (nonraid-tools) is active and already owns the NonRAID array on"
+        . " this node. Stop it deliberately - its ExecStop unmounts members"
+        . " and stops the array - with 'systemctl disable --now"
+        . " nonraid.service', then retry.\n"
+        if -l _systemd_units_dir() . '/invocation:nonraid.service';
+    return;
+}
+
+# The unit's ExecStop is the ordered teardown (pools -> members -> array); its
+# ExecStart activates enabled storages for onboot guests. --no-block is
+# required, not cosmetic: when the unit itself is what triggered this
+# activation, a blocking start would wait on the job that is running us.
+#
+# The stamp records that this boot already registered it, so the fast path can
+# tell "done" from "never happened" with a stat instead of forking systemctl
+# on every pvestatd cycle.
+sub _ensure_unit_registered {
+    my ($storeid) = @_;
+
+    # systemd's own liveness record, not a stamp of our own. A stamp only says
+    # "we started it once this boot" - it survives `systemctl stop`, so an
+    # operator who stopped the unit by hand lost the ordered teardown for the
+    # rest of the boot with nothing to notice it. This symlink exists exactly
+    # while the unit is active (verified: gone after stop, back after start),
+    # and reading it is a stat, so the fast path stays fork-free in the
+    # settled case.
+    return 1 if -l _systemd_units_dir() . '/invocation:pve-nonraid.service';
+
+    eval {
+        run_command(['/usr/bin/systemctl', 'start', '--no-block', 'pve-nonraid.service'],
+            timeout => 15);
+    };
+    if ($@) {
+        syslog('warning', '%s', "storage $storeid: could not start pve-nonraid.service"
+            . " ($@) - ordered shutdown teardown is not registered, retrying"
+            . " on the next activation");
+        warn "could not start pve-nonraid.service: $@";
+        return 0;
+    }
+    return 1;
+}
+
+# Both steps are idempotent and independently retryable, and the fast path
+# calls this too. Without that, a single transient failure - a full or
+# read-only /var, systemd busy for a moment - would persist for as long as the
+# array stays up, because every later activation short-circuits before
+# reaching here. Two stats in the settled case.
+sub _ensure_bookkeeping {
+    my ($storeid, $scfg) = @_;
+    my $ok = _ensure_marker($storeid);
+    $ok = _ensure_unit_registered($storeid) && $ok;
+    $ok = _ensure_correction($storeid, $scfg) && $ok if $scfg;
+    return $ok;
+}
+
+sub _log_health_transition {
+    my ($storeid, $health) = @_;
+
+    my $file = "$HEALTH_DIR/$storeid.health";
+    my $prev = '';
+    if (open(my $fh, '<', $file)) {
+        $prev = <$fh> // '';
+        chomp $prev;
+        close($fh);
+    }
+    return if $prev eq $health->{summary};
+
+    make_path($HEALTH_DIR);
+    if (open(my $fh, '>', $file)) {
+        print $fh "$health->{summary}\n";
+        close($fh);
+    }
+
+    my $msg = "storage $storeid: array health changed:"
+        . " '" . ($prev || 'unknown') . "' -> '$health->{summary}'";
+    $msg .= " ($health->{resync_pct}%)" if defined($health->{resync_pct});
+    syslog($health->{degraded} ? 'warning' : 'notice', '%s', $msg);
+}
+
+# Disk actions
+#
+# These run from the storage create/update hooks, which hold the cluster-wide
+# storage config lock - so everything here must return promptly. nmdctl create,
+# start and check all return as soon as the driver accepts the command; the
+# parity build then runs in the kernel. Nothing here waits for it.
+
+sub _lsblk_entry {
+    my ($dev) = @_;
+    my $json = '';
+    eval {
+        run_command(
+            ['/usr/bin/lsblk', '-J', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', $dev],
+            timeout => 15,
+            outfunc => sub { $json .= shift },
+            errfunc => sub { },
+        );
+    };
+    return undef if $@ || $json eq '';
+    my $decoded = eval { JSON::PP::decode_json($json) };
+    return undef if !$decoded;
+    return $decoded->{blockdevices}->[0];
+}
+
+# Every device named by an action goes through the gate first, and the error
+# lists every reason for every device rather than dying on the first - an
+# operator fixing three disks should not have to discover them one at a time.
+my sub require_assignable {
+    my ($devs, $st) = @_;
+    my @problems;
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
+        my $blockers = disk_blockers(_lsblk_entry($dev), $st);
+        push @problems, "$dev: " . join(', ', @$blockers) if @$blockers;
+    }
+    die "refusing to touch these disks:\n  " . join("\n  ", @problems) . "\n"
+        if @problems;
+}
+
+# Mountpoints that belong to a configured PVE storage, as a path => storeid
+# map. Wrapped in eval and split out so the unit tests can stub it: reading the
+# cluster config is not something the pure-helper tests should need.
+sub configured_storage_paths {
+    my $paths = {};
+    my $cfg = eval { PVE::Storage::config() };
+    return $paths if !$cfg || ref($cfg->{ids}) ne 'HASH';
+    for my $sid (keys %{ $cfg->{ids} }) {
+        my $scfg = $cfg->{ids}->{$sid};
+        for my $key (qw(path mountpoint export)) {
+            my $p = $scfg->{$key};
+            $paths->{$p} = $sid if defined($p) && $p ne '';
+        }
+    }
+    return $paths;
+}
+
+# Why a mountpoint may not be unmounted from here, or undef if it may.
+#
+# system_mountpoint() alone was not enough. It covers /, /boot, /usr and the
+# rest, but not /mnt/pve/* - so another PVE storage's filesystem was fair game,
+# and because run_disk_actions goes unmount -> wipe in one pass and wipe_disks
+# re-reads lsblk, a single call could unmount that storage, observe the disk is
+# no longer mounted, and wipe it out from under running guests. Each step's own
+# guard was right; the sequence walked between them.
+sub unmount_refusal {
+    my ($mp, $storage_paths) = @_;
+    return undef if !defined($mp) || $mp eq '';
+
+    return "it is the system mountpoint '$mp'" if system_mountpoint($mp);
+
+    $storage_paths //= {};
+    for my $path (keys %$storage_paths) {
+        next if $path ne $mp && index($mp, "$path/") != 0;
+        return "'$mp' belongs to the configured storage"
+            . " '$storage_paths->{$path}'";
+    }
+    return undef;
+}
+
+my sub unmount_disks {
+    my ($storeid, $devs, $st) = @_;
+
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
+        my $entry = _lsblk_entry($dev)
+            or die "'$dev': device not found\n";
+
+        # Only unmounting. A holder - LVM, ZFS, MD, a Ceph OSD - is undone by
+        # the tool that created it, and guessing at that from here is how an
+        # unrelated pool gets destroyed.
+        my @children = @{ $entry->{children} // [] };
+        for my $child (@children) {
+            my $ctype = $child->{type} // '';
+            die "'$dev' is held by $child->{name} ($ctype); release it with the"
+                . " tool that created it (LVM, ZFS, Ceph, mdadm) first\n"
+                if $ctype ne 'part';
+        }
+
+        # An array member must never be unmounted this way: it would pull a
+        # live filesystem out from under the pool.
+        my $blockers = disk_blockers($entry, $st);
+        for my $b (@$blockers) {
+            die "'$dev' is $b\n" if $b =~ /already in this array/;
+        }
+
+        my @points = grep { defined($_) && $_ ne '' }
+            ($entry->{mountpoint}, map { $_->{mountpoint} } @children);
+
+        # Checked before anything is unmounted, so a disk carrying both a data
+        # filesystem and a protected one is refused outright rather than half
+        # done.
+        my $storage_paths = configured_storage_paths();
+        for my $mp (@points) {
+            my $why = unmount_refusal($mp, $storage_paths);
+            die "refusing to unmount '$dev': $why\n" if defined($why);
+        }
+
+        if (!@points) {
+            syslog('info', '%s', "storage $storeid: '$dev' is not mounted, nothing to do");
+            next;
+        }
+        for my $mp (@points) {
+            syslog('warning', '%s', "storage $storeid: unmounting '$mp' ($dev) on request");
+            run_command(['/bin/umount', $mp], timeout => 60,
+                errmsg => "could not unmount '$mp'");
+        }
+    }
+}
+
+# Wiping goes through here rather than straight to PVE's /disks/wipedisk,
+# which is the obvious implementation and the wrong one: that endpoint knows
+# nothing about NonRAID, and a live array member looks exactly like a spare to
+# it - not mounted (the driver's /dev/nmdNp1 is), no holder, just partitions.
+# Wiping one destroys a member beneath the parity layer. So membership is
+# checked here first, and only then is the disk wiped.
+my sub wipe_disks {
+    my ($storeid, $devs, $st) = @_;
+
+    for my $dev (@$devs) {
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
+        my $entry = _lsblk_entry($dev)
+            or die "'$dev': device not found\n";
+
+        # Partitions are why one wipes, so they are not a blocker here. Every
+        # other reason still is.
+        # A partition table and an ordinary filesystem are the two things
+        # 'wipefs -a' is for; everything else - mountpoints, holders, holder
+        # signatures at any depth, array membership - stays fatal.
+        #
+        # This is a check-then-act: nothing stops the disk being claimed
+        # between the lsblk here and the wipefs below. The window is small and
+        # the hook holds the cluster storage lock, but it is a window, and this
+        # gate is the only thing between an operator and wipefs -a.
+        my @fatal = grep { !/^\d+ partition/ && !/holds a .* filesystem$/ }
+            @{ disk_blockers($entry, $st) };
+        die "refusing to wipe '$dev': " . join(', ', @fatal) . "\n" if @fatal;
+
+        syslog('warning', '%s', "storage $storeid: wiping '$dev' on request"
+            . " - its contents are being destroyed");
+        # -a takes every signature on the device, the partition table included.
+        run_command(['/sbin/wipefs', '-a', $dev], timeout => 120,
+            errmsg => "wiping '$dev' failed");
+        eval { run_command(['/usr/bin/udevadm', 'trigger', $dev], timeout => 30) };
+    }
+}
+
+my sub create_array {
+    my ($storeid, $scfg, $parity, $data) = @_;
+
+    die "nonraid-create-parity needs at least one disk\n" if !@$parity;
+    die "nonraid-create-data needs at least one disk\n" if !@$data;
+
+    my $st = read_nmdstat();
+
+    # One array per node - the superblock is a module parameter - so building
+    # one on top of a loaded array would take its disks with it.
+    # Two distinct situations, and the advice differs: a module that is merely
+    # loaded with nothing assigned reports STOPPED with mdNumDisks=0, and
+    # telling that operator to "stop and unassign it" is advice about an array
+    # that does not exist.
+    if ($st && nmdstat_num($st->{mdNumDisks}) > 0) {
+        die "an array is already loaded (state '" . ($st->{mdState} // '?')
+            . "', superblock '" . ($st->{sbName} // '?') . "'); stop and unassign"
+            . " it with nmdctl before building a new one\n";
+    }
+    if ($st && ($st->{mdState} // '') ne '' && ($st->{mdState} // '') ne 'STOPPED') {
+        die "the NonRAID module is in state '$st->{mdState}' with no disks"
+            . " assigned; let it settle (or reload it) before building an"
+            . " array\n";
+    }
+
+    # Deduped on the resolved path, not the string: /dev/sdb and
+    # /dev/disk/by-id/... can be the same disk, and assigning one disk to two
+    # slots would build an array on top of itself.
+    my %seen;
+    for my $dev (@$parity, @$data) {
+        my $real = canon_path($dev) // $dev;
+        die "'$dev' listed twice\n" if $seen{$real}++;
+    }
+    require_assignable([@$parity, @$data], $st);
+
+    my @specs = build_assign_specs($parity, $data, 1);
+    my $super = _scfg_super($scfg);
+    syslog('warning', '%s', "storage $storeid: creating a NonRAID array on $super"
+        . " with " . join(' ', @specs) . " - this destroys their contents");
+
+    run_command([$NMDCTL, '-u', '-s', $super, 'create', '--force', @specs],
+        timeout => 120, errmsg => 'creating the NonRAID array failed');
+
+    # A freshly created array sits in NEW_ARRAY, which activation refuses by
+    # design. Start it here so the storage this hook is creating can actually
+    # come up; the parity build the driver then begins runs in the kernel, so
+    # this returns without holding the storage lock for it.
+    run_command([$NMDCTL, '-u', '-v', '-s', $super, 'start', 'NEW_ARRAY'],
+        # 120s like the degraded start above: nmdctl returns on driver
+        # acceptance, so these bounds guard a wedged tool while the hook holds
+        # the cluster storage lock.
+        timeout => 120, errmsg => 'starting the new array failed');
+    run_command([$NMDCTL, '-u', '-s', $super, 'check', 'recon'],
+        timeout => 60, errmsg => 'starting the parity build failed');
+
+    syslog('warning', '%s', "storage $storeid: array created and started;"
+        . " parity is building - watch it with 'nmdctl status'");
+}
+
+# Actions are consumed here and deleted from the config, so they never persist.
+# Two guards that the disk actions share, both of which exist because these
+# properties travel on a CLUSTER-level endpoint while the thing they destroy is
+# one node's hardware.
+
+# Device names are node-local, and POST/PUT /storage is served by whichever
+# node the client happens to be talking to - not by the node in 'nodes'. The
+# GUI makes that gap sharp rather than obvious: it lists the disks of the node
+# in the Nodes field (/nodes/{node}/disks/list) and then submits to /storage
+# with no node at all. An operator who set nodes=nodeB, saw nodeB's inventory
+# and picked /dev/sdb from it would have wiped nodeA's /dev/sdb - and if that
+# happened to be an unpartitioned spare, every blocker check would have passed.
+sub _check_disk_action_node {
+    my ($storeid, $scfg) = @_;
+
+    # Not $local: "$local's" interpolates as the package variable $local::s.
+    my $here = PVE::INotify::nodename();
+    my $nodes = $scfg->{nodes};
+
+    # Unset means "every node", which for an array that exists on exactly one
+    # machine is never what was meant - and for a destructive action it is the
+    # case where nobody has thought about which machine it is.
+    die "refusing disk actions on storage '$storeid': it has no 'nodes'"
+        . " restriction, so there is nothing to say these disks belong to"
+        . " $here. Set --nodes to the node that has the array.\n"
+        if !$nodes || !%$nodes;
+
+    # More than one node named is a legacy configuration check_config lets
+    # stay editable, but the driver holds exactly one array per node - naming
+    # several authorises destructive actions on all of them, since this test
+    # only ever checked "does $here appear", not "is $here the only one".
+    die "refusing disk actions on storage '$storeid': its 'nodes' restriction"
+        . " names more than one node ('" . join(',', sort keys %$nodes) . "'),"
+        . " but a NonRAID array is one node's hardware and device names are"
+        . " node-local - naming several would authorise this action on all"
+        . " of them. Set --nodes to the single node that has the array.\n"
+        if scalar(keys %$nodes) != 1;
+
+    die "refusing disk actions on storage '$storeid': these disks belong to"
+        . " '" . join(',', sort keys %$nodes) . "', but this request is being"
+        . " served by '$here' and device names are node-local. Re-issue it"
+        . " against the target node.\n"
+        if !$nodes->{$here};
+
+    return $here;
+}
+
+# PVE gates the equivalent operation (/nodes/{node}/disks/wipedisk) on
+# Sys.Modify for that node - its API entry carries no permissions block at all,
+# which makes it root@pam-only. These properties ride in on POST/PUT /storage,
+# which needs only Datastore.Allocate on /storage. Routing around
+# /disks/wipedisk was right - it cannot see NonRAID membership, so a live
+# member looks exactly like a spare to it - but the privilege that came with it
+# has to be carried over by hand, or a delegated storage admin inherits the
+# ability to erase any block device on the node.
+sub _check_disk_action_perms {
+    my ($storeid, $node) = @_;
+
+    my $rpcenv = eval { PVE::RPCEnvironment::get() };
+    # No API environment: pvesm/pvesh from a shell, or the unit tests. Those
+    # are already root-only by virtue of being a local root shell.
+    return if !$rpcenv;
+
+    my $user = eval { $rpcenv->get_user() };
+    return if !defined($user);
+
+    $rpcenv->check($user, "/nodes/$node", ['Sys.Modify']);
+    return;
+}
+
+my sub run_disk_actions {
+    my ($storeid, $scfg, $target) = @_;
+
+    my $unmount = $target->{'nonraid-unmount-disks'};
+    my $wipe = $target->{'nonraid-wipe-disks'};
+    my $parity = $target->{'nonraid-create-parity'};
+    my $data = $target->{'nonraid-create-data'};
+
+    delete $target->{'nonraid-unmount-disks'};
+    delete $target->{'nonraid-wipe-disks'};
+    delete $target->{'nonraid-create-parity'};
+    delete $target->{'nonraid-create-data'};
+
+    my $wanted = grep { defined($_) && $_ ne '' } ($unmount, $wipe, $parity, $data);
+    return if !$wanted;
+
+    # Both before anything is touched, and in this order: establish WHICH node
+    # these device names belong to, then whether the caller may modify it.
+    #
+    # The check is against the config that will RESULT, not the one on disk: an
+    # update that repoints 'nodes' at another node in the same call must not be
+    # able to authorise itself against the old value. On the add path the two
+    # are the same hash.
+    my $effective = { %{ $scfg // {} }, %{ $target // {} } };
+    my $node = _check_disk_action_node($storeid, $effective);
+    _check_disk_action_perms($storeid, $node);
+
+    # Ordered the way the operator works: free it, clear it, then use it.
+    unmount_disks($storeid, [PVE::Tools::split_list($unmount)], read_nmdstat())
+        if defined($unmount) && $unmount ne '';
+
+    wipe_disks($storeid, [PVE::Tools::split_list($wipe)], read_nmdstat())
+        if defined($wipe) && $wipe ne '';
+
+    if ((defined($parity) && $parity ne '') || (defined($data) && $data ne '')) {
+        create_array(
+            $storeid, $scfg,
+            [PVE::Tools::split_list($parity // '')],
+            [PVE::Tools::split_list($data // '')],
+        );
+    }
+}
+
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %param) = @_;
+    run_disk_actions($storeid, $scfg, $scfg);
+    return undef;
+}
+
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+    # Building an array under an existing storage would need the array stopped,
+    # which means stopping every guest on it - not something to do from a
+    # config edit. Unmounting is fine.
+    die "nonraid-create-* only applies when creating a storage; to extend an"
+        . " existing array use 'nmdctl add', which needs the array stopped\n"
+        if defined($update->{'nonraid-create-parity'})
+        || defined($update->{'nonraid-create-data'});
+    run_disk_actions($storeid, $scfg, $update);
+    return undef;
+}
+
+# Storage implementation
+
+sub activate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    my $st = read_nmdstat();
+    $cache->{mountdata} //= PVE::ProcFSTools::parse_proc_mounts();
+
+    # Fast path: pvestatd activates every enabled storage on each cycle, so
+    # the already-running case must not fork. "Up" means our array is running
+    # and our pool - identified by fsname, not merely "something mounted
+    # there" - is at the path; anything else takes the slow path, which
+    # validates and fails loudly.
+    my $up = $st
+        && ($st->{mdState} // '') eq 'STARTED'
+        && superblock_matches($st, _scfg_super($scfg))
+        && pool_is_ours($storeid, $scfg, $cache->{mountdata}, $st);
+
+    if ($up) {
+        # Cheap, and it has to happen here: bookkeeping that failed once would
+        # otherwise stay failed for the lifetime of the mount, because this is
+        # the path every subsequent cycle takes.
+        #
+        # A failure is warned about, NOT fatal - deliberately asymmetric with
+        # the slow path below. Refusing to activate a pool that is already
+        # serving guests, because a marker could not be written, takes those
+        # guests down to close a window that the next cycle retries anyway.
+        _ensure_bookkeeping($storeid, $scfg);
+    } else {
+        # One lock for the node, not one per storage. The driver holds a
+        # single array - the superblock is a module parameter - so two
+        # storages activating at once would import and start different
+        # superblocks into the same driver. Serialising per storeid let them
+        # do exactly that.
+        PVE::Tools::lock_file("/run/lock/pve-nonraid-array.lck", 10, sub {
+            $st = read_nmdstat(); # re-check under the lock
+            my $unclean = -e _marker_file();
+
+            _refuse_if_legacy_unit_active($storeid);
+
+            # Recorded before anything is started or mounted: see
+            # _record_correction_debt for why the ordering is load-bearing.
+            _record_correction_debt($storeid, $unclean)
+                or die "refusing to activate storage '$storeid': the"
+                . " correcting-check debt for the last unclean shutdown"
+                . " could not be recorded; see the warnings above\n";
+
+            _ensure_array_started($storeid, $scfg, $st);
+            _ensure_members_mounted($scfg);
+            _ensure_pool_mounted($storeid, $scfg);
+            # Fatal here, unlike the fast path: nothing is serving yet, so
+            # reporting a successful activation whose crash marker could not
+            # be made durable would mean the next unclean shutdown looks
+            # clean and parity is never re-checked. pvestatd retries this
+            # whole path idempotently.
+            _ensure_bookkeeping($storeid, $scfg)
+                or die "activation bookkeeping failed - refusing to report"
+                . " storage '$storeid' as active; see the warnings above\n";
+        });
+        die "unable to activate storage '$storeid' - $@" if $@;
+        $cache->{mountdata} = PVE::ProcFSTools::parse_proc_mounts();
+    }
+
+    return $class->SUPER::activate_storage($storeid, $scfg, $cache);
+}
+
+sub status {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    my $st = read_nmdstat();
+    # undef = storage offline, not an error (the NFS-plugin idiom). A degraded
+    # but STARTED array stays online - emulated reads are what parity is for;
+    # degradation is surfaced through the transition log below.
+    return undef if !$st || ($st->{mdState} // '') ne 'STARTED';
+    return undef if !superblock_matches($st, _scfg_super($scfg));
+
+    # Same identity test as the activation fast path: reporting df numbers for
+    # a foreign filesystem that happens to sit at the path would be worse than
+    # reporting the storage offline.
+    $cache->{mountdata} //= PVE::ProcFSTools::parse_proc_mounts();
+    return undef if !pool_is_ours($storeid, $scfg, $cache->{mountdata}, $st);
+
+    _log_health_transition($storeid, nmdstat_health($st));
+
+    return $class->SUPER::status($storeid, $scfg, $cache);
+}
+
+# deactivate_storage stays the inherited no-op on purpose: it fires per-guest
+# with no refcounting, while the array and pool are node-global. Teardown
+# belongs to pve-nonraid.service at shutdown, or to the operator.
+
+1;

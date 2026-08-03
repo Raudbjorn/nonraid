@@ -1,0 +1,30 @@
+Source: libpve-storage-nonraid-perl
+Section: perl
+Priority: optional
+Maintainer: Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>
+Build-Depends: debhelper-compat (= 13)
+# Nothing here needs to be built as root or own a file it does not create:
+# every path is a plain root:root file that dh_installdeb and
+# 'dpkg-deb --root-owner-group' handle on their own. Declaring that means the
+# build needs no root emulation at all, so the '-rfakeroot' the Makefile passes
+# is a no-op rather than a dependency - and fakeroot is only a *Recommends* of
+# dpkg-dev, so it is genuinely absent under --no-install-recommends.
+Rules-Requires-Root: no
+Standards-Version: 4.6.2
+Homepage: https://github.com/Raudbjorn/nonraid
+
+Package: libpve-storage-nonraid-perl
+Architecture: all
+Depends: ${perl:Depends}, ${misc:Depends},
+ libpve-storage-perl (>= 9.0~),
+ nonraid-tools (>= 1.23.0-2),
+ mergerfs
+# pve-manager Recommends rather than Depends: the GUI surface (a JS file under
+# its tree and a tag in its template) is cosmetic and self-heals via the dpkg
+# trigger; the plugin itself is fully functional through pvesm and the API.
+Recommends: nonraid-dkms, pve-manager
+Description: NonRAID storage plugin for Proxmox VE
+ Exposes a NonRAID array as Proxmox VE directory-backed storage: on
+ activation the plugin starts the array via nmdctl, mounts the member
+ disks and unions them into a mergerfs pool. Includes an optional web
+ UI integration that adds a NonRAID entry to the Add Storage menu.

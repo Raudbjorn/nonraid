@@ -1,3 +1,12 @@
+nonraid-dkms (1.4.0-1) stable; urgency=medium
+
+  * Sync the package version with dkms.conf PACKAGE_VERSION.
+  * Install the module sources into usr/src/nonraid-dkms-$(PACKAGE_VERSION)
+    so they share a directory with dkms.conf.
+  * Switch to debhelper-compat and drop the deprecated debian/compat.
+
+ -- Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>  Mon, 03 Aug 2026 03:22:00 +0000
+
 nonraid-dkms (1.0.0-1) stable; urgency=medium
 
   * NonRAID DKMS Debian Package

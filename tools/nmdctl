@@ -2404,42 +2404,60 @@ save_disk_offset() {
         return 1
     fi
 
-    local dir tmp
+    local dir
     dir=$(dirname "$DISK_OFFSETS_FILE")
     if ! mkdir -p "$dir" 2>/dev/null; then
         echo -e "${RED}Error: could not create $dir to record the import offset${NC}" >&2
         return 1
     fi
-    tmp="${DISK_OFFSETS_FILE}.tmp.$$"
 
-    # Build the complete target contents - every other entry, plus this one -
-    # and put it in place with a single checked rename. Filtering into place and
-    # then appending leaves a window in which the previous offset is already
-    # gone and the replacement is not yet written; dying there loses the only
-    # persisted copy and the next reload imports at sector 0.
-    if ! : > "$tmp" 2>/dev/null; then
-        echo -e "${RED}Error: could not write $tmp${NC}" >&2
-        return 1
-    fi
-    if [ -f "$DISK_OFFSETS_FILE" ]; then
-        if ! awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" >> "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            echo -e "${RED}Error: could not read $DISK_OFFSETS_FILE${NC}" >&2
-            return 1
+    # The whole read-modify-write is serialised. The rename alone makes each
+    # writer's result self-consistent, but not correct under concurrency: two
+    # imports running at once (the PVE plugin's activation and an operator's
+    # nmdctl, say) both read the same original, each writes a full file from
+    # it, and the second rename silently discards the first one's entry - after
+    # it was reported as recorded. A lost offset means the next reload imports
+    # that disk at sector 0.
+    #
+    # A subshell rather than a bare flock so the descriptor is released on
+    # every path out, including the error returns below.
+    (
+        flock -x 9 || {
+            echo -e "${RED}Error: could not lock ${DISK_OFFSETS_FILE}.lock${NC}" >&2
+            exit 1
+        }
+
+        local tmp="${DISK_OFFSETS_FILE}.tmp.$$"
+
+        # Build the complete target contents - every other entry, plus this one
+        # - and put it in place with a single checked rename. Filtering into
+        # place and then appending leaves a window in which the previous offset
+        # is already gone and the replacement is not yet written; dying there
+        # loses the only persisted copy and the next reload imports at sector 0.
+        if ! : > "$tmp" 2>/dev/null; then
+            echo -e "${RED}Error: could not write $tmp${NC}" >&2
+            exit 1
         fi
-    fi
-    if [ "$offset" -ne 0 ]; then
-        if ! echo "$disk_id $offset" >> "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            echo -e "${RED}Error: could not record the offset entry${NC}" >&2
-            return 1
+        if [ -f "$DISK_OFFSETS_FILE" ]; then
+            if ! awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" >> "$tmp" 2>/dev/null; then
+                rm -f "$tmp"
+                echo -e "${RED}Error: could not read $DISK_OFFSETS_FILE${NC}" >&2
+                exit 1
+            fi
         fi
-    fi
-    if ! mv "$tmp" "$DISK_OFFSETS_FILE" 2>/dev/null; then
-        rm -f "$tmp"
-        echo -e "${RED}Error: could not replace $DISK_OFFSETS_FILE${NC}" >&2
-        return 1
-    fi
+        if [ "$offset" -ne 0 ]; then
+            if ! echo "$disk_id $offset" >> "$tmp" 2>/dev/null; then
+                rm -f "$tmp"
+                echo -e "${RED}Error: could not record the offset entry${NC}" >&2
+                exit 1
+            fi
+        fi
+        if ! mv "$tmp" "$DISK_OFFSETS_FILE" 2>/dev/null; then
+            rm -f "$tmp"
+            echo -e "${RED}Error: could not replace $DISK_OFFSETS_FILE${NC}" >&2
+            exit 1
+        fi
+    ) 9>"${DISK_OFFSETS_FILE}.lock" || return 1
 
     return 0
 }
@@ -3858,7 +3876,7 @@ add_disk() {
         esac
     done
 
-    # Parse parameter if provided in SLOT:DEVICE[:ID] format
+    # Parse parameter if provided in SLOT:DEV[:ID[:OFFSET]] format
     local param_slot=""
     local param_device=""
     local param_disk_id=""
@@ -3866,7 +3884,7 @@ add_disk() {
     local use_param_mode=0
 
     if [ -n "$disk_param" ] && [[ "$disk_param" =~ : ]]; then
-        # Check if it matches SLOT:DEVICE[:ID] format
+        # Check if it matches SLOT:DEV[:ID[:OFFSET]] format
         if [[ "$disk_param" =~ ^([0-9P-Q]|[12][0-9]|29):(.+)$ ]]; then
             use_param_mode=1
 
@@ -3903,8 +3921,9 @@ add_disk() {
         else
             # If it has a colon but doesn't match the format, it's an error
             echo -e "${RED}Error: Invalid format for parameter: $disk_param${NC}"
-            echo -e "${YELLOW}Expected format: SLOT:DEVICE or SLOT:DEVICE:ID-STRING${NC}"
-            echo -e "${YELLOW}Example: nmdctl add 1:/dev/sdb1 or nmdctl add P:/dev/sda1:WD-12345${NC}"
+            echo -e "${YELLOW}Expected format: SLOT:DEV[:ID[:OFFSET]]${NC}"
+            echo -e "${YELLOW}Example: nmdctl add 1:/dev/sdb1, nmdctl add P:/dev/sda1:WD-12345,${NC}"
+            echo -e "${YELLOW}         nmdctl add 1:/dev/sdb:WD-12345:2048 (OFFSET needs a whole device)${NC}"
             return 1
         fi
     elif [ -n "$disk_param" ]; then

@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+# dh_installsystemd is skipped ENTIRELY, not merely defanged with
+# --no-enable --no-start --no-stop-on-upgrade. Those flags suppress the
+# enable/start/stop snippets but still emit postinst/postrm daemon-reload
+# autoscripts, and debhelper's own snippet guards on
+# `[ -d /run/systemd/system ]` with no DPKG_ROOT test - which is the BUILD
+# HOST's systemd. A `dpkg --root` install or removal would reload the host's
+# systemd on behalf of a target tree it never touched.
+#
+# The unit file itself is installed by debian/install; the reloads are
+# hand-written and DPKG_ROOT-guarded in postinst/postrm. Nothing is enabled or
+# started at install time either way: the plugin starts the unit on first
+# activation, and enabling it is an operator decision (see README). Never
+# stopping it on upgrade matters most - its ExecStop tears down the pools, the
+# member mounts and the array, under running guests.
+override_dh_installsystemd:
