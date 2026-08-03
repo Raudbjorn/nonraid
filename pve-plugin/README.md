@@ -36,11 +36,24 @@ The storage stays online while the array is degraded (emulated reads);
 transitions are syslogged. `NEW_ARRAY`, `SWAP_DSBL` and `ERROR:*` states are
 never started automatically. With `nonraid-degraded-autostart 0` a degraded
 array is not started either; the activation error names the manual command.
+Note that a freshly created array reports bogus disabled/invalid counters
+until the module is reloaded, which with autostart disabled reads as
+degraded - reload (or leave autostart on) after creating an array.
+
+Before any manual array ceremony (`unassign`, `replace`, `stop`), run
+`pvesm set <id> --disable 1` first: pvestatd re-activates - and therefore
+restarts - the array every cycle, and will fight the maintenance. Re-enable
+when done.
 
 Stop order: guests, then `umount <pool>`, `nmdctl unmount`, `nmdctl stop`.
-`pve-nonraid.service` (started by the plugin, never enabled) encodes exactly
-that for node shutdown. If `nonraid.service` from nonraid-tools is enabled,
-set `AUTOMOUNT=no` in `/etc/default/nonraid` and let the plugin mount.
+`pve-nonraid.service` (started by the plugin) encodes exactly that for node
+shutdown. **Enable it (`systemctl enable pve-nonraid`) when guests on a
+nonraid storage use onboot**: qemu-server's cloud-init regeneration stats the
+cloudinit volume before anything has activated the storage on a cold boot,
+and the first `qm start` fails once with "disk image already exists"; the
+enabled unit activates the storages before pve-guests runs. If
+`nonraid.service` from nonraid-tools is enabled, set `AUTOMOUNT=no` in
+`/etc/default/nonraid` and let the plugin mount.
 
 ## Web UI
 
@@ -68,3 +81,13 @@ sh pve-plugin/t/tpl-roundtrip.sh    # GUI injection round-trip
 
 `perl -c` on the plugin is a false negative (compile cycle through the
 DirPlugin parent); CI loads it through `PVE::Storage` on real PVE 9 packages.
+
+Verified end to end on a PVE 9.2.6 node (kernel 6.14.11-9-pve, nonraid-dkms
+1.3.2, mergerfs 2.40.2, 4-disk virtio array): plugin-driven start/mount/pool
+from a cold array; degraded autostart with parity-emulated reads (md5-clean
+through mergerfs); the fail-stop refusal; a full unassign/replace/RECON_DISK
+rebuild; a guest with `cache=none,aio=native` qcow2 on the pool surviving
+reboots with data intact, plus qcow2 snapshot/rollback; ordered shutdown
+teardown; the dpkg trigger on a pve-manager reinstall; and the Add/Edit
+dialogs in a real browser. Untested: PVE kernel 7.x with dkms 1.4.0,
+multi-node clusters, and parity-check impact on guest latency.

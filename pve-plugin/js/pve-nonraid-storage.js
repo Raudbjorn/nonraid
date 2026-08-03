@@ -7,8 +7,11 @@
 //
 // This runs on every PVE web session: any failure must degrade to "no
 // Add-menu entry" and never break the rest of the UI.
+// No 'use strict': ExtJS classic's callParent() walks Function.caller, which
+// strict mode forbids - a strict initComponent dies with "Cannot read
+// properties of null (reading 'apply')". None of pve-manager's own UI files
+// use strict mode for the same reason.
 (function () {
-    'use strict';
     try {
         if (
             typeof Ext === 'undefined' ||
@@ -127,10 +130,16 @@
             },
 
             onGetValues: function (values) {
-                // An empty path on create means "use the plugin default"
-                // (/mnt/pve/<id>); the backend fills it in check_config.
-                if (this.isCreate && values.path === '') {
-                    delete values.path;
+                // Untouched optional fields submit '', which the API rejects
+                // against the path/string formats. Dropping them on create
+                // yields the backend defaults (path becomes /mnt/pve/<id>
+                // via check_config, the rest via properties()).
+                if (this.isCreate) {
+                    Ext.Object.each(values, function (key, value) {
+                        if (value === '' && (key === 'path' || key.indexOf('nonraid-') === 0)) {
+                            delete values[key];
+                        }
+                    });
                 }
                 return this.callParent([values]);
             },
