@@ -140,11 +140,29 @@
             }
             var dark = true;
             try {
-                var bg = getComputedStyle(document.body).backgroundColor;
-                var m = bg && bg.match(/\d+/g);
-                if (m && m.length >= 3) {
+                // A fully transparent background (rgba(0, 0, 0, 0), what
+                // getComputedStyle reports for a body with no background of
+                // its own) is unmeasured, not black - the old \d+ match
+                // ignored alpha and read it as black, so a theme that paints
+                // the surface on an ancestor rather than <body> itself would
+                // read as dark even under PVE's light theme. Walk up looking
+                // for the first element with a painted (non-transparent)
+                // background; if none is found up to <html>, fall back to
+                // the browser's own preference rather than guessing black.
+                var paintedBg = null;
+                for (var el = document.body; el && !paintedBg; el = el.parentElement) {
+                    var candidate = getComputedStyle(el).backgroundColor;
+                    var parts = candidate && candidate.match(
+                        /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?\)$/);
+                    if (parts && (parts[4] === undefined || parseFloat(parts[4]) > 0)) {
+                        paintedBg = parts;
+                    }
+                }
+                if (paintedBg) {
                     // Relative luminance, roughly; PVE light is near-white.
-                    dark = (0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2]) < 128;
+                    dark = (0.299 * paintedBg[1] + 0.587 * paintedBg[2] + 0.114 * paintedBg[3]) < 128;
+                } else if (window.matchMedia) {
+                    dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
                 }
             } catch (ignore) { /* default to dark-first, like the system */ }
 

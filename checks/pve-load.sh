@@ -55,7 +55,13 @@ in_image '
     # rather than only on the ones we wrote. Covers nonraid-tools too: its
     # five units used to go through dh_installsystemd the same unguarded way.
     # A fake /run/systemd/system makes the host look systemd-managed, and a
-    # PATH-stubbed systemctl records every call.
+    # PATH-stubbed systemctl records every call. Tracked so it can be removed
+    # again below: left in place, it would make the REAL apt-get remove/purge
+    # a few lines down - which runs with DPKG_ROOT unset, i.e. host_actions()
+    # true - believe this container is systemd-managed too, for the rest of
+    # the script.
+    fake_systemd_dir=0
+    [ -d /run/systemd/system ] || fake_systemd_dir=1
     mkdir -p /run/systemd/system /tmp/sysbin
     cat > /tmp/sysbin/systemctl <<STUB
 #!/bin/sh
@@ -82,6 +88,10 @@ STUB
     fi
     echo "no systemctl invocations under DPKG_ROOT (either package)"
     rm -rf /tmp/sysbin /tmp/systemctl.calls
+    # Restore pre-existing state exactly: remove only what this check
+    # created, and only the leaf directory - /run/systemd itself was already
+    # there (container runtime tmpfs), not ours to remove.
+    [ "$fake_systemd_dir" = 1 ] && rmdir /run/systemd/system
 
     echo ">>> remove sweeps the tag, purge removes the backup"
     apt-get remove -y -qq libpve-storage-nonraid-perl >/dev/null 2>&1
