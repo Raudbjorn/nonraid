@@ -1,6 +1,6 @@
 [Unit]
 Description=NonRAID scheduled parity check
-Requires=nonraid.service
+ConditionPathExists=!/usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
 After=nonraid.service
 
 [Service]

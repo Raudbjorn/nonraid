@@ -103,9 +103,31 @@ enabled unit activates the storages before pve-guests runs. Note what
 enabling it couples: its ExecStart is `pvesm status`, the canonical
 "activate the enabled storages" call, so boot now waits (up to its 100s
 bound) on **every** enabled storage on the node, not only this one — an
-unreachable NFS server elsewhere delays boot too. If
-`nonraid.service` from nonraid-tools is enabled, set `AUTOMOUNT=no` in
-`/etc/default/nonraid` and let the plugin mount.
+unreachable NFS server elsewhere delays boot too.
+
+### Coexistence with nonraid-tools' own units
+
+The two must not both drive the array, and nonraid-tools now steps aside on its
+own: `nonraid.service` and `nonraid-parity-check.service` carry
+
+```ini
+ConditionPathExists=!/usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
+```
+
+so installing this plugin disables them without any `/etc/default/nonraid`
+edit. Two consequences worth knowing:
+
+- **Scheduled parity checks stop.** `nonraid-parity-check.timer` still fires,
+  but its service is now condition-skipped, and the plugin does not schedule
+  checks of its own — it only runs a *correcting* check after an unclean
+  shutdown. If you want periodic scrubs on a plugin-managed node, schedule
+  `nmdctl -u check nocorrect` yourself.
+- **Notifications keep working**, and previously would not have. The notifier
+  used `Requisite=nonraid.service`, so on a plugin-managed node — where that
+  unit is deliberately inactive while the array is very much running — it never
+  fired at all. It now keys off the array instead of off the unit
+  (`ExecCondition=/bin/grep -qx mdState=STARTED /proc/nmdstat`), which is true
+  whichever side started it.
 
 ## Web UI
 
