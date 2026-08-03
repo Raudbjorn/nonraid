@@ -26,22 +26,32 @@
 
         // Single edit point: names must match the properties() of
         // PVE::Storage::Custom::NonRAIDPlugin exactly.
+        //
+        // 'suggest' turns a field into an editable combobox seeded with those
+        // values. Both path fields are free-form - a new array may use any
+        // path - so this cannot be a closed list, but offering the values
+        // already in use removes the common typo. The list is extended at
+        // render time from the nonraid storages this cluster already has (see
+        // addDerivedSuggestions); the driver takes its superblock as a module
+        // parameter, so a second storage on the same node needs the same one.
         var NONRAID_FIELDS = [
             {
                 name: 'nonraid-super',
                 label: 'Superblock File',
-                xtype: 'textfield',
+                xtype: 'combobox',
                 value: '/nonraid.dat',
                 allowBlank: false,
+                suggest: ['/nonraid.dat'],
                 column: 1,
             },
             {
                 name: 'nonraid-disk-prefix',
                 label: 'Disk Mount Prefix',
-                xtype: 'textfield',
+                xtype: 'combobox',
                 emptyText: '/mnt/disk',
                 allowBlank: true,
                 deleteEmptyOnEdit: true,
+                suggest: ['/mnt/disk'],
                 column: 1,
             },
             {
@@ -61,6 +71,132 @@
                 column: 2,
             },
         ];
+
+        // Values already in use by this cluster's nonraid storages. Read from
+        // the storage config the UI is entitled to anyway - PVE has no
+        // extension point for a per-plugin scan endpoint (the /nodes/{node}/
+        // scan/<type> list is fixed at compile time in pve-storage), and
+        // patching the API tree to add one would be a far worse dependency
+        // than reading a list the Storage view already renders.
+        //
+        // Best-effort throughout: on any failure the field keeps its defaults
+        // and stays typeable, which is exactly what it was before.
+        var addDerivedSuggestions = function (panel) {
+            if (typeof Proxmox === 'undefined' || !Proxmox.Utils ||
+                !Ext.isFunction(Proxmox.Utils.API2Request)) {
+                return;
+            }
+            Proxmox.Utils.API2Request({
+                url: '/storage',
+                method: 'GET',
+                success: function (response) {
+                    try {
+                        var seen = {};
+                        var data = (response.result && response.result.data) || [];
+                        Ext.Array.each(NONRAID_FIELDS, function (f) {
+                            if (!f.suggest) {
+                                return;
+                            }
+                            var field = panel.down('field[name=' + f.name + ']');
+                            if (!field || !field.getStore) {
+                                return;
+                            }
+                            var store = field.getStore();
+                            seen = {};
+                            store.each(function (rec) { seen[rec.get('value')] = true; });
+                            Ext.Array.each(data, function (s) {
+                                var v = s[f.name];
+                                if (s.type === 'nonraid' && v && !seen[v]) {
+                                    seen[v] = true;
+                                    store.add({ value: v });
+                                }
+                            });
+                        });
+                    } catch (err) {
+                        console.warn('pve-nonraid: could not derive suggestions', err);
+                    }
+                },
+                failure: function () {
+                    // Defaults remain; nothing to report to the user.
+                },
+            });
+        };
+
+        // A one-line summary of the node's disks, so the operator can see what
+        // hardware is actually there while pointing a storage at an array.
+        //
+        // These are the NODE's disks, not the array's members: the slot -> disk
+        // mapping lives in /proc/nmdstat, which no API exposes, and inventing
+        // an endpoint for it would mean patching PVE's API tree (the
+        // /nodes/{node}/scan/<type> list is fixed at compile time). The label
+        // says so rather than implying these are the members.
+        var describeDisks = function (panel, node) {
+            var hint = panel.down('field[name=nonraid-node-disks]');
+            if (!hint) {
+                return;
+            }
+            if (!node) {
+                hint.setValue(gettext('Select a single node to list its disks'));
+                return;
+            }
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + node + '/disks/list',
+                method: 'GET',
+                success: function (response) {
+                    try {
+                        var disks = (response.result && response.result.data) || [];
+                        if (!disks.length) {
+                            hint.setValue(gettext('No disks reported'));
+                            return;
+                        }
+                        var parts = Ext.Array.map(disks, function (d) {
+                            var size = Ext.isFunction(Proxmox.Utils.format_size)
+                                ? Proxmox.Utils.format_size(d.size)
+                                : d.size;
+                            var model = d.model && d.model !== 'unknown'
+                                ? ' ' + Ext.String.htmlEncode(d.model) : '';
+
+                            // 'used' is whatever already claims the disk - a
+                            // filesystem, LVM, ZFS, partitions - and osdid is
+                            // set for a Ceph OSD. Either way it is spoken for,
+                            // including by a NonRAID array, whose members
+                            // carry their own filesystems.
+                            var claim = d.used ||
+                                (d.osdid !== undefined && d.osdid >= 0 ? 'Ceph OSD' : '');
+                            var label = '<b>' + Ext.String.htmlEncode(d.devpath) + '</b> '
+                                + size + model;
+
+                            if (claim) {
+                                // Dimmed rather than hidden: knowing a disk is
+                                // taken, and by what, is the point. Inert too -
+                                // no text selection, no pointer - so a claimed
+                                // disk cannot be copied into an nmdctl command
+                                // by accident. Opacity degrades sanely in
+                                // either PVE theme.
+                                return '<span aria-disabled="true" title="'
+                                    + Ext.String.htmlEncode(gettext('In use') + ': ' + claim)
+                                    + '" style="opacity:0.5;pointer-events:none;'
+                                    + 'user-select:none;-webkit-user-select:none;'
+                                    + 'cursor:not-allowed">'
+                                    + label + ' (' + Ext.String.htmlEncode(claim)
+                                    + ')</span>';
+                            }
+                            // Free disks stay selectable on purpose: the point
+                            // of showing the path is to copy it into nmdctl.
+                            return '<span style="user-select:text">' + label
+                                + ' <span style="opacity:0.7">(' + gettext('free')
+                                + ')</span></span>';
+                        });
+                        hint.setValue(parts.join('&nbsp; · &nbsp;'));
+                    } catch (err) {
+                        hint.setValue(gettext('Could not read the disk list'));
+                    }
+                },
+                failure: function () {
+                    hint.setValue(gettext('Could not read the disk list'));
+                },
+            });
+        };
 
         Ext.define('PVE.storage.NonRAIDInputPanel', {
             extend: 'PVE.panel.StorageBase',
@@ -121,6 +257,24 @@
                     if (f.deleteEmptyOnEdit) {
                         field.deleteEmpty = !me.isCreate;
                     }
+                    if (f.suggest) {
+                        // Editable and forceSelection:false on purpose: the
+                        // suggestions are a convenience, not the valid set.
+                        // queryMode local because the store is in memory.
+                        Ext.apply(field, {
+                            editable: true,
+                            forceSelection: false,
+                            queryMode: 'local',
+                            displayField: 'value',
+                            valueField: 'value',
+                            store: {
+                                fields: ['value'],
+                                data: Ext.Array.map(f.suggest, function (v) {
+                                    return { value: v };
+                                }),
+                            },
+                        });
+                    }
                     (f.column === 2 ? me.column2 : me.column1).push(field);
                 });
 
@@ -137,7 +291,39 @@
                     },
                 ];
 
+                // Full width, under both columns: a disk list does not fit in
+                // a half-width field. submitValue false - it is a hint, and
+                // the API rejects keys the schema does not define.
+                me.columnB = [
+                    {
+                        xtype: 'displayfield',
+                        name: 'nonraid-node-disks',
+                        submitValue: false,
+                        fieldLabel: gettext('Node disks'),
+                        value: gettext('Select a single node to list its disks'),
+                        // The list can wrap over a few lines on a full node.
+                        autoEl: { tag: 'div', style: 'line-height:1.6' },
+                    },
+                ];
+
                 me.callParent();
+
+                // After callParent so the fields exist to be looked up.
+                addDerivedSuggestions(me);
+
+                // StorageBase owns the Nodes selector; follow it rather than
+                // adding one, so the hint always describes the node the
+                // storage is actually being restricted to.
+                var nodesField = me.down('field[name=nodes]');
+                if (nodesField) {
+                    var refresh = function () {
+                        var v = nodesField.getValue();
+                        var list = Ext.isArray(v) ? v : (v ? String(v).split(',') : []);
+                        describeDisks(me, list.length === 1 ? list[0] : undefined);
+                    };
+                    nodesField.on('change', refresh);
+                    refresh();
+                }
             },
 
             onGetValues: function (values) {
