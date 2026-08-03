@@ -93,8 +93,9 @@ kernel. Keep the matching `proxmox-headers-*` installed and check
 ## Tests
 
 ```sh
-prove pve-plugin/t/                 # pure helpers, no PVE needed
+prove pve-plugin/t/                 # pure helpers and orchestration argv
 sh pve-plugin/t/tpl-roundtrip.sh    # GUI injection round-trip
+sh pve-plugin/t/teardown.sh         # shutdown teardown, incl. failure paths
 ```
 
 `perl -c` on the plugin is a false negative (compile cycle through the

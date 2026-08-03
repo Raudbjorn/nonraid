@@ -12,12 +12,19 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# A fake nmdctl that succeeds or fails on demand and records its arguments.
+# A fake nmdctl with a per-subcommand exit code, so a test can make one step
+# fail while the others succeed - "every call fails" would not distinguish
+# "stop failed" from "the teardown stopped after the first failure".
+# Usage: make_nmdctl [unmount_rc] [stop_rc]
 make_nmdctl() {
     cat > "$tmp/nmdctl" <<EOF
 #!/bin/sh
 echo "\$@" >> "$tmp/nmdctl.log"
-exit ${1:-0}
+case "\$*" in
+    *unmount*) exit ${1:-0} ;;
+    *stop*)    exit ${2:-0} ;;
+esac
+exit 0
 EOF
     chmod +x "$tmp/nmdctl"
     : > "$tmp/nmdctl.log"
@@ -30,7 +37,7 @@ run() { PVE_NONRAID_MOUNTS="$tmp/mounts" PVE_NONRAID_NMDCTL="$tmp/nmdctl" \
         PVE_NONRAID_MARKER="$tmp/array.running" sh "$script" 2>"$tmp/err"; }
 
 # --- clean teardown: no pools, nmdctl succeeds -> marker removed ------------
-make_nmdctl 0
+make_nmdctl 0 0
 : > "$tmp/array.running"
 cat > "$tmp/mounts" <<'EOF'
 /dev/nmd1p1 /mnt/disk1 xfs rw 0 0
@@ -40,17 +47,28 @@ run || fail "clean teardown should exit 0"
 grep -qx -- "-u unmount" "$tmp/nmdctl.log" || fail "nmdctl unmount not called"
 grep -qx -- "-u stop" "$tmp/nmdctl.log" || fail "nmdctl stop not called"
 
-# --- nmdctl stop fails -> marker kept, still exits 0 ------------------------
-make_nmdctl 1
+# --- only nmdctl stop fails -> marker kept, still exits 0 -------------------
+# The unmount succeeds here, so this isolates the stop failure rather than
+# testing a teardown in which everything failed.
+make_nmdctl 0 1
 : > "$tmp/array.running"
 run || fail "failed teardown must still exit 0"
 [ -e "$tmp/array.running" ] || fail "failed teardown must keep the marker"
-grep -q "teardown incomplete" "$tmp/err" || fail "failure not reported on stderr"
-# Every step is attempted even after the first failure.
+grep -q "nmdctl stop failed" "$tmp/err" || fail "stop failure not reported"
+grep -q "nmdctl unmount failed" "$tmp/err" && fail "unmount reported as failed but it succeeded"
+grep -q "teardown incomplete" "$tmp/err" || fail "incomplete teardown not reported"
+grep -qx -- "-u stop" "$tmp/nmdctl.log" || fail "stop was never attempted"
+
+# --- only nmdctl unmount fails -> stop is still attempted -------------------
+make_nmdctl 1 0
+: > "$tmp/array.running"
+run || fail "failed unmount must still exit 0"
+grep -q "nmdctl unmount failed" "$tmp/err" || fail "unmount failure not reported"
 grep -qx -- "-u stop" "$tmp/nmdctl.log" || fail "stop skipped after unmount failed"
+[ -e "$tmp/array.running" ] || fail "failed teardown must keep the marker"
 
 # --- an unmountable pool keeps the marker too -------------------------------
-make_nmdctl 0
+make_nmdctl 0 0
 : > "$tmp/array.running"
 mkdir -p "$tmp/pool"
 cat > "$tmp/mounts" <<EOF
@@ -61,7 +79,7 @@ run || fail "busy pool must still exit 0"
 grep -q "could not unmount" "$tmp/err" || fail "unmount failure not reported"
 
 # --- a mountpoint containing whitespace is decoded, not split ---------------
-make_nmdctl 0
+make_nmdctl 0 0
 : > "$tmp/array.running"
 mkdir -p "$tmp/two words"
 cat > "$tmp/mounts" <<EOF
@@ -72,7 +90,7 @@ grep -q "could not unmount pool $tmp/two words" "$tmp/err" \
     || fail "\\040 not decoded into a single path (got: $(cat "$tmp/err"))"
 
 # --- a foreign mergerfs pool is left alone ----------------------------------
-make_nmdctl 0
+make_nmdctl 0 0
 : > "$tmp/array.running"
 mkdir -p "$tmp/other"
 cat > "$tmp/mounts" <<EOF

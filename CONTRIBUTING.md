@@ -21,6 +21,7 @@ Two habits worth keeping anyway, because they have actually bitten here:
   Every extra line is friction later.
 
 **Sending something upstream?** [Their rules](https://github.com/qvr/nonraid/blob/main/CONTRIBUTING.md)
-apply there, not this file — notably: write PR and issue descriptions in your own words,
-and flag AI-assisted parts. That binds anything headed to `qvr/nonraid`, including work
-that started here.
+apply there, not this file. Two in particular, because they are the opposite of the line
+above: **do not generate PR or issue descriptions with AI** — write them yourself — and
+disclose any AI-assisted parts of the contribution. That binds anything headed to
+`qvr/nonraid`, including work that started here.

@@ -7,7 +7,7 @@ set -e
 case "$1" in
     configure)
         /usr/share/pve-nonraid/pve-nonraid-gui apply || true
-        for s in pve-cluster pvedaemon pvestatd pveproxy pvescheduler; do
+        for s in pvedaemon pvestatd pveproxy pvescheduler; do
             systemctl try-restart "$s.service" >/dev/null 2>&1 || true
         done
         ;;

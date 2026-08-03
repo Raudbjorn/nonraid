@@ -19,7 +19,7 @@ case "$1" in
                 echo "  leaving it alone - remove the block by hand." >&2
             fi
         fi
-        for s in pve-cluster pvedaemon pvestatd pveproxy pvescheduler; do
+        for s in pvedaemon pvestatd pveproxy pvescheduler; do
             systemctl try-restart "$s.service" >/dev/null 2>&1 || true
         done
         ;;

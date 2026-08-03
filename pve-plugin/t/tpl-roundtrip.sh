@@ -77,6 +77,13 @@ awk '{ print } /pvemanagerlib/ && !d { print "    <!-- " $0 " -->"; d = 1 }' \
 PVE_NONRAID_TPL="$tmp/twoanchors.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
 [ "$(grep -c 'BEGIN pve-nonraid-gui' "$tmp/twoanchors.tpl")" = 1 ] \
     || fail "two anchor matches produced more than one block"
+# Not just "one block" but "after the FIRST anchor": landing after the second
+# would load our script before pvemanagerlib.js defines the classes it needs,
+# and the registration would silently no-op.
+first_anchor=$(grep -n 'pvemanagerlib' "$tmp/twoanchors.tpl" | head -1 | cut -d: -f1)
+block=$(grep -n 'BEGIN pve-nonraid-gui' "$tmp/twoanchors.tpl" | cut -d: -f1)
+[ "$block" -eq "$((first_anchor + 1))" ] \
+    || fail "block at line $block, expected $((first_anchor + 1)) (just after the first anchor)"
 
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
