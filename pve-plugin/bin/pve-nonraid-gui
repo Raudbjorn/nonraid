@@ -114,8 +114,22 @@ parse_block() {
                     }
                 }
             }
-            if (eline == 0 && index($0, emark) > 0) { eline = NR }
-            if (bline > 0 && NR > bline && eline == 0 && index($0, url) > 0) { payload = 1 }
+            if (eline == 0 && index($0, emark) > 0) {
+                eline = NR
+                # Same strictness as BEGIN: the marker must be the whole line.
+                # A substring match on an unrelated line would make the removal
+                # below delete that line, content and all.
+                if (substr($0, 1, index($0, emark) - 1) !~ /^[ \t]*$/ ||
+                    substr($0, index($0, emark) + length(emark)) !~ /^[ \t]*$/) {
+                    badend = 1
+                }
+            }
+            # The payload is the exact loader at the version the BEGIN marker
+            # names - not any line mentioning the URL. A comment containing the
+            # path, or a tag left at the previous cache-busting version, is not
+            # an applied GUI.
+            if (bline > 0 && NR > bline && eline == 0 &&
+                index($0, "src=\"" url "?ver=" ver "\"") > 0) { payload = 1 }
         }
         END {
             if (nb == 0 && ne == 0) { print "none"; exit 0 }
@@ -123,6 +137,7 @@ parse_block() {
                 printf "bad %d BEGIN / %d END marker(s)\n", nb, ne; exit 0
             }
             if (eline < bline) { print "bad END marker precedes BEGIN"; exit 0 }
+            if (badend) { print "bad malformed END marker"; exit 0 }
             if (ver == "") { print "bad malformed BEGIN marker"; exit 0 }
             if (!payload) { print "bad block does not load " url; exit 0 }
             printf "ok %s %d %d\n", ver, bline, eline

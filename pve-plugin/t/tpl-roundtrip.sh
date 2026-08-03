@@ -159,6 +159,26 @@ fi
 [ "$(wc -c < "$tmp/real.tpl")" = "$before" ] || fail "the symlink target was modified"
 grep -q 'BEGIN pve-nonraid-gui' "$tmp/real.tpl" && fail "block injected through a symlink"
 
+# A payload left at a different cache-busting version than the BEGIN marker
+# names is not an applied GUI: browsers would keep serving the old script from
+# cache while status reports the new version applied.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|?ver=1.0.0|?ver=0.9.9|' "$tmp/work.tpl" > "$tmp/wrongver.tpl"
+PVE_NONRAID_TPL="$tmp/wrongver.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" status | grep -q MALFORMED \
+    || fail "a payload at the wrong version was accepted as applied"
+
+# An END marker embedded in an unrelated line must refuse, not delete the line.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|<!-- END pve-nonraid-gui -->|<span>x</span><!-- END pve-nonraid-gui -->|' \
+    "$tmp/work.tpl" > "$tmp/embedded.tpl"
+before=$(wc -l < "$tmp/embedded.tpl")
+if PVE_NONRAID_TPL="$tmp/embedded.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" remove 2>/dev/null; then
+    fail "remove accepted an END marker embedded in an unrelated line"
+fi
+[ "$(wc -l < "$tmp/embedded.tpl")" = "$before" ] || fail "the embedded-marker line was deleted"
+
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
     || fail "status on a missing template should report it"

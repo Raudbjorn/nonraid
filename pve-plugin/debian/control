@@ -19,7 +19,10 @@ Depends: ${perl:Depends}, ${misc:Depends},
  libpve-storage-perl (>= 9.0~),
  nonraid-tools,
  mergerfs
-Recommends: nonraid-dkms
+# pve-manager Recommends rather than Depends: the GUI surface (a JS file under
+# its tree and a tag in its template) is cosmetic and self-heals via the dpkg
+# trigger; the plugin itself is fully functional through pvesm and the API.
+Recommends: nonraid-dkms, pve-manager
 Description: NonRAID storage plugin for Proxmox VE
  Exposes a NonRAID array as Proxmox VE directory-backed storage: on
  activation the plugin starts the array via nmdctl, mounts the member

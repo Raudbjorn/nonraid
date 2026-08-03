@@ -725,7 +725,13 @@ sub _ensure_array_started {
     # mutates member state, and the refusal promises that nothing was touched.
     my $autostart = $scfg->{'nonraid-degraded-autostart'} // 1;
     if ($state ne '' && $state ne 'STOPPED') {
-        my $pre = decide_start_action($state, $autostart, $st ? nmdstat_health($st)->{degraded} : 0);
+        # $degraded is undef ON PURPOSE: pre-import counters are meaningless
+        # (nmdstat_health's own contract is post-import), and the states this
+        # guard admits never consult the flag. Passing the real value here
+        # worked only by that coincidence - anyone adding a degraded check to
+        # the DISABLE_DISK branch would silently start consuming a pre-import
+        # number. undef turns that mistake into a visible warning instead.
+        my $pre = decide_start_action($state, $autostart, undef);
         die $pre->{msg} if $pre->{action} eq 'die';
     }
 
@@ -769,7 +775,11 @@ sub _ensure_array_started {
         warn "WARNING: starting NonRAID array in degraded state\n";
         push @$cmd, $decision->{assert} if defined($decision->{assert});
     }
-    run_command($cmd, timeout => 300, errmsg => "NonRAID array start failed");
+    # 120s, not more: nmdctl returns as soon as the driver accepts the command
+    # (the parity build runs in the background), so this bound is against a
+    # wedged nmdctl, not normal operation - and it runs under the cluster-wide
+    # storage config lock, which every node's config changes wait on.
+    run_command($cmd, timeout => 120, errmsg => "NonRAID array start failed");
 
     my $new = read_nmdstat();
     my $new_state = $new ? ($new->{mdState} // 'unknown') : 'unknown';
@@ -1040,7 +1050,8 @@ my sub require_assignable {
     my ($devs, $st) = @_;
     my @problems;
     for my $dev (@$devs) {
-        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
         my $blockers = disk_blockers(_lsblk_entry($dev), $st);
         push @problems, "$dev: " . join(', ', @$blockers) if @$blockers;
     }
@@ -1092,7 +1103,8 @@ my sub unmount_disks {
     my ($storeid, $devs, $st) = @_;
 
     for my $dev (@$devs) {
-        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
         my $entry = _lsblk_entry($dev)
             or die "'$dev': device not found\n";
 
@@ -1148,7 +1160,8 @@ my sub wipe_disks {
     my ($storeid, $devs, $st) = @_;
 
     for my $dev (@$devs) {
-        die "'$dev' is not an absolute device path\n" if $dev !~ m{^/dev/[\w/-]+$};
+        die "'$dev' is not an absolute device path\n"
+            if $dev !~ m{^/dev/[\w./-]+$} || $dev =~ m{\.\.};
         my $entry = _lsblk_entry($dev)
             or die "'$dev': device not found\n";
 
@@ -1216,14 +1229,17 @@ my sub create_array {
         . " with " . join(' ', @specs) . " - this destroys their contents");
 
     run_command([$NMDCTL, '-u', '-s', $super, 'create', '--force', @specs],
-        timeout => 300, errmsg => 'creating the NonRAID array failed');
+        timeout => 120, errmsg => 'creating the NonRAID array failed');
 
     # A freshly created array sits in NEW_ARRAY, which activation refuses by
     # design. Start it here so the storage this hook is creating can actually
     # come up; the parity build the driver then begins runs in the kernel, so
     # this returns without holding the storage lock for it.
     run_command([$NMDCTL, '-u', '-v', '-s', $super, 'start', 'NEW_ARRAY'],
-        timeout => 300, errmsg => 'starting the new array failed');
+        # 120s like the degraded start above: nmdctl returns on driver
+        # acceptance, so these bounds guard a wedged tool while the hook holds
+        # the cluster storage lock.
+        timeout => 120, errmsg => 'starting the new array failed');
     run_command([$NMDCTL, '-u', '-s', $super, 'check', 'recon'],
         timeout => 60, errmsg => 'starting the parity build failed');
 

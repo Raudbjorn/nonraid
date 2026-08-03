@@ -100,7 +100,11 @@ happens at 3am. `nmdctl status` shows the progress.
 storage use onboot**: qemu-server's cloud-init regeneration stats the
 cloudinit volume before anything has activated the storage on a cold boot,
 and the first `qm start` fails once with "disk image already exists"; the
-enabled unit activates the storages before pve-guests runs. If
+enabled unit activates the storages before pve-guests runs. Note what
+enabling it couples: its ExecStart is `pvesm status`, the canonical
+"activate the enabled storages" call, so boot now waits (up to its 100s
+bound) on **every** enabled storage on the node, not only this one — an
+unreachable NFS server elsewhere delays boot too. If
 `nonraid.service` from nonraid-tools is enabled, set `AUTOMOUNT=no` in
 `/etc/default/nonraid` and let the plugin mount.
 
@@ -187,7 +191,13 @@ lock for the duration. The commands return as soon as the driver accepts them
 the bounds are generous, so budget up to a couple of minutes and do not
 interrupt the API call. The steps run in order (unmount, wipe, create) and are
 not replayed: if a later one fails, the earlier ones have already happened and
-a retry starts from where the disks now are.
+a retry starts from where the disks now are. The same asymmetry exists one
+step later: PVE activates the storage after the create hook, and if that
+activation fails it rolls back the *storage definition* — not the array,
+which by then is built and syncing. That is deliberate (un-creating an array
+is far more destructive than leaving it), so the recovery is to fix whatever
+blocked activation and add the storage again, pointing at the now-existing
+superblock.
 
 A disabled button carries the reason as a tooltip. Ceph OSDs, LVM, ZFS and
 Device Mapper are refused outright rather than unmounted — release those with

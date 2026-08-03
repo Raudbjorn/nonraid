@@ -88,6 +88,14 @@ jobs:
             my $v = $c->api();
             die "api $v out of range\n" if $v < 9 || $v > PVE::Storage::APIVER();
             die "properties missing\n" if !$c->properties()->{"nonraid-super"};
+            # The disk-action properties are deleted inside on_update_hook_full;
+            # if that hook name ever stops being the one PVE dispatches, the
+            # deletion silently never runs and a wipe directive would be
+            # WRITTEN to storage.cfg instead of executed. Pin the contract.
+            die "parent no longer declares on_update_hook_full\n"
+                if !PVE::Storage::Plugin->can("on_update_hook_full");
+            die "plugin does not override on_update_hook_full\n"
+                if $c->can("on_update_hook_full") == PVE::Storage::Plugin->can("on_update_hook_full");
             print "loaded nonraid, api=$v\n";
           ' 2> stderr.log
           cat stderr.log
