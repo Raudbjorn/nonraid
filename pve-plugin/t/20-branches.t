@@ -76,4 +76,40 @@ sub load_fixture {
     like($opts, qr/minfreespace=1G/, 'minfreespace stays below small branches');
 }
 
+# ---- nodes is mandatory, and exactly one -----------------------------------
+#
+# PVE's schema makes 'nodes' optional; this plugin cannot. storage.cfg is
+# cluster-wide but the driver holds one array per node with the superblock as
+# a module parameter, so an unrestricted storage has every node contending for
+# the same array and the same lock.
+{
+    my $cc = sub {
+        my ($config, $create) = @_;
+        my $err = '';
+        eval { $P->check_config('nrpool', { %$config }, $create, 1) };
+        $err = $@;
+        return $err;
+    };
+    my $one = { 'testnode' => 1 };
+    my $two = { 'testnode' => 1, 'othernode' => 1 };
+
+    is($cc->({ path => '/mnt/pve/nrpool', nodes => $one }, 1), '',
+        'create with exactly one node is accepted');
+    like($cc->({ path => '/mnt/pve/nrpool' }, 1), qr/one node's hardware/,
+        'create without nodes is refused');
+    like($cc->({ path => '/mnt/pve/nrpool', nodes => $two }, 1),
+        qr/exactly one node/, 'create naming two nodes is refused');
+    like($cc->({ path => '/mnt/pve/nrpool', nodes => {} }, 1),
+        qr/one node's hardware/, 'an empty nodes set is not a restriction');
+
+    # Update: validated only when 'nodes' is being set, so a storage created
+    # before this rule stays editable instead of becoming unparseable.
+    is($cc->({ 'nonraid-super' => '/nonraid.dat' }, 0), '',
+        'an update that does not touch nodes is left alone');
+    like($cc->({ nodes => $two }, 0), qr/exactly one node/,
+        'but an update that sets two nodes is refused');
+    is($cc->({ nodes => $one }, 0), '',
+        'and setting a single node is accepted');
+}
+
 done_testing();

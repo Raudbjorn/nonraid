@@ -128,8 +128,15 @@ parse_block() {
             # names - not any line mentioning the URL. A comment containing the
             # path, or a tag left at the previous cache-busting version, is not
             # an applied GUI.
-            if (bline > 0 && NR > bline && eline == 0 &&
-                index($0, "src=\"" url "?ver=" ver "\"") > 0) { payload = 1 }
+            if (bline > 0 && NR > bline && eline == 0) {
+                # A structurally valid element, not just the string. A comment
+                # or a fragment carrying the URL is not an applied GUI, and
+                # accepting one leaves the block "applied" forever with
+                # nothing actually loading.
+                src = index($0, "src=\"" url "?ver=" ver "\"")
+                if (src > 0 && index(substr($0, 1, src), "<script") > 0 &&
+                    index(substr($0, src), "</script>") > 0) { payload = 1 }
+            }
         }
         END {
             if (nb == 0 && ne == 0) { print "none"; exit 0 }
@@ -161,7 +168,19 @@ anchor_line() {
                     p = index(s, "<!--")
                     if (p == 0) { seg = s; s = "" }
                     else { seg = substr(s, 1, p - 1); s = substr(s, p + 4); incomment = 1 }
-                    if (found == 0 && index(seg, anchor) > 0) { found = NR }
+                    # A COMPLETE element on this line, not merely the URL: the
+                    # block is injected after this line, so a loader whose tag
+                    # spans lines would receive it between "<script" and its
+                    # own ">" and corrupt the template. Requiring the closing
+                    # tag here means a multiline loader finds no anchor at all
+                    # and takes the fail-safe skip below.
+                    a = index(seg, anchor)
+                    if (found == 0 && a > 0) {
+                        open_tag = index(substr(seg, 1, a), "<script")
+                        if (open_tag > 0 && index(substr(seg, a), "</script>") > 0) {
+                            found = NR
+                        }
+                    }
                 }
             }
         }
@@ -204,9 +223,13 @@ apply() {
         return 1
     fi
 
-    # Back up what was there on entry, before any stale block is stripped -
-    # otherwise the upgrade path would save an already-modified template.
-    cp -a "$TPL" "$BAK"
+    # Only a template with NO block of ours becomes the backup, so $BAK is
+    # always a pristine pve-manager file - which is what refuse_malformed
+    # tells the operator to restore. Backing up on every apply meant a version
+    # bump saved an already-injected template over the pristine one. A
+    # pve-manager upgrade replaces the template outright, which parses as
+    # "none" and refreshes the backup, so it does not go stale.
+    [ -n "$cur" ] || cp -a "$TPL" "$BAK"
 
     new_tmp || return 1
     # Strip the old block (by line number, so nothing else can be caught) and

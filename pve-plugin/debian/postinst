@@ -28,6 +28,13 @@ gui() {
 case "$1" in
     configure)
         gui apply || true
+        # Hand-written because dh_installsystemd's own reload autoscript
+        # guards on [ -d /run/systemd/system ] with no DPKG_ROOT test - it
+        # would reload the BUILD HOST's systemd during an offline-root
+        # install. See the comment in debian/rules.
+        if host_actions && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
         if host_actions; then
             # invoke-rc.d, not systemctl: it honours policy-rc.d, which is how
             # a chroot or an image build says "do not start services here".

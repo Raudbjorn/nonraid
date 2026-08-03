@@ -14,4 +14,12 @@ package PVE::Storage::DirPlugin;
 use strict;
 use warnings;
 
+# The one SUPER:: the tests reach: check_config's schema pass. The real one
+# validates and normalises against PVE's section-config schema; here it just
+# hands the config back, so the plugin's OWN validation is what gets tested.
+sub check_config {
+    my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
+    return { %$config };
+}
+
 1;

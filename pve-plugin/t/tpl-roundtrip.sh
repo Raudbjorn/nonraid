@@ -179,6 +179,42 @@ if PVE_NONRAID_TPL="$tmp/embedded.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" remove 2
 fi
 [ "$(wc -l < "$tmp/embedded.tpl")" = "$before" ] || fail "the embedded-marker line was deleted"
 
+# A loader whose <script> tag spans lines must find NO anchor: the block is
+# injected AFTER the matched line, so anchoring on the line holding the URL
+# would land it between "<script" and that tag's own ">".
+cp "$pristine" "$tmp/work.tpl"
+awk '/pvemanagerlib/ && !d {
+        print "    <script type=\"text/javascript\""
+        print "            src=\"/pve2/js/pvemanagerlib.js\"></script>"
+        d = 1
+        next
+     } { print }' "$tmp/work.tpl" > "$tmp/multiline.tpl"
+before=$(cat "$tmp/multiline.tpl")
+if PVE_NONRAID_TPL="$tmp/multiline.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" apply 2>/dev/null; then
+    fail "apply injected into a template whose loader tag spans lines"
+fi
+[ "$(cat "$tmp/multiline.tpl")" = "$before" ] || fail "the multiline template was modified"
+
+# A URL inside a comment is not a payload: accepting one leaves the block
+# reported as applied forever with nothing actually loading.
+cp "$pristine" "$tmp/work.tpl"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+sed 's|<script type="text/javascript" src="/pve2/js/pve-nonraid-storage.js?ver=1.0.0"></script>|<!-- src="/pve2/js/pve-nonraid-storage.js?ver=1.0.0" -->|' \
+    "$tmp/work.tpl" > "$tmp/commentpayload.tpl"
+PVE_NONRAID_TPL="$tmp/commentpayload.tpl" PVE_NONRAID_VER=1.0.0 sh "$tool" status | grep -q MALFORMED \
+    || fail "a commented-out payload was accepted as applied"
+
+# The backup must stay pristine across a version bump - it is what
+# refuse_malformed tells the operator to restore.
+cp "$pristine" "$tmp/work.tpl"
+rm -f "$tmp/work.tpl.pve-nonraid.bak"
+PVE_NONRAID_VER=1.0.0 sh "$tool" apply >/dev/null
+PVE_NONRAID_VER=2.0.0 sh "$tool" apply >/dev/null
+grep -q 'BEGIN pve-nonraid-gui' "$tmp/work.tpl.pve-nonraid.bak" \
+    && fail "the version bump overwrote the backup with an injected template"
+cmp -s "$tmp/work.tpl.pve-nonraid.bak" "$pristine" \
+    || fail "the backup is not the pristine template"
+
 # A missing template is a diagnosis, not a crash.
 PVE_NONRAID_TPL="$tmp/gone.tpl" sh "$tool" status | grep -q 'tpl: MISSING' \
     || fail "status on a missing template should report it"

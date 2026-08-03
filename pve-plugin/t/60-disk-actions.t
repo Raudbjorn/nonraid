@@ -470,4 +470,27 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
     is_deeply(cmds(), [], 'and neither the umount nor the wipefs ran');
 }
 
+# The module loaded with nothing assigned: mdState=STOPPED, mdNumDisks=0, no
+# slots. Every other fixture has disks, so this state - a fresh modprobe -
+# had no coverage, and the "already loaded, stop and unassign it" refusal used
+# to fire here with advice about an array that does not exist.
+{
+    reset_commands();
+    stub_lsblk(
+        '/dev/sdb' => { name => 'sdb', type => 'disk' },
+        '/dev/sdc' => { name => 'sdc', type => 'disk' },
+    );
+    local $ENV{PROC_NMDSTAT} = "$fixtures/nmdstat-loaded-empty.txt";
+    eval {
+        $P->on_add_hook('nrpool', {
+            %$scfg,
+            'nonraid-create-parity' => '/dev/sdb',
+            'nonraid-create-data' => '/dev/sdc',
+        });
+    };
+    is($@, '', 'a loaded-but-empty module does not block array creation');
+    like(join(' ', @{ cmds() }), qr/create --force/,
+        'and the create actually runs');
+}
+
 done_testing();

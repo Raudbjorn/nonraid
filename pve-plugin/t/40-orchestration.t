@@ -268,11 +268,13 @@ sub member_mounts {
     my $bk = tempdir(CLEANUP => 1);
     local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
     local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
 
     reset_commands();
     ok($P->can('_ensure_marker')->('nrpool'), 'the marker is created');
     ok(-e "$bk/var/array.running", 'and it is where it says it is');
 
+    # Unit not running: systemd has no invocation record for it.
     reset_commands();
     ok($P->can('_ensure_unit_registered')->('nrpool'), 'unit registration succeeds');
     like(
@@ -281,17 +283,34 @@ sub member_mounts {
         'systemctl start is issued with --no-block',
     );
 
+    # Unit running: systemd's invocation symlink is what proves it, so the
+    # settled state costs stats rather than a fork.
+    mkdir "$bk/units";
+    symlink('deadbeef', "$bk/units/invocation:pve-nonraid.service") or die $!;
     reset_commands();
     $P->can('_ensure_bookkeeping')->('nrpool');
-    is_deeply(cmds(), [], 'settled state costs two stats, not a fork');
+    is_deeply(cmds(), [], 'settled state costs stats, not a fork');
+
+    # THE case a stamp could not express: an operator stops the unit by hand.
+    # A stamp would still be there and the teardown would stay unregistered
+    # for the rest of the boot; the invocation record is gone, so the next
+    # cycle re-registers it.
+    unlink "$bk/units/invocation:pve-nonraid.service";
+    reset_commands();
+    $P->can('_ensure_bookkeeping')->('nrpool');
+    like(
+        join(' ', @{ cmds() }),
+        qr{systemctl start --no-block pve-nonraid\.service},
+        'a manually stopped unit is re-registered on the next activation',
+    );
 }
 
 {
-    # A failed registration must not leave the stamp behind: the retry on the
-    # next activation is the entire point of recording it.
+    # A failed registration must be reported so the next activation retries.
     my $bk = tempdir(CLEANUP => 1);
     local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
     local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
 
     reset_commands();
     $PVE::Tools::run_command_hook = sub { die "systemd is busy\n" };
@@ -301,13 +320,45 @@ sub member_mounts {
         $P->can('_ensure_unit_registered')->('nrpool');
     };
     ok(!$ok, 'a failed unit start is reported, not swallowed');
-    ok(!-e "$bk/run/unit-started", 'no stamp is left behind to suppress the retry');
     like(join('', @warnings), qr/pve-nonraid\.service/, 'and it is warned about');
 
-    # Retry succeeds once systemd is willing.
     reset_commands();
     ok($P->can('_ensure_unit_registered')->('nrpool'), 'the retry goes through');
-    ok(-e "$bk/run/unit-started", 'and now it is stamped');
+}
+
+# ---- the correcting-parity debt is paid from BOTH paths -------------------
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    local $ENV{PVE_NONRAID_MARKER} = "$bk/var/array.running";
+    local $ENV{PVE_NONRAID_SYSTEMD_UNITS} = "$bk/units";
+    mkdir "$bk/units";
+    symlink('deadbeef', "$bk/units/invocation:pve-nonraid.service") or die $!;
+    mkdir "$bk/var";
+
+    # A debt recorded earlier, with the array already up: the slow path will
+    # never run again, so the fast path has to be what pays it.
+    open(my $fh, '>', "$bk/var/array.running.correct-pending") or die $!;
+    close($fh);
+
+    reset_commands();
+    $P->can('_ensure_bookkeeping')->('nrpool', $scfg);
+    like(join(' ', @{ cmds() }), qr/check correct/,
+        'a pending correction is started from the fast path');
+    ok(!-e "$bk/var/array.running.correct-pending",
+        'and the debt is cleared once the check starts');
+
+    # A check that cannot be started stays owed.
+    open($fh, '>', "$bk/var/array.running.correct-pending") or die $!;
+    close($fh);
+    reset_commands();
+    $PVE::Tools::run_command_hook = sub { die "driver busy\n" };
+    do {
+        local $SIG{__WARN__} = sub { };
+        $P->can('_ensure_bookkeeping')->('nrpool', $scfg);
+    };
+    ok(-e "$bk/var/array.running.correct-pending",
+        'a check that would not start is still owed');
 }
 
 {
@@ -402,6 +453,71 @@ sub member_mounts {
     like($err, qr/nonraid-tools is too old/, 'an old nmdctl is refused');
     is_deeply(cmds(), [], 'and nothing else was issued');
     ok(!-e "$bk/run/nmdctl-checked", 'a failed probe is not stamped as passed');
+}
+
+# ---- pool identity: the branch manifest ------------------------------------
+#
+# fsname proves WHOSE pool is mounted, not what is in it. A pool mounted
+# before a slot changed keeps its fsname and would sail through the fast path
+# unioning a stale member set.
+{
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    my $ours = [['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
+
+    my $st = with_fixture('nmdstat-started-clean.txt', sub {
+        return $P->can('read_nmdstat')->();
+    });
+
+    # No manifest yet (a pool that predates this check): adopt, do not remount.
+    ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st),
+        'a pool with no manifest is adopted rather than refused');
+    ok(-e "$bk/run/pool-nrpool.branches", 'and the live branch set is recorded');
+
+    # Recorded and unchanged: still ours.
+    is($P->can('pool_manifest_matches')->('nrpool', $scfg, $st), 1,
+        'the adopted manifest matches the array it was taken from');
+    ok($P->can('pool_is_ours')->('nrpool', $scfg, $ours, $st),
+        'and the fast path still accepts it');
+
+    # The array gains a slot while the pool stays mounted.
+    my $grown = with_fixture('nmdstat-started-clean.txt', sub {
+        my $x = $P->can('read_nmdstat')->();
+        $x->{'diskName.3'} = 'nmd3p1';
+        $x->{'diskSize.3'} = '1000000';
+        return $x;
+    });
+    is($P->can('pool_manifest_matches')->('nrpool', $scfg, $grown), 0,
+        'a changed slot set no longer matches the manifest');
+    ok(!$P->can('pool_is_ours')->('nrpool', $scfg, $ours, $grown),
+        'so the fast path refuses the stale pool');
+}
+
+{
+    # And the slow path must not silently accept it either - without this the
+    # refusal above would fall into the already-mounted early return.
+    my $bk = tempdir(CLEANUP => 1);
+    local $ENV{PVE_NONRAID_RUN_DIR} = "$bk/run";
+    mkdir "$bk/run";
+    open(my $fh, '>', "$bk/run/pool-nrpool.branches") or die $!;
+    # A pool built when slot 9 existed and slot 2 did not. The clean fixture's
+    # live array is slots 1+2, so this manifest is genuinely stale.
+    print {$fh} "/mnt/disk1\n/mnt/disk9\n";
+    close($fh);
+
+    reset_commands();
+    local $PVE::ProcFSTools::mounts =
+        [@{ member_mounts() }, ['nonraid-nrpool', $POOL, 'fuse.mergerfs']];
+    my $err = '';
+    # ...against a fixture whose live array has different members.
+    with_fixture('nmdstat-started-clean.txt', sub {
+        eval { $P->can('_ensure_pool_mounted')->('nrpool', $scfg) };
+        $err = $@;
+    });
+    like($err, qr/built from a different set of members/,
+        'the slow path refuses a stale pool instead of returning silently');
+    like($err, qr/systemctl stop pve-nonraid/, 'and names how to clear it');
+    is_deeply(cmds(), [], 'nothing was mounted over the top of it');
 }
 
 done_testing();

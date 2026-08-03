@@ -48,6 +48,38 @@ in_image '
     DPKG_ROOT=/target sh /var/lib/dpkg/info/libpve-storage-nonraid-perl.postrm remove >/dev/null 2>&1
     cmp -s /tmp/before.tpl /usr/share/pve-manager/index.html.tpl
 
+    echo ">>> DPKG_ROOT touches no host systemd, generated snippets included"
+    # debhelper emits a reload autoscript guarded only on
+    # [ -d /run/systemd/system ] - the BUILD HOST, not the target - so this
+    # asserts on the INSTALLED maintainer scripts, autoscripts and all,
+    # rather than only on the ones we wrote.
+    # A fake /run/systemd/system makes the host look systemd-managed, and a
+    # PATH-stubbed systemctl records every call.
+    mkdir -p /run/systemd/system /tmp/sysbin
+    cat > /tmp/sysbin/systemctl <<STUB
+#!/bin/sh
+echo "systemctl \$*" >> /tmp/systemctl.calls
+exit 0
+STUB
+    chmod +x /tmp/sysbin/systemctl
+    : > /tmp/systemctl.calls
+    for phase in postinst postrm prerm; do
+        script=/var/lib/dpkg/info/libpve-storage-nonraid-perl.$phase
+        [ -f "$script" ] || continue
+        case $phase in
+            postinst) arg=configure ;;
+            *)        arg=remove ;;
+        esac
+        PATH=/tmp/sysbin:$PATH DPKG_ROOT=/target sh "$script" "$arg" >/dev/null 2>&1 || true
+    done
+    if [ -s /tmp/systemctl.calls ]; then
+        echo "offline-root run touched the host systemd:" >&2
+        cat /tmp/systemctl.calls >&2
+        exit 1
+    fi
+    echo "no systemctl invocations under DPKG_ROOT"
+    rm -rf /tmp/sysbin /tmp/systemctl.calls
+
     echo ">>> remove sweeps the tag, purge removes the backup"
     apt-get remove -y -qq libpve-storage-nonraid-perl >/dev/null 2>&1
     ! grep -q "BEGIN pve-nonraid-gui" /usr/share/pve-manager/index.html.tpl

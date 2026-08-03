@@ -48,6 +48,12 @@ case "$1" in
             fi
         fi
         if host_actions; then
+            # Same reasoning as postinst: debhelper's generated reload snippet
+            # is not DPKG_ROOT-aware, so it is suppressed in debian/rules and
+            # written out here instead.
+            if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            fi
             for s in pvedaemon pvestatd pveproxy pvescheduler; do
                 invoke-rc.d --quiet "$s" try-restart >/dev/null 2>&1 || true
             done

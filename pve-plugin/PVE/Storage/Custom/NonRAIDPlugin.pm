@@ -48,6 +48,12 @@ sub _run_dir {
     return $ENV{PVE_NONRAID_RUN_DIR} // '/run/pve-nonraid';
 }
 
+# systemd's per-unit invocation records. Overridable for the same reason as
+# the two above: the tests need to say "the unit is/is not running".
+sub _systemd_units_dir {
+    return $ENV{PVE_NONRAID_SYSTEMD_UNITS} // '/run/systemd/units';
+}
+
 my $DEFAULT_SUPER = '/nonraid.dat';
 my $DEFAULT_DISK_PREFIX = '/mnt/disk';
 
@@ -203,6 +209,26 @@ sub check_config {
     my $prefix = $opts->{'nonraid-disk-prefix'};
     die "nonraid-disk-prefix must be an absolute path without a trailing slash\n"
         if defined($prefix) && $prefix !~ m|^/.*[^/]$|;
+
+    # 'nodes' is optional in PVE's schema and mandatory here. storage.cfg is
+    # cluster-wide, but the driver holds ONE array per node and the superblock
+    # is a module parameter, so an unrestricted nonraid storage means every
+    # node in the cluster contends for the same node-global array and the same
+    # lock. Exactly one node, because two nodes cannot share it either.
+    #
+    # Enforced on create, and on update only when 'nodes' is being set: an
+    # existing storage that predates this rule must stay editable rather than
+    # becoming unparseable.
+    my $nodes = $opts->{nodes};
+    if ($create || defined($nodes)) {
+        my $count = ref($nodes) eq 'HASH' ? scalar(keys %$nodes) : 0;
+        die "a NonRAID array is one node's hardware: set --nodes to the node"
+            . " that has it\n" if !$count;
+        die "a NonRAID storage may name exactly one node (got: "
+            . join(',', sort keys %$nodes) . "); the driver holds one array"
+            . " per node, so two nodes cannot share this storage\n"
+            if $count > 1;
+    }
 
     return $opts;
 }
@@ -600,12 +626,79 @@ sub mount_entry_for {
 # "Is the pool at $path the one this storage mounted?" - not merely "is
 # something mounted there". Used by the activation fast path and by status(),
 # so a foreign filesystem at the path can never be served as array content.
+# The branch manifest: which member directories the live pool was built from.
+#
+# fsname proves WHOSE pool is mounted, not WHAT is in it. A pool mounted
+# before a slot was added, removed or re-ordered keeps its fsname and sails
+# through the fast path while unioning a stale branch set - exposing an
+# obsolete member directory, or missing a new one, for as long as it stays
+# mounted. The manifest is the missing half of the identity.
+sub _pool_manifest_file {
+    my ($storeid) = @_;
+    return _run_dir() . "/pool-$storeid.branches";
+}
+
+sub _expected_branches {
+    my ($scfg, $st) = @_;
+    return () if !$st;
+    my $prefix = _scfg_disk_prefix($scfg);
+    return map { $prefix . $_ } data_slots($st);
+}
+
+sub _write_pool_manifest {
+    my ($storeid, @branches) = @_;
+    return 0 if !eval { make_path(_run_dir()); 1 };
+    my $tmp = _pool_manifest_file($storeid) . ".tmp.$$";
+    open(my $fh, '>', $tmp) or return 0;
+    print {$fh} join("\n", sort @branches), "\n";
+    close($fh) or do { unlink($tmp); return 0 };
+    rename($tmp, _pool_manifest_file($storeid)) or do { unlink($tmp); return 0 };
+    return 1;
+}
+
+sub _read_pool_manifest {
+    my ($storeid) = @_;
+    open(my $fh, '<', _pool_manifest_file($storeid)) or return undef;
+    my @lines = <$fh>;
+    close($fh);
+    chomp @lines;
+    return [grep { $_ ne '' } @lines];
+}
+
+# undef = "cannot tell" (no manifest); 1 = matches; 0 = stale.
+sub pool_manifest_matches {
+    my ($storeid, $scfg, $st) = @_;
+    my $have = _read_pool_manifest($storeid);
+    return undef if !defined($have);
+    my @want = sort(_expected_branches($scfg, $st));
+    return 0 if scalar(@$have) != scalar(@want);
+    for my $i (0 .. $#want) {
+        return 0 if $have->[$i] ne $want[$i];
+    }
+    return 1;
+}
+
 sub pool_is_ours {
-    my ($storeid, $scfg, $mountdata) = @_;
+    my ($storeid, $scfg, $mountdata, $st) = @_;
     my $entry = mount_entry_for($scfg->{path}, $mountdata)
         or return 0;
     return 0 if $entry->[2] ne 'fuse.mergerfs';
-    return $entry->[0] eq _pool_fsname($storeid) ? 1 : 0;
+    return 0 if $entry->[0] ne _pool_fsname($storeid);
+
+    # Ours by name; is it ours by content? A missing manifest means the pool
+    # predates this check (upgrade path) - adopt the live set rather than
+    # forcing a remount of a working pool.
+    my $matches = pool_manifest_matches($storeid, $scfg, $st);
+    if (!defined($matches)) {
+        my @want = _expected_branches($scfg, $st);
+        if (@want) {
+            _write_pool_manifest($storeid, @want);
+            syslog('notice', '%s', "storage $storeid: adopted the running"
+                . " pool's branch list (" . scalar(@want) . " members)");
+        }
+        return 1;
+    }
+    return $matches;
 }
 
 # A STOPPED array's degradedness is only knowable after import, so a policy
@@ -823,6 +916,22 @@ sub _ensure_pool_mounted {
         die "'$path' holds a mergerfs pool belonging to another storage"
             . " ($entry->[0])\n"
             if $entry->[0] ne _pool_fsname($storeid);
+
+        # Ours, mounted - but built from which branches? Without this the
+        # fast path's manifest refusal would land here and return silently,
+        # leaving the stale pool serving. mergerfs cannot be re-branched in
+        # place, so this needs an operator.
+        my $live = read_nmdstat();
+        my $matches = pool_manifest_matches($storeid, $scfg, $live);
+        if (defined($matches) && !$matches) {
+            my $have = _read_pool_manifest($storeid) // [];
+            my @want = sort(_expected_branches($scfg, $live));
+            die "'$path' holds a pool built from a different set of members"
+                . " (mounted: @$have; array now has: @want). The array"
+                . " changed while the pool stayed up; stop it with"
+                . " 'systemctl stop pve-nonraid.service' (or umount '$path')"
+                . " and activate again.\n";
+        }
         return;
     }
 
@@ -860,6 +969,13 @@ sub _ensure_pool_mounted {
         errmsg => 'mergerfs pool mount failed',
     );
 
+    # Record what this pool was actually built from, so a later fast-path
+    # activation can tell "our pool" from "our pool, from a stale array".
+    _write_pool_manifest($storeid, @branches)
+        or syslog('warning', '%s', "storage $storeid: could not record the"
+            . " pool's branch list - a later array change may go unnoticed"
+            . " while this pool stays mounted");
+
     # Member mounts are not re-checked per status() cycle on purpose: once the
     # pool is up mergerfs holds every branch busy, so a member cannot be
     # unmounted from under it, and the check would fork on pvestatd's path.
@@ -880,7 +996,9 @@ sub _post_start_bookkeeping {
     my ($storeid, $scfg, $started, $unclean) = @_;
 
     # A leftover marker means the previous shutdown never tore the array down
-    # cleanly. Record the debt durably before the marker is rewritten.
+    # cleanly. Record the debt durably; paying it is _ensure_bookkeeping's
+    # job, so that a debt recorded now but unpayable now still gets retried
+    # from the fast path once the array is up.
     if ($unclean && !-e _correction_pending_file()) {
         if (eval { make_path(File::Basename::dirname(_marker_file())); 1 }
             && open(my $fh, '>', _correction_pending_file())) {
@@ -888,28 +1006,38 @@ sub _post_start_bookkeeping {
         }
     }
 
-    if (-e _correction_pending_file()) {
-        syslog('warning', '%s', "storage $storeid: unclean shutdown detected"
-            . " - starting correcting parity check");
-        my $ok = eval {
-            run_command(
-                [$NMDCTL, '-u', '-s', _scfg_super($scfg), 'check', 'correct'],
-                timeout => 60,
-            );
-            1;
-        };
-        if ($ok) {
-            unlink(_correction_pending_file());
-        } else {
-            # Left in place on purpose: the next activation tries again.
-            syslog('warning', '%s', "storage $storeid: could not start the"
-                . " correcting parity check ($@) - will retry on the next"
-                . " activation");
-            warn "could not start parity check: $@";
-        }
-    }
+    return _ensure_bookkeeping($storeid, $scfg);
+}
 
-    _ensure_bookkeeping($storeid);
+# Pay the correcting-parity debt if one is outstanding. Called from
+# _ensure_bookkeeping, which means from BOTH paths: a check that could not be
+# started - the driver busy, nmdctl missing - used to be retried only by
+# another slow activation, and once the array was up no slow activation ever
+# came. The debt file outlives reboots, so the retry has to reach it from the
+# path that actually runs.
+sub _ensure_correction {
+    my ($storeid, $scfg) = @_;
+    return 1 if !-e _correction_pending_file();
+
+    syslog('warning', '%s', "storage $storeid: unclean shutdown detected"
+        . " - starting correcting parity check");
+    my $ok = eval {
+        run_command(
+            [$NMDCTL, '-u', '-s', _scfg_super($scfg), 'check', 'correct'],
+            timeout => 60,
+        );
+        1;
+    };
+    if ($ok) {
+        unlink(_correction_pending_file());
+        return 1;
+    }
+    # Left in place on purpose: the next activation tries again.
+    syslog('warning', '%s', "storage $storeid: could not start the"
+        . " correcting parity check ($@) - will retry on the next"
+        . " activation");
+    warn "could not start parity check: $@";
+    return 0;
 }
 
 # The unclean-shutdown marker. Written on every activation, not only the one
@@ -962,8 +1090,15 @@ sub _ensure_marker {
 # on every pvestatd cycle.
 sub _ensure_unit_registered {
     my ($storeid) = @_;
-    my $stamp = _run_dir() . "/unit-started";
-    return 1 if -e $stamp;
+
+    # systemd's own liveness record, not a stamp of our own. A stamp only says
+    # "we started it once this boot" - it survives `systemctl stop`, so an
+    # operator who stopped the unit by hand lost the ordered teardown for the
+    # rest of the boot with nothing to notice it. This symlink exists exactly
+    # while the unit is active (verified: gone after stop, back after start),
+    # and reading it is a stat, so the fast path stays fork-free in the
+    # settled case.
+    return 1 if -l _systemd_units_dir() . '/invocation:pve-nonraid.service';
 
     eval {
         run_command(['/usr/bin/systemctl', 'start', '--no-block', 'pve-nonraid.service'],
@@ -976,10 +1111,6 @@ sub _ensure_unit_registered {
         warn "could not start pve-nonraid.service: $@";
         return 0;
     }
-
-    if (eval { make_path(_run_dir()); 1 } && open(my $fh, '>', $stamp)) {
-        close($fh);
-    }
     return 1;
 }
 
@@ -989,9 +1120,10 @@ sub _ensure_unit_registered {
 # array stays up, because every later activation short-circuits before
 # reaching here. Two stats in the settled case.
 sub _ensure_bookkeeping {
-    my ($storeid) = @_;
+    my ($storeid, $scfg) = @_;
     my $ok = _ensure_marker($storeid);
     $ok = _ensure_unit_registered($storeid) && $ok;
+    $ok = _ensure_correction($storeid, $scfg) && $ok if $scfg;
     return $ok;
 }
 
@@ -1384,13 +1516,18 @@ sub activate_storage {
     my $up = $st
         && ($st->{mdState} // '') eq 'STARTED'
         && superblock_matches($st, _scfg_super($scfg))
-        && pool_is_ours($storeid, $scfg, $cache->{mountdata});
+        && pool_is_ours($storeid, $scfg, $cache->{mountdata}, $st);
 
     if ($up) {
         # Cheap, and it has to happen here: bookkeeping that failed once would
         # otherwise stay failed for the lifetime of the mount, because this is
         # the path every subsequent cycle takes.
-        _ensure_bookkeeping($storeid);
+        #
+        # A failure is warned about, NOT fatal - deliberately asymmetric with
+        # the slow path below. Refusing to activate a pool that is already
+        # serving guests, because a marker could not be written, takes those
+        # guests down to close a window that the next cycle retries anyway.
+        _ensure_bookkeeping($storeid, $scfg);
     } else {
         # One lock for the node, not one per storage. The driver holds a
         # single array - the superblock is a module parameter - so two
@@ -1403,7 +1540,14 @@ sub activate_storage {
             my $started = _ensure_array_started($storeid, $scfg, $st);
             _ensure_members_mounted($scfg);
             _ensure_pool_mounted($storeid, $scfg);
-            _post_start_bookkeeping($storeid, $scfg, $started, $unclean);
+            # Fatal here, unlike the fast path: nothing is serving yet, so
+            # reporting a successful activation whose crash marker could not
+            # be made durable would mean the next unclean shutdown looks
+            # clean and parity is never re-checked. pvestatd retries this
+            # whole path idempotently.
+            _post_start_bookkeeping($storeid, $scfg, $started, $unclean)
+                or die "activation bookkeeping failed - refusing to report"
+                . " storage '$storeid' as active; see the warnings above\n";
         });
         die "unable to activate storage '$storeid' - $@" if $@;
         $cache->{mountdata} = PVE::ProcFSTools::parse_proc_mounts();
@@ -1426,7 +1570,7 @@ sub status {
     # a foreign filesystem that happens to sit at the path would be worse than
     # reporting the storage offline.
     $cache->{mountdata} //= PVE::ProcFSTools::parse_proc_mounts();
-    return undef if !pool_is_ours($storeid, $scfg, $cache->{mountdata});
+    return undef if !pool_is_ours($storeid, $scfg, $cache->{mountdata}, $st);
 
     _log_health_transition($storeid, nmdstat_health($st));
 

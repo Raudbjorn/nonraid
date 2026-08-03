@@ -658,6 +658,14 @@
                 // storage is actually being restricted to.
                 var nodesField = me.down('field[name=nodes]');
                 if (nodesField) {
+                    // The backend refuses a nonraid storage without exactly
+                    // one node (check_config): the driver holds one array per
+                    // node. Say so in the form rather than after the round
+                    // trip.
+                    nodesField.allowBlank = false;
+                    if (Ext.isFunction(nodesField.validate)) {
+                        nodesField.validate();
+                    }
                     var refresh = function () {
                         var v = nodesField.getValue();
                         var list = Ext.isArray(v) ? v : (v ? String(v).split(',') : []);
