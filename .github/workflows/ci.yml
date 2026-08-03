@@ -10,6 +10,11 @@ on:
   pull_request:
   push:
     branches: [ main ]
+  # Upstream runs its build and integration tests weekly too: the runner
+  # kernel moves underneath the module, and a scheduled run catches that
+  # drift without waiting for the next code change to trip over it.
+  schedule:
+    - cron: '0 3 * * 0'
 
 jobs:
   nmdctl:

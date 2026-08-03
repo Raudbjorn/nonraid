@@ -1,0 +1,82 @@
+name: Build nonraid-tools Debian Package
+
+# Trimmed emulation of upstream's tools-debian.yml. Upstream's version is
+# workflow_dispatch-only and also publishes to a PPA and cuts releases; a fork
+# has neither the secrets nor the audience for that, so this keeps the half
+# that matters here: proving the package BUILDS with a real version, on every
+# change to what goes into it. The synthesis below (changelog from nmdctl's
+# VERSION, units copied under the names debhelper expects) is the same one
+# upstream's workflow performs - it is why tools/debian/changelog can sit at
+# 1.0.0-1 in-tree, and why building from a bare checkout fails without it.
+# pve-plugin/README.md documents the identical sequence for hand builds.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/tools-debian.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/tools-debian.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build nonraid-tools .deb
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            debhelper build-essential devscripts
+
+      - name: Synthesize version and unit names
+        run: |
+          VERSION=$(grep '^VERSION=' tools/nmdctl | cut -d= -f2 | tr -d '"')
+          test -n "$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cd tools
+          cat > debian/changelog <<EOF
+          nonraid-tools ($VERSION-1) noble; urgency=medium
+
+            * NonRAID tools Debian Package (CI build)
+
+           -- $(git log -1 --format='%an <%ae>')  $(date -R)
+          EOF
+          for u in nonraid.service nonraid.default nonraid-parity-check.service \
+                   nonraid-parity-check.timer nonraid-notify.service nonraid-notify.timer; do
+              cp "systemd/$u" "debian/nonraid-tools.$u"
+          done
+          cp udev/nonraid.udev debian/nonraid-tools.nonraid.udev
+
+      - name: Build
+        run: |
+          cd tools
+          dpkg-buildpackage -b -us -uc
+          ls -la ../*.deb
+
+      - name: Sanity-check the package
+        run: |
+          deb=$(ls nonraid-tools_*.deb | head -1)
+          dpkg-deb -I "$deb" | grep -q "Version: $VERSION-1"
+          dpkg-deb -c "$deb" | grep -q './usr/bin/nmdctl'
+          dpkg-deb -c "$deb" | grep -q 'nonraid.service'
+          echo "package carries $VERSION-1 and its payload"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonraid-tools-${{ env.VERSION }}
+          path: "*.deb"
+          retention-days: 30

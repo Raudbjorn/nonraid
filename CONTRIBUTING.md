@@ -10,6 +10,12 @@ keeping work in progress somewhere visible. Do what you like.
   beats a branch on someone's laptop.
 - Batch or split changes however suits you.
 
+**One-time setup:** `git config core.hooksPath .githooks`. That wires up a
+pre-push gate (shellcheck, both test suites, syntax checks, ~12s) so a broken
+tree never reaches the remote — it exists because GitHub Actions sat disabled
+on this fork for the first six review rounds and nobody noticed. Bypass in an
+emergency with `git push --no-verify`.
+
 Two habits worth keeping anyway, because they have actually bitten here:
 
 - **Driver fixes start on the matching `nonraid-6.X` branch**, not on `main`.
