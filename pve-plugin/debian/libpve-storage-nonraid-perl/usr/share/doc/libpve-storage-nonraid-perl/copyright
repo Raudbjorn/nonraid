@@ -1,9 +1,0 @@
-Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: nonraid
-Source: https://github.com/Raudbjorn/nonraid
-
-Files: *
-Copyright: 2026 NonRAID contributors
-License: GPL-2.0-only
- On Debian systems, the complete text of the GNU General Public License
- version 2 can be found in /usr/share/common-licenses/GPL-2.

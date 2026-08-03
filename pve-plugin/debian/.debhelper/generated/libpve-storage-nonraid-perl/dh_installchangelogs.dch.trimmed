@@ -1,7 +1,0 @@
-libpve-storage-nonraid-perl (0.1.0) unstable; urgency=medium
-
-  * Initial release: nonraid storage type for Proxmox VE 9 with on-demand
-    array start/mount orchestration, mergerfs pooling and optional web UI
-    integration.
-
- -- Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>  Sun, 02 Aug 2026 22:00:00 +0000

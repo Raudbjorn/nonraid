@@ -109,8 +109,12 @@ jobs:
           # Through the documented entry point, so the target itself is
           # covered rather than just dpkg-buildpackage.
           cd /work && make package-plugin
-          lintian --fail-on error /work/out/libpve-storage-nonraid-perl_*.deb
-          dpkg-deb -c /work/out/libpve-storage-nonraid-perl_*.deb
+          # The target's output directory depends on the Makefile revision
+          # (parent dir, or out/ once artifact collection lands), so find it.
+          deb=$(find /work -name 'libpve-storage-nonraid-perl_*.deb' | head -1)
+          test -n "$deb"
+          lintian --fail-on error "$deb"
+          dpkg-deb -c "$deb"
 
   package-lifecycle:
     name: Install, trigger, remove, purge (Debian 13 + PVE 9)
@@ -166,7 +170,9 @@ jobs:
           cp systemd/nonraid-notify.timer debian/nonraid-tools.nonraid-notify.timer
           cp udev/nonraid.udev debian/nonraid-tools.nonraid.udev
           dpkg-buildpackage -b -us -uc
-          apt-get install -y /work/nonraid-tools_*.deb
+          tools_deb=$(find /work -name 'nonraid-tools_*.deb' | head -1)
+          test -n "$tools_deb"
+          apt-get install -y --no-install-recommends "$tools_deb"
           nmdctl --version
 
       - name: Install through apt, resolving Depends
@@ -180,8 +186,9 @@ jobs:
         run: |
           install -D -m 0644 pve-plugin/t/fixtures/index.html.tpl.fixture \
             /usr/share/pve-manager/index.html.tpl
-          apt-get install -y --no-install-recommends \
-            /work/out/libpve-storage-nonraid-perl_*.deb
+          deb=$(find /work -name 'libpve-storage-nonraid-perl_*.deb' | head -1)
+          test -n "$deb"
+          apt-get install -y --no-install-recommends "$deb"
           test -f /usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
           test -x /usr/share/pve-nonraid/pve-nonraid-teardown
           /usr/share/pve-nonraid/pve-nonraid-gui status | grep -q "^tpl: applied"

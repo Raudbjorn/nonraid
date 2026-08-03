@@ -1,0 +1,47 @@
+# Build artifacts: .deb, .changes, .buildinfo from 'make package*'.
+/out/
+*.deb
+*.changes
+*.buildinfo
+
+# debhelper leaves these behind in every debian/ directory it builds in: the
+# root one (nonraid-dkms), tools/ (nonraid-tools) and pve-plugin/
+# (libpve-storage-nonraid-perl). The staged package trees are the ones that
+# matter - they are a second copy of files already tracked elsewhere.
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.debhelper.log
+debian/debhelper-build-stamp
+debian/.debhelper/
+debian/tmp/
+debian/nonraid-dkms/
+tools/debian/files
+tools/debian/*.substvars
+tools/debian/*.debhelper
+tools/debian/*.debhelper.log
+tools/debian/debhelper-build-stamp
+tools/debian/.debhelper/
+tools/debian/tmp/
+tools/debian/nonraid-tools/
+# Synthesized at build time from tools/systemd and tools/udev, never edited in
+# place (see CLAUDE.md).
+tools/debian/nonraid-tools.*
+pve-plugin/debian/files
+pve-plugin/debian/*.substvars
+pve-plugin/debian/*.debhelper
+pve-plugin/debian/*.debhelper.log
+pve-plugin/debian/debhelper-build-stamp
+pve-plugin/debian/.debhelper/
+pve-plugin/debian/tmp/
+pve-plugin/debian/libpve-storage-nonraid-perl/
+
+# kbuild output from 'make modules'.
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
