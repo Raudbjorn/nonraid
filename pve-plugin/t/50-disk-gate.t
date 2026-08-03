@@ -175,4 +175,71 @@ sub live_array {
     is($next->({}), 1, 'an empty array starts at slot 1');
 }
 
+# Realistic whole-disk layouts, run through the gate exactly as wipe_disks
+# sees it. Every one of these is a disk somebody could pick in the dialog.
+{
+    my $wipe_fatal = sub {
+        return [grep { !/^\d+ partition/ && !/holds a .* filesystem$/ }
+            @{ $blockers->($_[0], undef) }];
+    };
+
+    # PVE's default installer layout: the running root is an LV two levels
+    # down, and the disk itself has neither mountpoint nor fstype.
+    my $pve_root = { name => 'sda', type => 'disk', children => [
+        { name => 'sda2', type => 'part', fstype => 'vfat' },
+        { name => 'sda3', type => 'part', fstype => 'LVM2_member', children => [
+            { name => 'pve-swap', type => 'lvm', fstype => 'swap' },
+            { name => 'pve-root', type => 'lvm', fstype => 'ext4', mountpoint => '/' },
+        ] },
+    ] };
+    ok(scalar @{ $wipe_fatal->($pve_root) }, 'the PVE root disk is never wipeable');
+    like(join('; ', @{ $blockers->($pve_root, undef) }), qr{pve-root is mounted at /},
+        'and the mounted LV is what it names');
+
+    # The same disk with the ESP not mounted - what saved the case above was a
+    # coincidence of the installer's layout, not a guard.
+    my $esp_unmounted = { name => 'sda', type => 'disk', children => [
+        { name => 'sda3', type => 'part', fstype => 'LVM2_member', children => [
+            { name => 'pve-root', type => 'lvm', fstype => 'ext4', mountpoint => '/' },
+        ] },
+    ] };
+    ok(scalar @{ $wipe_fatal->($esp_unmounted) },
+        'still refused with nothing mounted from the ESP');
+
+    # A ZFS vdev with the pool EXPORTED has no children and no mountpoint at
+    # all: a bare zfs_member signature on a partition. This is the layout that
+    # gets past mountpoint checks, holder-type checks and child recursion
+    # alike, because there is nothing assembled to find.
+    my $zfs_exported = { name => 'sdb', type => 'disk', children => [
+        { name => 'sdb1', type => 'part', fstype => 'zfs_member' },
+        { name => 'sdb9', type => 'part' },
+    ] };
+    like(join('; ', @{ $blockers->($zfs_exported, undef) }),
+        qr/sdb1 carries a zfs_member signature/, 'an exported ZFS vdev is recognised');
+    ok(scalar @{ $wipe_fatal->($zfs_exported) }, 'and refused');
+
+    for my $sig (qw(LVM2_member linux_raid_member crypto_LUKS ceph_bluestore)) {
+        my $e = { name => 'sdc', type => 'disk',
+            children => [{ name => 'sdc1', type => 'part', fstype => $sig }] };
+        ok(scalar @{ $wipe_fatal->($e) }, "a bare $sig signature is fatal to a wipe");
+    }
+
+    # The other direction: an ordinary filesystem is precisely what wipefs is
+    # for. Refusing it left a disk formatted with no partition table refused by
+    # BOTH wipe and assign - a dead end in the funnel, with the operator sent
+    # to the shell to run the command this feature exists to replace.
+    my $bare_fs = { name => 'sdz', type => 'disk', fstype => 'btrfs' };
+    is_deeply($wipe_fatal->($bare_fs), [], 'a bare-formatted disk is wipeable');
+    is_deeply($blockers->($bare_fs, undef), ['holds a btrfs filesystem'],
+        'but not assignable until it has been');
+
+    my $ext4_parts = { name => 'sdx', type => 'disk', children => [
+        { name => 'sdx1', type => 'part', fstype => 'ext4' },
+        { name => 'sdx2', type => 'part', fstype => 'ext4' },
+    ] };
+    is_deeply($wipe_fatal->($ext4_parts), [], 'unmounted data partitions are wipeable');
+    like(join('; ', @{ $blockers->($ext4_parts, undef) }), qr/sdx1 holds a ext4/,
+        'and each one is named, not reported twice as the same sentence');
+}
+
 done_testing();

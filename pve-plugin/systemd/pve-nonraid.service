@@ -9,8 +9,15 @@ Documentation=https://github.com/Raudbjorn/nonraid
 # cold boot that makes "qm start" fail once with "disk image already exists".
 # When enabled, ExecStart activates the enabled storages (starting the array
 # and mounting the pool) before pve-guests runs.
+# Requires= is load-bearing (failure propagation); After= is not, and is
+# dropped deliberately. A service with DefaultDependencies=yes already orders
+# after basic.target -> sysinit.target -> local-fs.target, which is the
+# argument the fork used when removing both from nonraid.service in #6/#7.
+# Requires= is kept because unlike that unit this one has a pool to tear down,
+# and the removal there was about a unit that mounts nothing of its own.
+# Recorded here so this stops being re-raised each round.
 Requires=local-fs.target
-After=local-fs.target pve-cluster.service pve-storage.target
+After=pve-cluster.service pve-storage.target
 Before=pve-guests.service
 
 [Service]

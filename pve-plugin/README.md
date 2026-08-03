@@ -163,6 +163,32 @@ them in order: unmount, wipe, create.
 
 ![The batch confirmation](images/add-dialog-confirm.png)
 
+**Who may do this, and on which machine.** These actions are node-local and
+destructive, so the plugin refuses them unless two things hold:
+
+- the storage names this node in **Nodes** (device names mean nothing on
+  another machine, and `POST /storage` is served by whichever node your
+  browser is talking to — not necessarily the one whose disks the dialog is
+  showing);
+- the caller has `Sys.Modify` on `/nodes/<node>`.
+
+The second is deliberate. PVE gates the equivalent operation
+(`/nodes/{node}/disks/wipedisk`) at root; these properties arrive on
+`POST`/`PUT /storage`, which needs only `Datastore.Allocate`. Going around
+that endpoint is necessary — it cannot see NonRAID membership, so a live
+array member looks exactly like a spare to it — but the privilege it carried
+has to be re-applied here, or delegating "may define storages" would also
+delegate "may erase any disk on the node".
+
+**How long it takes.** Creating an array runs `nmdctl create`, `start` and
+`check recon` inside the storage-config hook, which holds the cluster storage
+lock for the duration. The commands return as soon as the driver accepts them
+— the parity build itself runs in the background and is *not* waited for — but
+the bounds are generous, so budget up to a couple of minutes and do not
+interrupt the API call. The steps run in order (unmount, wipe, create) and are
+not replayed: if a later one fails, the earlier ones have already happened and
+a retry starts from where the disks now are.
+
 A disabled button carries the reason as a tooltip. Ceph OSDs, LVM, ZFS and
 Device Mapper are refused outright rather than unmounted — release those with
 the tool that owns them.

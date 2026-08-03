@@ -12,6 +12,8 @@ use lib "$FindBin::Bin/lib", "$FindBin::Bin/..";
 use PVE::Tools;
 use PVE::ProcFSTools;
 use PVE::Storage::DirPlugin;
+use PVE::INotify;
+use PVE::RPCEnvironment;
 use PVE::Storage::Custom::NonRAIDPlugin;
 
 my $P = 'PVE::Storage::Custom::NonRAIDPlugin';
@@ -34,7 +36,10 @@ sub reset_commands {
 }
 sub cmds { return [map { join(' ', @$_) } @PVE::Tools::run_command_log]; }
 
-my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat' };
+# Disk actions are node-scoped: device names are node-local, so the hooks
+# refuse unless the storage names the node serving the request.
+my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat',
+    nodes => { $PVE::INotify::nodename => 1 } };
 
 # --- creating an array -----------------------------------------------------
 
@@ -318,6 +323,105 @@ my $scfg = { path => '/mnt/pve/nrpool', 'nonraid-super' => '/nonraid.dat' };
     $P->on_update_hook_full('nrpool', $scfg,
         { 'nonraid-unmount-disks' => '/dev/sdz' }, undef, {});
     is_deeply(cmds(), [], 'an unmounted disk needs no umount');
+}
+
+# --- node scoping ----------------------------------------------------------
+#
+# storage.cfg is cluster-wide but device names are node-local, and POST/PUT
+# /storage is served by whichever node the client is talking to. The GUI makes
+# the gap sharp: it lists the disks of the node in the Nodes field and then
+# submits to a cluster endpoint with no node at all.
+
+{
+    reset_commands();
+    stub_lsblk('/dev/sdb' => { name => 'sdb', type => 'disk' });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+
+    # Aimed at another node: the disks named are not this machine's.
+    eval {
+        $P->on_add_hook('nrpool', {
+            %$scfg,
+            nodes => { 'someothernode' => 1 },
+            'nonraid-wipe-disks' => '/dev/sdb',
+        });
+    };
+    like($@, qr/served by 'testnode'/, 'a wipe aimed at another node is refused');
+    like($@, qr/device names are node-local/, 'and the reason is named');
+    is_deeply(cmds(), [], 'nothing was issued');
+
+    # No restriction at all: nothing says which machine these disks are.
+    eval {
+        $P->on_add_hook('nrpool', {
+            path => '/mnt/pve/nrpool',
+            'nonraid-wipe-disks' => '/dev/sdb',
+        });
+    };
+    like($@, qr/no 'nodes' restriction/, 'an unrestricted storage is refused');
+    is_deeply(cmds(), [], 'nothing was issued');
+
+    # Named, and this is the node: allowed through to the gate.
+    reset_commands();
+    eval {
+        $P->on_add_hook('nrpool', {
+            %$scfg,
+            nodes => { 'testnode' => 1, 'anothernode' => 1 },
+            'nonraid-wipe-disks' => '/dev/sdb',
+        });
+    };
+    is($@, '', 'a storage that names this node proceeds');
+    like(join(' ', @{ cmds() }), qr{wipefs -a /dev/sdb}, 'and the wipe ran');
+}
+
+{
+    # An update may not repoint 'nodes' elsewhere and authorise itself against
+    # the value still on disk.
+    reset_commands();
+    stub_lsblk('/dev/sdb' => { name => 'sdb', type => 'disk' });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+    eval {
+        $P->on_update_hook_full('nrpool', $scfg,
+            { nodes => { 'someothernode' => 1 }, 'nonraid-wipe-disks' => '/dev/sdb' },
+            undef, {});
+    };
+    like($@, qr/served by 'testnode'/, 'the resulting config is what is checked');
+    is_deeply(cmds(), [], 'nothing was issued');
+}
+
+# --- authorization ---------------------------------------------------------
+#
+# These properties ride in on POST/PUT /storage, which needs only
+# Datastore.Allocate on /storage. PVE gates the equivalent physical operation
+# (/nodes/{node}/disks/wipedisk) far higher - its API entry carries no
+# permissions block at all, making it root@pam only.
+
+{
+    reset_commands();
+    stub_lsblk('/dev/sdb' => { name => 'sdb', type => 'disk' });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+
+    local $PVE::RPCEnvironment::env =
+        PVE::RPCEnvironment::Stub->new(user => 'storageadmin@pve', allow => 0);
+    eval {
+        $P->on_add_hook('nrpool', { %$scfg, 'nonraid-wipe-disks' => '/dev/sdb' });
+    };
+    like($@, qr/Permission check failed/, 'a caller without Sys.Modify is refused');
+    is_deeply(cmds(), [], 'nothing was issued');
+    my $asked = $PVE::RPCEnvironment::env->{checks}->[0];
+    is($asked->{path}, '/nodes/testnode', 'the check is against this node');
+    is_deeply($asked->{privs}, ['Sys.Modify'], 'and asks for Sys.Modify');
+}
+
+{
+    reset_commands();
+    stub_lsblk('/dev/sdb' => { name => 'sdb', type => 'disk' });
+    local $ENV{PROC_NMDSTAT} = "$fixtures/does-not-exist";
+    local $PVE::RPCEnvironment::env =
+        PVE::RPCEnvironment::Stub->new(user => 'root@pam', allow => 1);
+    eval {
+        $P->on_add_hook('nrpool', { %$scfg, 'nonraid-wipe-disks' => '/dev/sdb' });
+    };
+    is($@, '', 'a caller with Sys.Modify proceeds');
+    like(join(' ', @{ cmds() }), qr{wipefs -a /dev/sdb}, 'and the wipe ran');
 }
 
 done_testing();

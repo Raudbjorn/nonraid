@@ -17,7 +17,9 @@ use File::Spec;
 use IO::Handle;
 use JSON::PP;
 
+use PVE::INotify;
 use PVE::ProcFSTools;
+use PVE::RPCEnvironment;
 use PVE::SafeSyslog;
 use PVE::Tools qw(run_command);
 
@@ -329,6 +331,37 @@ sub system_mountpoint {
 #
 # Split pure/impure so the rules are testable against fixtures: this half takes
 # a parsed lsblk entry plus /proc/nmdstat and returns why not, if not.
+# Filesystem signatures split in two, and the split is what makes the
+# unmount -> wipe -> assign funnel finish.
+#
+# An ordinary filesystem is exactly what 'wipefs -a' exists to remove, so
+# reporting it must not be fatal to a wipe - otherwise a disk formatted
+# directly, with no partition table, is refused by wipe AND by assign, and the
+# operator has to leave the UI and run wipefs by hand.
+#
+# A holder signature is different: it means some subsystem owns this device
+# even though nothing is assembled from it at this moment. An exported ZFS
+# pool, a deactivated VG, an inactive MD member and a closed LUKS container all
+# present as a bare signature with no children and no mountpoint. Erasing one
+# destroys the pool/array/volume it belongs to.
+my %HOLDER_FSTYPES = map { $_ => 1 } qw(
+    LVM2_member zfs_member linux_raid_member crypto_LUKS
+    ceph_bluestore bcache DDF_raid_member isw_raid_member
+    swsuspend
+);
+
+sub _fstype_blocker {
+    my ($node, $is_child) = @_;
+    my $fstype = $node->{fstype} // '';
+    return undef if $fstype eq '';
+    my $name = $node->{name} // 'it';
+    return "$name carries a $fstype signature" if $HOLDER_FSTYPES{$fstype};
+    # Name the child, so "2 partition(s)" plus two filesystems reads as which
+    # ones rather than as the same sentence twice.
+    return $is_child ? "$name holds a $fstype filesystem"
+                     : "holds a $fstype filesystem";
+}
+
 sub disk_blockers {
     my ($entry, $st) = @_;
     my @blockers;
@@ -370,7 +403,7 @@ sub disk_blockers {
 
     push @blockers, "mounted at $entry->{mountpoint}"
         if defined($entry->{mountpoint}) && $entry->{mountpoint} ne '';
-    push @blockers, "holds a $entry->{fstype} filesystem"
+    push @blockers, _fstype_blocker($entry) // ()
         if defined($entry->{fstype}) && $entry->{fstype} ne '';
 
     # The WHOLE subtree, not just the direct children. lsblk nests, and the
@@ -390,6 +423,13 @@ sub disk_blockers {
             # OSD. Undoing those is the business of the tool that made them.
             push @blockers, "$child->{name} ($ctype) holds it";
         }
+        # A descendant's SIGNATURE matters even when nothing is assembled from
+        # it right now. A ZFS vdev is the case that gets past everything else:
+        # 'sdb1' is type 'part' with fstype 'zfs_member' and, with the pool
+        # exported, no children at all - so it looked exactly like a spare
+        # carrying a partition table, which is the one blocker wipe drops.
+        push @blockers, _fstype_blocker($child, 1) // ()
+            if defined($child->{fstype}) && $child->{fstype} ne '';
         push @queue, @{ $child->{children} // [] };
     }
     # Counted at the top level only: "3 partition(s)" describes the partition
@@ -1036,7 +1076,16 @@ my sub wipe_disks {
 
         # Partitions are why one wipes, so they are not a blocker here. Every
         # other reason still is.
-        my @fatal = grep { !/^\d+ partition/ } @{ disk_blockers($entry, $st) };
+        # A partition table and an ordinary filesystem are the two things
+        # 'wipefs -a' is for; everything else - mountpoints, holders, holder
+        # signatures at any depth, array membership - stays fatal.
+        #
+        # This is a check-then-act: nothing stops the disk being claimed
+        # between the lsblk here and the wipefs below. The window is small and
+        # the hook holds the cluster storage lock, but it is a window, and this
+        # gate is the only thing between an operator and wipefs -a.
+        my @fatal = grep { !/^\d+ partition/ && !/holds a .* filesystem$/ }
+            @{ disk_blockers($entry, $st) };
         die "refusing to wipe '$dev': " . join(', ', @fatal) . "\n" if @fatal;
 
         syslog('warning', '%s', "storage $storeid: wiping '$dev' on request"
@@ -1064,9 +1113,13 @@ my sub create_array {
             . " it with nmdctl before building a new one\n";
     }
 
+    # Deduped on the resolved path, not the string: /dev/sdb and
+    # /dev/disk/by-id/... can be the same disk, and assigning one disk to two
+    # slots would build an array on top of itself.
     my %seen;
     for my $dev (@$parity, @$data) {
-        die "'$dev' listed twice\n" if $seen{$dev}++;
+        my $real = canon_path($dev) // $dev;
+        die "'$dev' listed twice\n" if $seen{$real}++;
     }
     require_assignable([@$parity, @$data], $st);
 
@@ -1092,6 +1145,64 @@ my sub create_array {
 }
 
 # Actions are consumed here and deleted from the config, so they never persist.
+# Two guards that the disk actions share, both of which exist because these
+# properties travel on a CLUSTER-level endpoint while the thing they destroy is
+# one node's hardware.
+
+# Device names are node-local, and POST/PUT /storage is served by whichever
+# node the client happens to be talking to - not by the node in 'nodes'. The
+# GUI makes that gap sharp rather than obvious: it lists the disks of the node
+# in the Nodes field (/nodes/{node}/disks/list) and then submits to /storage
+# with no node at all. An operator who set nodes=nodeB, saw nodeB's inventory
+# and picked /dev/sdb from it would have wiped nodeA's /dev/sdb - and if that
+# happened to be an unpartitioned spare, every blocker check would have passed.
+sub _check_disk_action_node {
+    my ($storeid, $scfg) = @_;
+
+    # Not $local: "$local's" interpolates as the package variable $local::s.
+    my $here = PVE::INotify::nodename();
+    my $nodes = $scfg->{nodes};
+
+    # Unset means "every node", which for an array that exists on exactly one
+    # machine is never what was meant - and for a destructive action it is the
+    # case where nobody has thought about which machine it is.
+    die "refusing disk actions on storage '$storeid': it has no 'nodes'"
+        . " restriction, so there is nothing to say these disks belong to"
+        . " $here. Set --nodes to the node that has the array.\n"
+        if !$nodes || !%$nodes;
+
+    die "refusing disk actions on storage '$storeid': these disks belong to"
+        . " '" . join(',', sort keys %$nodes) . "', but this request is being"
+        . " served by '$here' and device names are node-local. Re-issue it"
+        . " against the target node.\n"
+        if !$nodes->{$here};
+
+    return $here;
+}
+
+# PVE gates the equivalent operation (/nodes/{node}/disks/wipedisk) on
+# Sys.Modify for that node - its API entry carries no permissions block at all,
+# which makes it root@pam-only. These properties ride in on POST/PUT /storage,
+# which needs only Datastore.Allocate on /storage. Routing around
+# /disks/wipedisk was right - it cannot see NonRAID membership, so a live
+# member looks exactly like a spare to it - but the privilege that came with it
+# has to be carried over by hand, or a delegated storage admin inherits the
+# ability to erase any block device on the node.
+sub _check_disk_action_perms {
+    my ($storeid, $node) = @_;
+
+    my $rpcenv = eval { PVE::RPCEnvironment::get() };
+    # No API environment: pvesm/pvesh from a shell, or the unit tests. Those
+    # are already root-only by virtue of being a local root shell.
+    return if !$rpcenv;
+
+    my $user = eval { $rpcenv->get_user() };
+    return if !defined($user);
+
+    $rpcenv->check($user, "/nodes/$node", ['Sys.Modify']);
+    return;
+}
+
 my sub run_disk_actions {
     my ($storeid, $scfg, $target) = @_;
 
@@ -1104,6 +1215,20 @@ my sub run_disk_actions {
     delete $target->{'nonraid-wipe-disks'};
     delete $target->{'nonraid-create-parity'};
     delete $target->{'nonraid-create-data'};
+
+    my $wanted = grep { defined($_) && $_ ne '' } ($unmount, $wipe, $parity, $data);
+    return if !$wanted;
+
+    # Both before anything is touched, and in this order: establish WHICH node
+    # these device names belong to, then whether the caller may modify it.
+    #
+    # The check is against the config that will RESULT, not the one on disk: an
+    # update that repoints 'nodes' at another node in the same call must not be
+    # able to authorise itself against the old value. On the add path the two
+    # are the same hash.
+    my $effective = { %{ $scfg // {} }, %{ $target // {} } };
+    my $node = _check_disk_action_node($storeid, $effective);
+    _check_disk_action_perms($storeid, $node);
 
     # Ordered the way the operator works: free it, clear it, then use it.
     unmount_disks($storeid, [PVE::Tools::split_list($unmount)], read_nmdstat())

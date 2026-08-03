@@ -596,18 +596,25 @@
                 return submit();
             }
             var s = panel.stagedDiskActions();
+            // Device names come from the node's own kernel, so this is not a
+            // trust boundary - but this dialog is the last thing an operator
+            // reads before erasing a disk, and a name that renders as markup
+            // is a name they cannot check.
+            var devs = function (list) {
+                return Ext.String.htmlEncode(list.join(', '));
+            };
             var lines = [];
             if (s.unmount.length) {
-                lines.push(gettext('Unmount') + ': ' + s.unmount.join(', '));
+                lines.push(gettext('Unmount') + ': ' + devs(s.unmount));
             }
             if (s.wipe.length) {
-                lines.push('<b>' + gettext('ERASE ALL DATA') + '</b>: ' + s.wipe.join(', '));
+                lines.push('<b>' + gettext('ERASE ALL DATA') + '</b>: ' + devs(s.wipe));
             }
             if (s.parity.length || s.data.length) {
                 lines.push('<b>' + gettext('Build a new array, destroying their contents')
                     + '</b>:<br>&nbsp;&nbsp;' + gettext('Parity') + ': '
-                    + (s.parity.join(', ') || '—') + '<br>&nbsp;&nbsp;'
-                    + gettext('Data') + ': ' + (s.data.join(', ') || '—'));
+                    + (s.parity.length ? devs(s.parity) : '—') + '<br>&nbsp;&nbsp;'
+                    + gettext('Data') + ': ' + (s.data.length ? devs(s.data) : '—'));
             }
             if (!lines.length) {
                 return submit();
