@@ -941,6 +941,8 @@ static void md_submit_bio(struct bio *bi)
         }
         
         bi = bio_split_to_limits(bi);
+        if (!bi)
+                return;
         bi->bi_opf &= ~REQ_NOMERGE;
 
         unraid_make_request(mddev, unit, bi);
@@ -985,6 +987,40 @@ static struct block_device_operations md_fops =
 //	.revalidate_disk= md_revalidate,
 };
 
+static struct queue_limits *md_set_queue_limits(struct queue_limits *lim, mdk_rdev_t *rdev)
+{
+        /* set default stacking limits */
+        blk_set_stacking_limits(lim);
+        lim->features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA | BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
+        
+        /* merge lower device limits */
+        if (!strstr(rdev->status, "DISK_NP")) {
+                queue_limits_stack_bdev(lim, rdev->bdev, rdev->offset, rdev->name);
+        }
+
+        /* disk being emulated, set some missing defaults */
+        if (strstr(rdev->status, "DISK_NP")) {
+                lim->max_zone_append_sectors = 0;
+        }
+
+        /* we must override selected merged limits */
+        lim->logical_block_size = 512;
+        lim->physical_block_size = 4096;
+        lim->dma_alignment = 511;
+        lim->io_min = 512;
+        lim->io_opt = 128 * 1024;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+        lim->max_hw_wzeroes_unmap_sectors = 0;
+#endif
+        lim->max_secure_erase_sectors = 0; /* disable secure_erase */
+        lim->max_write_zeroes_sectors = 0; /* disable write_zeroes */
+        lim->max_hw_sectors = 256;  /* 256 sectors => 128K */
+        lim->max_hw_discard_sectors = 0; /* disable discard */
+        lim->max_discard_sectors = 0;
+        lim->discard_granularity = 0;
+        return lim;
+}
+
 static int do_run(mddev_t *mddev)
 {
 	mdp_super_t *sb = &mddev->sb;
@@ -1017,10 +1053,12 @@ static int do_run(mddev_t *mddev)
         /* create the md devices */
 	for (i = 1; i <= 28; i++) {
 		mdp_disk_t *disk = &sb->disks[i];
+                struct queue_limits lim;
 
 		if (disk_active(disk) || disk_enabled(disk)) {
-			int unit = disk->number;
 			struct gendisk *gd = blk_alloc_disk(NULL,NUMA_NO_NODE);
+                        mdk_rdev_t *rdev = &mddev->rdev[i];
+			int unit = disk->number;
                         int ret;
 
 			mddev->gendisk[unit] = gd;
@@ -1032,21 +1070,10 @@ static int do_run(mddev_t *mddev)
 			gd->fops = &md_fops;
 			gd->private_data = mddev;
 			gd->queue->queuedata = mddev;
+                        queue_limits_set(gd->queue, md_set_queue_limits(&lim, rdev));
 
                         /* capacity in 512-byte sectors */
                         set_capacity(gd, disk->size*2);
-
-                        blk_set_stacking_limits(&gd->queue->limits);
-                        gd->queue->limits.features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA |
-                                BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT |
-                                BLK_FEAT_ROTATIONAL;
-
-                        blk_queue_disable_discard(gd->queue);
-                        blk_queue_disable_secure_erase(gd->queue);
-                        blk_queue_disable_write_zeroes(gd->queue);
-
-                        if (md_restrict & 1)
-                                gd->queue->limits.max_hw_sectors = 256;  /* 256 sectors => 128K */
                         
 			ret = add_disk(gd);
 			printk("nmd%dp1: running, size: %llu blocks\n", unit, disk->size);
@@ -2249,4 +2276,5 @@ module_exit(md_exit);
 
 MODULE_ALIAS("nonraid");
 MODULE_ALIAS_BLOCKDEV_MAJOR(MAJOR_NR);
+MODULE_DESCRIPTION("NonRAID array stacking driver");
 MODULE_LICENSE("GPL");

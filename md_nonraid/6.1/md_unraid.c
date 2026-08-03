@@ -941,6 +941,8 @@ static void md_submit_bio(struct bio *bi)
         }
         
         bi = bio_split_to_limits(bi);
+        if (!bi)
+                return;
         bi->bi_opf &= ~REQ_NOMERGE;
 
         unraid_make_request(mddev, unit, bi);
@@ -2249,4 +2251,5 @@ module_exit(md_exit);
 
 MODULE_ALIAS("nonraid");
 MODULE_ALIAS_BLOCKDEV_MAJOR(MAJOR_NR);
+MODULE_DESCRIPTION("NonRAID array stacking driver");
 MODULE_LICENSE("GPL");

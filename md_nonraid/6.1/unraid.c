@@ -24,6 +24,11 @@
 #include "md_unraid.h"
 
 /*
+ * The global zero page.
+ */
+#define raid6_empty_zero_page page_address(ZERO_PAGE(0))
+
+/*
  * The following can be used to debug the driver
  */
 extern int md_trace;
@@ -1723,6 +1728,12 @@ void unraid_make_request(mddev_t *mddev, int unit, struct bio *bi)
 	/* check for requests before we're running */
 	BUG_ON(!conf);
 
+        /* check for REQ_OP_DISCARD - shouldn't happen */
+        if (unlikely(bio_op(bi) == REQ_OP_DISCARD)) {
+                /* just ignore it */
+                return;
+        }
+
 	/* check for REQ_FLUSH */
         if (bi->bi_opf & REQ_PREFLUSH) {
                 dprintk("got a flush: disk: %d\n", unit);
@@ -1795,8 +1806,6 @@ static void unraidd(mddev_t *mddev, unsigned long unit)
 
 	dprintk("nonraidd%d: activated\n", (int)unit);
 
-	blk_start_plug(&plug);
-
 	spin_lock_irq(&conf->device_lock);
 	while (!list_empty(&conf->handle_list[unit])) {
 		struct list_head *first;
@@ -1811,6 +1820,9 @@ static void unraidd(mddev_t *mddev, unsigned long unit)
 
 		spin_unlock_irq(&conf->device_lock);
 
+                if (count == 0)
+                        blk_start_plug(&plug);
+
 		handle_stripe(sh);
 		release_stripe(sh);
 		count++;
@@ -1819,7 +1831,8 @@ static void unraidd(mddev_t *mddev, unsigned long unit)
 	}
 	spin_unlock_irq(&conf->device_lock);
 
-	blk_finish_plug(&plug);
+        if (count)
+                blk_finish_plug(&plug);
 
         dprintk("nonraidd%d: handled %d stripes\n", (int)unit, count);
 }

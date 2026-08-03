@@ -64,7 +64,7 @@ extern void (*raid6_xor_syndrome)(int, int, int, size_t, void **);
  */
 #define MD_MAJOR_VERSION                2
 #define MD_MINOR_VERSION                9
-#define MD_PATCHLEVEL_VERSION           35
+#define MD_PATCHLEVEL_VERSION           40
 
 /****************************************************************************/
 /* 'md_p.h' holds the 'physical' layout of RAID devices */

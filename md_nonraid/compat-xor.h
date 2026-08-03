@@ -1,15 +1,5 @@
 /*
- * Kernel compatibility shim, force-included by md_nonraid/Makefile.
- *
- * This deliberately lives outside the per-kernel source directories. Those are
- * verbatim copies of the nonraid-6.X branches, which are rebased onto new
- * UnRAID vendor drops, so every line of local change there is friction at
- * rebase time - and the directories themselves get renamed (6.12 -> 6.18 in
- * qvr/nonraid#116), which would silently strand a patch kept inside one.
- *
- * Because it is force-included via -include, it applies to whichever source
- * directory the version gate in the Makefile selects, and the vendored copies
- * stay byte-identical to upstream.
+ * Kernel 7.1+ compatibility shim
  */
 
 #ifndef NONRAID_COMPAT_XOR_H
