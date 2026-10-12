@@ -1,25 +1,79 @@
+# SPDX-License-Identifier: GPL-2.0-only
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: nonraid-dkms
-Source: https://github.com/qvr/nonraid
+Source: https://github.com/Raudbjorn/nonraid
 
 Files: *
 Copyright:
-  Copyright by respective authors and contributors.
-License: GPL-2
+ Copyright by the respective file authors and contributors.
+License: GPL-2.0-only
 
-License: GPL-2
+Files: pve-plugin/*
+Copyright:
+ 2026 Sveinbjörn Geirsson
+ 2026 qvr-nonraid contributors
+License: AGPL-3.0-or-later
+
+Files:
+ raid6/algos.c
+ raid6/avx2.c
+ raid6/avx512.c
+ raid6/loongarch.h
+ raid6/loongarch_simd.c
+ raid6/mktables.c
+ raid6/mmx.c
+ raid6/nonraid_pq.h
+ raid6/nonraid_raid6.h
+ raid6/recov.c
+ raid6/sse1.c
+ raid6/sse2.c
+ raid6/x86.h
+Copyright:
+ Copyright by the respective file authors and contributors.
+License: GPL-2.0-or-later
+
+Files:
+ raid6/Makefile
+ raid6/recov_s390xc.c
+ raid6/s390vx.uc
+Copyright:
+ Copyright by the respective file authors and contributors.
+License: GPL-2.0
+
+License: GPL-2.0-only
  This program is free software; you can redistribute it and/or modify it
- under the terms of version 2 of the GNU General Public License as
- published by the Free Software Foundation.
+ under the terms of version 2 of the GNU General Public License as published
+ by the Free Software Foundation.
  .
- This program is distributed in the hope that it will be useful, but
- WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
- for more details.
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
  .
- You should have received a copy of the GNU General Public License along
- with this program; if not, write to the Free Software Foundation, Inc., 51
- Franklin Street, Fifth Floor, Boston, MA 02110, USA
+ On Debian systems, the complete text of the GNU General Public License version
+ 2 can be found in /usr/share/common-licenses/GPL-2.
+
+License: GPL-2.0
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of version 2 of the GNU General Public License as published
+ by the Free Software Foundation.
  .
- On Debian systems, the complete text of the GNU General Public License
- version 2 can be found in "/usr/share/common-licenses/GPL-2"
+ On Debian systems, the complete text of the GNU General Public License version
+ 2 can be found in /usr/share/common-licenses/GPL-2.
+
+License: GPL-2.0-or-later
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 2 of the License, or (at your option) any later
+ version.
+ .
+ On Debian systems, the complete text of the GNU General Public License version
+ 2 can be found in /usr/share/common-licenses/GPL-2.
+
+License: AGPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU Affero General Public License as published by the Free
+ Software Foundation, either version 3 of the License, or (at your option) any
+ later version.
+ .
+ On Debian systems, the complete text of version 3 of the GNU Affero General
+ Public License can be found in /usr/share/common-licenses/AGPL-3.

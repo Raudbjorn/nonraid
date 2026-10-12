@@ -3,7 +3,7 @@ PWD := $(shell pwd)
 KVERSION := $(shell uname -r)
 HEADERS := /lib/modules/$(KVERSION)/build/
 
-.PHONY: modules clean package package-native package-docker
+.PHONY: modules clean package package-native package-docker package-plugin
 
 modules:
 	make -C $(HEADERS) M=$(PWD) modules CONFIG_UBSAN=n
@@ -16,7 +16,7 @@ clean:
 # which only Debian's dh-dkms provides, so a native build cannot work elsewhere.
 # This file is installed into /usr/src and re-parsed on every DKMS build, so the
 # probing below is skipped unless a packaging goal was actually asked for.
-ifneq ($(filter package package-native package-docker,$(MAKECMDGOALS)),)
+ifneq ($(filter package package-native package-docker package-plugin,$(MAKECMDGOALS)),)
 
 DOCKER ?= docker
 # Floating tag, so the toolchain drifts across point releases. Override with a
@@ -71,6 +71,9 @@ ENGINE_SWITCH := Set DOCKER=podman to use podman instead.
 endif
 
 endif
+
+package-plugin:
+	cd pve-plugin && dpkg-buildpackage -b -rfakeroot -us -uc
 
 package-native:
 	dpkg-buildpackage -b -rfakeroot -us -uc

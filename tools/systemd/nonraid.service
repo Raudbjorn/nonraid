@@ -2,6 +2,7 @@
 Description=Start/Stop NonRAID array and manage mounts
 Requires=local-fs.target
 After=local-fs.target
+ConditionPathExists=!/usr/share/perl5/PVE/Storage/Custom/NonRAIDPlugin.pm
 
 [Service]
 Type=oneshot

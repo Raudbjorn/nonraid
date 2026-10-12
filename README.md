@@ -103,7 +103,17 @@ light. Anything destined for the actual project goes to
 
 ## License
 
-GPL-2.0, same as upstream and the Linux kernel. See [LICENSE](LICENSE).
+GPL-2.0-only, same as upstream and the Linux kernel. See [LICENSE](LICENSE).
+
+The PVE storage integration is a separate experimental package boundary and is
+licensed AGPL-3.0-or-later; that package license does not relicense this driver.
 
 Unraid is a trademark of Lime Technology, Inc. Neither this fork nor the upstream project is
 affiliated with Lime Technology.
+
+## Port provenance
+
+This fork is based on target source `b7ed4c582e5a5730ed5de472af308a2756969e1e`.
+The authorized PVE prototype evidence is pinned at `qvr-nonraid@1eca6fcaaeedfc64469e0746fe8a120c1dcb3675`; plugin implementation sources remain the six commits through `73cc390`, with drill evidence extended by `4ad16c5`.
+The PVE integration is a selective port, not a wholesale cherry-pick; implementation
+commits cite the exact prototype commit(s) used with `Ported-From:` trailers.
