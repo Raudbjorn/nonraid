@@ -1,0 +1,11 @@
+Package: nonraid-dkms
+Version: 1.3.2-1
+Architecture: amd64
+Maintainer: Matti Hiljanen <matti@hiljanen.com>
+Installed-Size: 731
+Depends: dkms (>= 2.8.7)
+Section: kernel
+Priority: optional
+Multi-Arch: foreign
+Homepage: https://github.com/qvr/nonraid
+Description: NonRAID driver DKMS Debian Package
