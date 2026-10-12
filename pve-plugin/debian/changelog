@@ -1,0 +1,8 @@
+libpve-storage-nonraid-perl (0.1.0-1) experimental; urgency=medium
+
+  * Initial experimental Proxmox VE 9 storage plugin package.
+  * Selectively port the six authorized qvr-nonraid implementation commits
+    through 73cc390 and preserve drill evidence through 4ad16c5 from the
+    execution-pinned prototype 1eca6fcaaeedfc64469e0746fe8a120c1dcb3675.
+
+ -- Sveinbjörn Geirsson <sveinbjorn@sveinbjorn.dev>  Mon, 03 Aug 2026 02:21:00 +0000

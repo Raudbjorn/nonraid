@@ -4,10 +4,12 @@ Priority: optional
 Maintainer: Matti Hiljanen <matti@hiljanen.com>
 Build-Depends: debhelper (>=13.1~)
 Standards-Version: 4.6.2.1
-Homepage: https://github.com/qvr/nonraid
+Homepage: https://github.com/Raudbjorn/nonraid
 
 Package: nonraid-tools
 Section: admin
 Architecture: all
-Depends: bash (>=5.0)
+Depends: bash (>= 5.0), ${misc:Depends}
 Description: NonRAID array management tools Debian Package
+ Installs nmdctl, legacy compatibility units, scheduled parity and notification
+ units, and the NonRAID udev rule without enabling or starting array ownership.

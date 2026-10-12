@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Matti Hiljanen <matti@hiljanen.com>
 Build-Depends: debhelper-compat (= 13), dh-sequence-dkms
 Standards-Version: 4.6.2.1
-Homepage: https://github.com/qvr/nonraid
+Homepage: https://github.com/Raudbjorn/nonraid
 
 Package: nonraid-dkms
 Section: kernel
@@ -12,3 +12,5 @@ Architecture: any
 Multi-Arch: foreign
 Depends: dkms (>= 2.8.7), ${misc:Depends}
 Description: NonRAID driver DKMS Debian Package
+ Builds the NonRAID kernel modules for each installed Linux kernel through
+ DKMS without managing array activation or userspace storage mounts.

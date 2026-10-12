@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright 2026 Sveinbjörn Geirsson
+
+%:
+	dh $@
+
+override_dh_installsystemd:
+	dh_installsystemd --name=pve-nonraid-boot --no-stop-on-upgrade --no-start --no-enable
+	dh_installsystemd --name=pve-nonraid-shutdown --no-stop-on-upgrade --no-start --no-enable
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+execute_after_dh_builddeb:
+	debian/check-package-manifest ../libpve-storage-nonraid-perl_0.1.0-1_all.deb
