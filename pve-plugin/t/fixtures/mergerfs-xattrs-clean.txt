@@ -1,0 +1,6 @@
+user.mergerfs.branches=/mnt/disk1=RW:/mnt/disk2=RW
+user.mergerfs.cache.files=off
+user.mergerfs.category.create=mfs
+user.mergerfs.moveonenospc=false
+user.mergerfs.minfreespace=1073741824
+user.mergerfs.fsname=nonraid-nrpool

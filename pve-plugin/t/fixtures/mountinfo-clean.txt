@@ -1,0 +1,3 @@
+36 25 0:32 / /mnt/disk1 rw,relatime - btrfs /dev/nmd1p1 rw
+37 25 0:33 / /mnt/disk2 rw,relatime - xfs /dev/nmd2p1 rw
+50 25 0:44 / /mnt/pve/nrpool rw,nosuid,nodev - fuse.mergerfs nonraid-nrpool rw

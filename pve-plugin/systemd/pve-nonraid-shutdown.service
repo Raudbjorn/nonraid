@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright 2026 Sveinbjörn Geirsson
+
+[Unit]
+Description=Arm and tear down the exact PVE-owned NonRAID stack
+Before=pve-guests.service
+After=pve-cluster.service local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/pve-nonraid-lifecycle arm
+ExecStop=/usr/sbin/pve-nonraid-lifecycle teardown
+TimeoutStartSec=30s
+TimeoutStopSec=5min

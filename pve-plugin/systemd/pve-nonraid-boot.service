@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright 2026 Sveinbjörn Geirsson
+
+[Unit]
+Description=Activate configured NonRAID storage before PVE guests
+Requires=pve-cluster.service
+After=pve-cluster.service local-fs.target pve-storage.target
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-nonraid-lifecycle boot-activate
+TimeoutStartSec=5min
